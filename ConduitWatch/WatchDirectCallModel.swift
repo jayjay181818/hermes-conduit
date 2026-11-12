@@ -629,7 +629,9 @@ final class WatchDirectCallModel: ObservableObject {
         audio.stopPlayback()
         // Local Live's server is told, so its microphone opens again (#1325).
         session?.cancelResponse()
-        suppressingModelTurn = true
+        // Only a turn still arriving is dropped: pressed while a finished
+        // turn's tail plays, the next turn must be heard (issue 1790).
+        suppressingModelTurn = modelTurnActive
         modelTurnActive = false
         lastModelTurnEndedAt = now
         lastPlaybackEndedAt = now
@@ -721,6 +723,8 @@ final class WatchDirectCallModel: ObservableObject {
 
     /// The iPhone's answer to the start, over the link or through the relay.
     private func sessionAnswered(_ answer: WatchVoiceWire.Message?) {
+        // The iPhone's context as the session came: the host it runs on.
+        sessionPhoneContext = link.phoneContext
         switch answer {
         case .directSession(_, let session)? where engine == .gemini || engine == .qwen:
             begin(session)
@@ -1159,7 +1163,9 @@ final class WatchDirectCallModel: ObservableObject {
                 "screen": "\(scenePhase)",
                 "reachable": link.isReachable,
             ])
-        case .failed(let message):
+        case .failed(let failure):
+            let message = Self.worded(failure, pluginAsk: WatchPhoneContext.pluginAsk(forCallBegunUnder: sessionPhoneContext,
+                                                                                         now: link.phoneContext))
             WatchCallLog.shared.note("directFailed", ["message": message, "screen": "\(scenePhase)", "rejoins": rejoins])
             // Once the call has been live, a fresh session carries it on;
             // not on the bridge once its grant is over, which its bridge was.
@@ -1174,6 +1180,14 @@ final class WatchDirectCallModel: ObservableObject {
         case .idle, .connecting, .stopped:
             break
         }
+    }
+
+    /// A session's ask to update the plugin (Grok or Local Live's socket
+    /// missing), in the iPhone's words when its host manages the plugin.
+    nonisolated static func worded(_ failure: String, pluginAsk: String?) -> String {
+        guard let pluginAsk else { return failure }
+        let asks = [GrokLiveAvailability.pluginMissing.userFacingReason, LocalLiveProtocol.pluginMissingReason]
+        return asks.contains(failure) ? pluginAsk : failure
     }
 
     /// The connection a tool call is answered on (see generationOffset).
@@ -3339,7 +3353,11 @@ final class WatchDirectCallModel: ObservableObject {
         finish(reason)
     }
 
+    /// The iPhone's context when this call's session came (WatchPhoneContext.pluginAsk).
+    private var sessionPhoneContext: WatchPhoneContext?
+
     private func reset() {
+        sessionPhoneContext = nil
         noNetwork = WatchNoNetwork()
         grokStreams = 0
         streamsSpent = false

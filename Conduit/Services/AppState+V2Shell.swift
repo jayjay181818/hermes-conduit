@@ -11,6 +11,19 @@
 import SwiftUI
 
 extension AppState {
+    /// A bot's own color, as its chat's glow shows it: the color picked
+    /// for its profile or drawn from its photo, else its Hermes color, else
+    /// its name's hue. Bots Home's rings and the overview use it, so a
+    /// ring matches the bot (build 248: the rings took the name's hue
+    /// whenever Hermes kept no color).
+    func botColor(_ bot: BotProfile) -> Color {
+        Self.botColor(bot, glow: profileGlowColors()[bot.name])
+    }
+
+    static func botColor(_ bot: BotProfile, glow: ProfileGlowRGB?) -> Color {
+        glow?.color ?? BotAvatarView.color(for: bot.appearanceColor, name: bot.name)
+    }
+
     /// The color the backdrop's warm glow takes for a profile: the one
     /// picked for it or drawn from its photo (`profileGlowColors`), else the
     /// color its bot was given in Hermes, or nil (the gold accent). The bot
@@ -20,9 +33,11 @@ extension AppState {
     /// resolves to a roster bot, a workspace profile's name included.
     func profileGlowTint(_ profile: String) -> Color? {
         if let glow = profileGlowColors()[profile] { return glow.color }
-        // The common case has no roster at all: one check, no passes.
-        guard !botRoster.isEmpty else { return nil }
-        guard let bot = Self.linkedBot(named: profile, in: botRoster),
+        // The kept bots until Hermes answers (#1533). The common case has
+        // no roster at all: one check, no passes.
+        let roster = shownBotRoster
+        guard !roster.isEmpty else { return nil }
+        guard let bot = Self.linkedBot(named: profile, in: roster),
               let color = bot.appearanceColor?.trimmingCharacters(in: .whitespacesAndNewlines),
               !color.isEmpty else { return nil }
         return BotAvatarView.color(for: color, name: bot.name)

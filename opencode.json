@@ -1,19 +1,73 @@
 {
   "$schema": "https://opencode.ai/config.json",
   "provider": {
-    "anthropic": {
+    "go-custom": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "OpenCode Go (Custom)",
       "options": {
-        "apiKey": "{env:ANTHROPIC_API_KEY}"
+        "baseURL": "https://opencode.ai/zen/go/v1",
+        "apiKey": "{env:OPENCODE_GO_API_KEY}"
       },
-      "whitelist": ["claude-haiku-5-5"],
       "models": {
-        "claude-haiku-5-5": {
-          "name": "Claude Haiku 5.5",
+        "deepseek-v4.1-flash": {
+          "name": "DeepSeek V4.1 Flash",
+          "interleaved": {
+            "field": "reasoning_content"
+          },
           "options": {
-            "thinking": {
-              "type": "adaptive"
-            },
-            "effort": "high"
+            "reasoningEffort": "high"
+          }
+        },
+        "beam-free": {
+          "name": "Beam",
+          "interleaved": {
+            "field": "reasoning_content"
+          }
+        }
+      }
+    },
+    "commandcode": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Command Code",
+      "options": {
+        "baseURL": "https://api.commandcode.ai/provider/v1",
+        "apiKey": "{env:COMMANDCODE_API_KEY}"
+      },
+      "whitelist": [
+        "deepseek/deepseek-v4.1-flash",
+        "reflection/beam:free"
+      ],
+      "models": {
+        "deepseek/deepseek-v4.1-flash": {
+          "name": "DeepSeek V4.1 Flash",
+          "interleaved": {
+            "field": "reasoning_content"
+          },
+          "options": {
+            "reasoningEffort": "high"
+          }
+        },
+        "reflection/beam:free": {
+          "name": "Beam",
+          "interleaved": {
+            "field": "reasoning_content"
+          }
+        }
+      }
+    },
+    "stepfun": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "StepFun",
+      "options": {
+        "baseURL": "https://api.stepfun.ai/step_plan/v1",
+        "apiKey": "{env:STEPFUN_API_KEY}"
+      },
+      "whitelist": ["step-5-preview"],
+      "models": {
+        "step-5-preview": {
+          "name": "Step 5 Preview",
+          "interleaved": {
+            "field": "reasoning_content"
           }
         }
       }
@@ -29,7 +83,7 @@
         "glm-5.3-flash": {
           "name": "GLM-5.3-Flash",
           "options": {
-            "reasoningEffort": "max"
+            "reasoningEffort": "high"
           }
         }
       }

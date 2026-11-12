@@ -16,6 +16,12 @@ import Foundation
 /// Reads JSON numbers and flags the way the plugin sends them: a JSON
 /// boolean is never a number, and epochs may carry fractions.
 enum PulseJSON {
+    /// A profile the plugin names, trimmed; nil when it names none.
+    static func profile(_ value: Any?) -> String? {
+        let profile = (value as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return profile.isEmpty ? nil : profile
+    }
+
     static func bool(_ value: Any?) -> Bool? {
         guard let number = value as? NSNumber, CFGetTypeID(number) == CFBooleanGetTypeID() else { return nil }
         return number.boolValue
@@ -113,8 +119,16 @@ struct PulseState: Equatable {
     var enabled = false
     var running = false
     var staleBuild = false
+    /// Why the dashboard can't run Pulse while it isn't running: "hermes_too_old"
+    /// (notifier 0.127.6), or empty, the restart hint.
+    var hostProblem = ""
+    /// Settings > Pulse says to update Hermes rather than restart the dashboard.
+    var hermesTooOld: Bool { enabled && !running && hostProblem == "hermes_too_old" }
     var homeChat: PulseHomeChat?
     var homeProblem = ""
+    /// The profile Pulse runs in, whose chats it reads (0.126.2); nil from
+    /// an older plugin, whose Pulse runs in the dashboard's default profile.
+    var profile: String?
     var homeTitle = "Pulse"
     var checks: [String: Int] = [:]
     var recent: [PulseRecentAttempt] = []
@@ -199,6 +213,7 @@ struct PulseState: Equatable {
         self.enabled = enabled
         running = PulseJSON.bool(json["running"]) ?? false
         staleBuild = PulseJSON.bool(json["stale_build"]) ?? false
+        hostProblem = json["host_problem"] as? String ?? ""
         if let chat = json["home_chat"] as? [String: Any], let id = chat["id"] as? String, !id.isEmpty {
             homeChat = PulseHomeChat(
                 id: id,
@@ -207,6 +222,7 @@ struct PulseState: Equatable {
             )
         }
         homeProblem = json["home_problem"] as? String ?? ""
+        profile = PulseJSON.profile(json["profile"])
         if let title = json["home_title"] as? String, !title.isEmpty { homeTitle = title }
         checks = PulseJSON.counts(json["checks"])
         recent = (json["recent"] as? [Any] ?? []).enumerated().compactMap { index, raw in
@@ -736,6 +752,8 @@ enum PulseBackfillAction: String {
 struct PulseClient {
     static let capability = "pulse"
     static let path = "/api/plugins/conduit_push/pulse"
+    static let memoryPath = "\(path)/memory"
+    static let backfillPath = "\(path)/backfill"
 
     typealias Request = @MainActor (_ path: String, _ method: String, _ body: [String: Any]?) async throws -> [String: Any]
 
@@ -768,7 +786,7 @@ struct PulseClient {
     }
 
     func estimate(days: Int) async throws -> PulseBackfillEstimate {
-        let response = try await request("\(Self.path)/backfill", "POST", ["action": "estimate", "days": days])
+        let response = try await request(Self.backfillPath, "POST", ["action": "estimate", "days": days])
         guard let estimate = PulseBackfillEstimate(json: response["estimate"]) else { throw HermesError.invalidResponse }
         return estimate
     }
@@ -776,13 +794,16 @@ struct PulseClient {
     func backfill(_ action: PulseBackfillAction, days: Int? = nil) async throws -> PulseState {
         var body: [String: Any] = ["action": action.rawValue]
         if let days { body["days"] = days }
-        let response = try await request("\(Self.path)/backfill", "POST", body)
+        let response = try await request(Self.backfillPath, "POST", body)
         return try Self.state(from: response)
     }
 
     func memory() async throws -> [PulseMemoryItem] {
-        let response = try await request("\(Self.path)/memory", "GET", nil)
-        return (response["items"] as? [Any] ?? []).compactMap(PulseMemoryItem.init(json:))
+        Self.memoryItems(from: try await request(Self.memoryPath, "GET", nil))
+    }
+
+    static func memoryItems(from response: [String: Any]) -> [PulseMemoryItem] {
+        (response["items"] as? [Any] ?? []).compactMap(PulseMemoryItem.init(json:))
     }
 
     /// False when the item was no longer open.
@@ -794,5 +815,17 @@ struct PulseClient {
     static func state(from response: [String: Any]) throws -> PulseState {
         guard let state = PulseState(json: response) else { throw HermesError.invalidResponse }
         return state
+    }
+
+    /// The route an answer is kept under, so Settings > Pulse and What Pulse
+    /// remembers open on it next time (#1533): Pulse's state, from any step
+    /// that answers with it (a read, a change, a step reading older chats),
+    /// and the remembered list. Nil for the rest.
+    static func keptRoute(path: String, method: String, answer: [String: Any]) -> String? {
+        switch path {
+        case Self.path, Self.backfillPath: return PulseState(json: answer) == nil ? nil : Self.path
+        case Self.memoryPath: return method == "GET" ? Self.memoryPath : nil
+        default: return nil
+        }
     }
 }

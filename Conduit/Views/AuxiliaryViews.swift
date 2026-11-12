@@ -502,7 +502,7 @@ private struct LegacySettingsView: View {
 // MARK: - Settings home and detail routes
 
 private enum SettingsDestination: Hashable {
-    case profile, model, usage, chat, voice, hermesCalls, workspace, memory, advanced, capabilities, pulse, gateway, conduitPlugin, savedDashboards, appearance, notifications, syncedPreferences, health, location, phone, shortcutInbox, screenQuestion, about
+    case profile, model, usage, chat, voice, hermesCalls, workspace, memory, advanced, capabilities, credentialVault, people, pulse, gateway, conduitPlugin, savedDashboards, appearance, notifications, syncedPreferences, health, location, phone, shortcutInbox, screenQuestion, about
 
     init(_ link: ConduitAppLink.SettingsLink) {
         switch link {
@@ -587,6 +587,9 @@ struct SettingsView: View {
     /// Counts main-model saves, so Fast mode's model-dependent choices
     /// reload for the new model.
     @State private var mainModelSaves = 0
+    /// Counts provider changes, so the model lists on the page read Hermes'
+    /// catalog again.
+    @State private var providerChanges = 0
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -659,6 +662,23 @@ struct SettingsView: View {
         )
     }
 
+    /// Models & providers > Helper models, for the profile in use.
+    private var helperModelSettings: HelperModelsSettingsModel {
+        HelperModelsSettingsModel(
+            kept: { appState.keptHelperModels() },
+            load: { try await appState.loadHelperModels() },
+            slot: { slot in
+                VoiceReplyModelSettingsModel(
+                    kept: { appState.keptHelperModel(task: slot.id) },
+                    keptProviders: { appState.keptModelProviders() },
+                    load: { try await appState.loadHelperModel(task: slot.id) },
+                    loadProviders: { await appState.loadModelProviders() },
+                    save: { await appState.setHelperModel($0, confirmed: $1) }
+                )
+            }
+        )
+    }
+
     @ViewBuilder
     private func destinationView(_ destination: SettingsDestination) -> some View {
         switch destination {
@@ -669,36 +689,63 @@ struct SettingsView: View {
             )
         case .model:
             ProfileConfigSettingsPage(
-                title: AppLocalization.string("Model"),
+                title: AppLocalization.string("Models & providers"),
                 subtitle: "",
                 fields: Self.modelFields,
                 load: loadProfileSettings,
                 keptValues: { appState.keptProfileSettings(keys: $0) },
                 save: persistProfileSetting,
                 fieldsHeader: AppLocalization.string("Speed & limits"),
-                leadingSection: AnyView(ProfileModelSettingsDetail(
-                    kept: { appState.keptProfileModelDefaults() },
-                    load: loadProfileModelDefaults,
-                    save: { provider, model, reasoning in
-                        let saved = await persistProfileMainModel(provider, model, reasoning)
-                        if saved { await MainActor.run { mainModelSaves += 1 } }
-                        return saved
+                leadingSection: AnyView(VStack(alignment: .leading, spacing: 24) {
+                    if let bridge = appState.dashboardTicketBridge {
+                        ModelPageProviders(
+                            bridge: bridge,
+                            profile: snapshot.profile,
+                            profileName: appState.profileDisplayName(snapshot.profile),
+                            answers: appState.screenAnswers(profile: snapshot.profile),
+                            profiles: { appState.profiles },
+                            kept: { appState.keptProfileModelDefaults() },
+                            load: loadProfileModelDefaults,
+                            makeDefault: { provider, model, reasoning in
+                                let saved = await persistProfileMainModel(provider, model, reasoning)
+                                if saved { await MainActor.run { mainModelSaves += 1 } }
+                                return saved
+                            },
+                            onChange: { providerChanges += 1 },
+                            refresh: mainModelSaves
+                        )
+                        .id(snapshot.profile)
                     }
-                )),
-                trailingSection: AnyView(FallbackModelsSettings(
-                    keptModels: { appState.keptProfileModelDefaults() },
-                    kept: { appState.keptProfileFallbackModels() },
-                    loadModels: loadProfileModelDefaults,
-                    load: { await appState.loadProfileFallbackModels() },
-                    save: { await appState.setProfileFallbackModels($0) }
-                )),
+                    ProfileModelSettingsDetail(
+                        kept: { appState.keptProfileModelDefaults() },
+                        load: loadProfileModelDefaults,
+                        save: { provider, model, reasoning in
+                            let saved = await persistProfileMainModel(provider, model, reasoning)
+                            if saved { await MainActor.run { mainModelSaves += 1 } }
+                            return saved
+                        },
+                        refresh: providerChanges + mainModelSaves
+                    )
+                }),
+                trailingSection: AnyView(VStack(alignment: .leading, spacing: 24) {
+                    FallbackModelsSettings(
+                        keptModels: { appState.keptProfileModelDefaults() },
+                        kept: { appState.keptProfileFallbackModels().map { ProfileFallbackChain(entries: $0) } },
+                        loadModels: loadProfileModelDefaults,
+                        load: { await appState.loadProfileFallbackModels().map { ProfileFallbackChain(entries: $0) } },
+                        save: { await appState.setProfileFallbackModels($0.entries) },
+                        refresh: providerChanges
+                    )
+                    HelperModelsSettingsSection(settings: helperModelSettings)
+                        .id(snapshot.profile)
+                }),
                 loadSchema: { await appState.loadProfileConfigSchema() },
                 keptSchema: { appState.keptProfileConfigSchema() },
                 loadExtraOptions: {
                     Self.modelExtraOptions(await loadProfileModelDefaults() ?? appState.keptProfileModelDefaults())
                 },
                 keptExtraOptions: { appState.keptProfileModelDefaults().map { Self.modelExtraOptions($0) } },
-                extraOptionsRefresh: mainModelSaves
+                extraOptionsRefresh: mainModelSaves + providerChanges
             )
         case .chat:
             ChatSettingsDetail(
@@ -724,6 +771,8 @@ struct SettingsView: View {
                     bridge: bridge,
                     profile: snapshot.profile,
                     profileParameter: { appState.notifierPlugin.dashboardProfileParameter },
+                    // Opens on what it showed last time while Hermes is asked.
+                    answers: appState.voiceSettingsAnswers(profile: snapshot.profile),
                     profileName: appState.profileDisplayName(snapshot.profile),
                     conversationController: appState.voiceConversationController,
                     actions: VoiceSettingsActions(
@@ -781,7 +830,9 @@ struct SettingsView: View {
                         saveCalls: appState.voiceCallSavingEnabled,
                         setSaveCalls: { appState.setVoiceCallSavingEnabled($0) },
                         speakerBargeIn: appState.liveVoiceSpeakerBargeInEnabled,
-                        setSpeakerBargeIn: { appState.setLiveVoiceSpeakerBargeInEnabled($0) }
+                        setSpeakerBargeIn: { appState.setLiveVoiceSpeakerBargeInEnabled($0) },
+                        keptStatus: appState.keptLiveVoiceStatus(.geminiLive),
+                        keepStatus: appState.liveVoiceStatusKeeper(.geminiLive)
                     ),
                     qwenLive: GeminiLiveSettingsModel(
                         enabled: appState.isQwenLiveEnabled,
@@ -807,16 +858,15 @@ struct SettingsView: View {
                         setSaveCalls: { appState.setVoiceCallSavingEnabled($0) },
                         speakerBargeIn: appState.liveVoiceSpeakerBargeInEnabled,
                         setSpeakerBargeIn: { appState.setLiveVoiceSpeakerBargeInEnabled($0) },
-                        provider: .qwenLive
+                        provider: .qwenLive,
+                        keptStatus: appState.keptLiveVoiceStatus(.qwenLive),
+                        keepStatus: appState.liveVoiceStatusKeeper(.qwenLive)
                     ),
                     gptLive: GPTLiveSettingsModel(
                         enabled: appState.isGPTLiveEnabled,
                         setEnabled: { appState.setGPTLiveEnabled($0) },
-                        checkAvailability: {
+                        checkAvailability: { billing in
                             do {
-                                // The path the picker shows, even while a call Hermes placed
-                                // would start on the subscription.
-                                let billing = await MainActor.run { appState.gptLiveBilling }
                                 let status = try await appState.gptLiveClient.availability(billing: billing)
                                 // The Watch's GPT-Live is always the subscription's: an API-key
                                 // check says nothing about it.
@@ -845,7 +895,9 @@ struct SettingsView: View {
                         apiMaxMinutes: appState.gptLiveAPIMaxMinutes,
                         setAPIMaxMinutes: { appState.setGPTLiveAPIMaxMinutes($0) },
                         apiHermesCalls: appState.gptLiveAPIHermesCalls,
-                        setAPIHermesCalls: { appState.setGPTLiveAPIHermesCalls($0) }
+                        setAPIHermesCalls: { appState.setGPTLiveAPIHermesCalls($0) },
+                        keptStatus: appState.keptLiveVoiceStatus(.gptLive),
+                        keepStatus: appState.gptLiveStatusKeeper()
                     ),
                     grokLive: GrokLiveSettingsModel(
                         enabled: appState.isGrokLiveEnabled,
@@ -866,15 +918,22 @@ struct SettingsView: View {
                         saveCalls: appState.voiceCallSavingEnabled,
                         setSaveCalls: { appState.setVoiceCallSavingEnabled($0) },
                         speakerBargeIn: appState.liveVoiceSpeakerBargeInEnabled,
-                        setSpeakerBargeIn: { appState.setLiveVoiceSpeakerBargeInEnabled($0) }
+                        setSpeakerBargeIn: { appState.setLiveVoiceSpeakerBargeInEnabled($0) },
+                        keptStatus: appState.keptLiveVoiceStatus(.grokLive),
+                        keepStatus: appState.liveVoiceStatusKeeper(.grokLive)
                     ),
                     localLive: LocalLiveSettingsModel(
                         enabled: appState.isLocalLiveEnabled,
                         setEnabled: { appState.setLocalLiveEnabled($0) },
                         agent: appState.isLocalLiveAgent,
-                        setAgent: { appState.setLocalLiveAgent($0) }
+                        setAgent: { appState.setLocalLiveAgent($0) },
+                        personality: appState.localLivePersonalityEnabled,
+                        setPersonality: { appState.setLocalLivePersonalityEnabled($0) }
                     ),
+                    // Local Live's agent mode reads the style too; its
+                    // hands-free option (Hermes answers each turn) doesn't.
                     liveStyle: appState.isQwenLiveEnabled || appState.isGeminiLiveEnabled || appState.isGPTLiveEnabled || appState.isGrokLiveEnabled
+                        || (appState.isLocalLiveEnabled && appState.isLocalLiveAgent)
                         ? LiveVoiceStyleSettingsModel(
                             profile: appState.activeProfile,
                             style: appState.liveVoiceStyle,
@@ -890,15 +949,18 @@ struct SettingsView: View {
                         provider: voicePreferences.voiceJobProvider,
                         model: voicePreferences.voiceJobModel,
                         reasoningEffort: voicePreferences.voiceJobReasoningEffort,
-                        loadProviders: { await appState.loadVoiceJobModelProviders() },
+                        keptProviders: { appState.keptModelProviders() },
+                        loadProviders: { await appState.loadModelProviders() },
                         save: { provider, model, reasoning in
                             appState.setVoiceJobModel(provider: provider, model: model, reasoningEffort: reasoning)
                         }
                     ),
                     voiceReplies: VoiceReplyModelSettingsModel(
-                        load: { await appState.loadVoiceReplyModel() },
-                        loadProviders: { await appState.loadVoiceJobModelProviders() },
-                        save: { await appState.setVoiceReplyModel($0) }
+                        kept: { appState.keptVoiceReplyModel() },
+                        keptProviders: { appState.keptModelProviders() },
+                        load: { try await appState.loadVoiceReplyModel() },
+                        loadProviders: { await appState.loadModelProviders() },
+                        save: { await appState.setVoiceReplyModel($0, confirmed: $1) }
                     ),
                     wake: wakeSettings(profile: snapshot.profile),
                     lockedListening: VoiceLockedListeningSettingsModel(
@@ -972,7 +1034,19 @@ struct SettingsView: View {
                 sections: Self.memorySections,
                 loadDelegationPaused: { await appState.loadDelegationPaused() },
                 keptDelegationPaused: { appState.keptDelegationPaused() },
-                setDelegationPaused: { await appState.setDelegationPaused($0) }
+                setDelegationPaused: { await appState.setDelegationPaused($0) },
+                routing: DelegationRoutingActions(
+                    kept: { appState.keptDelegationRouting() },
+                    load: { try await appState.loadDelegationRouting() },
+                    choose: { try await appState.chooseDelegationMode($0) },
+                    saveModelRoutes: { try await appState.saveDelegationModelRoutes($0) },
+                    saveProfileRoutes: { try await appState.saveDelegationProfileRoutes($0) },
+                    keptModels: { appState.keptProfileModelDefaults() },
+                    loadModels: loadProfileModelDefaults
+                ),
+                keptDelegateFallbacks: { appState.keptDelegateFallbackModels() },
+                loadDelegateFallbacks: { await appState.loadDelegateFallbackModels() },
+                saveDelegateFallbacks: { await appState.setDelegateFallbackModels($0) }
             )
         case .advanced:
             ProfileConfigSettingsPage(
@@ -990,6 +1064,10 @@ struct SettingsView: View {
             UsageSettingsDetail()
         case .capabilities:
             CapabilitiesView()
+        case .credentialVault:
+            CredentialVaultSettingsPage()
+        case .people:
+            PeopleSettingsPage()
         case .pulse:
             PulseSettingsPage()
         case .gateway:
@@ -1009,6 +1087,8 @@ struct SettingsView: View {
             HermesCallsSettingsPage(
                 model: HermesCallSettingsModel(
                     profile: appState.activeProfile,
+                    dashboardID: appState.activeDashboardID,
+                    botName: appState.hermesCallContactName(appState.activeProfile),
                     status: appState.activeHermesCallsStatus,
                     load: {
                         await appState.refreshHermesCallsStatus()
@@ -1097,9 +1177,23 @@ struct SettingsView: View {
             .init(key: "auxiliary.compression.timeout", label: AppLocalization.string("Compression timeout"), help: AppLocalization.string("Seconds to wait for the compression model on each call. Raise it for slow local models."), control: .number(defaultValue: 120), requiresSchema: true),
         ]),
         ProfileSettingSection(title: AppLocalization.string("Delegation"), symbol: "point.3.connected.trianglepath.dotted", fields: [
-            .init(key: "delegation.max_concurrent_children", label: AppLocalization.string("Concurrent delegate agents"), help: AppLocalization.string("Maximum child agents that can work at once."), control: .number(defaultValue: 2)),
+            .init(key: "delegation.max_concurrent_children", label: AppLocalization.string("Concurrent delegate agents"), help: AppLocalization.string("Maximum child agents that can work at once."), control: .number(defaultValue: 10)),
             .init(key: "delegation.max_iterations", label: AppLocalization.string("Delegate turn limit"), help: AppLocalization.string("Most turns one delegate agent can take."), control: .number(defaultValue: 250), requiresSchema: true),
             .init(key: "delegation.child_timeout_seconds", label: AppLocalization.string("Delegate timeout"), help: AppLocalization.string("Seconds before a delegate agent is stopped. 0 means no limit."), control: .number(defaultValue: 0), requiresSchema: true),
+            .init(key: "delegation.max_spawn_depth", label: AppLocalization.string("Delegation depth"), help: AppLocalization.string("Levels of delegate agents that can start their own. 1 means delegates can't."), control: .number(defaultValue: 1), requiresSchema: true),
+            .init(key: "delegation.orchestrator_enabled", label: AppLocalization.string("Coordinating delegates"), help: AppLocalization.string("Let a delegate agent start and coordinate its own delegates, up to the depth above."), control: .toggle(defaultValue: true), requiresSchema: true),
+            .init(key: "delegation.subagent_auto_approve", label: AppLocalization.string("Delegates approve commands"), help: AppLocalization.string("Delegate agents can't ask you. On, they approve a command once; off, they decline it."), control: .toggle(defaultValue: false), requiresSchema: true),
+            .init(key: "delegation.independent_completions", label: AppLocalization.string("Results as each finishes"), help: AppLocalization.string("Background delegate agents report one by one, not all together at the end."), control: .toggle(defaultValue: false), requiresSchema: true),
+            .init(key: "delegation.gateway_mode", label: AppLocalization.string("Delegation in chats"), help: AppLocalization.string("Inline waits for delegates inside the reply; Background lets the reply finish first. Auto is inline when progress messages are off."), control: .labeledOptions([
+                (value: "auto", label: AppLocalization.string("Auto")),
+                (value: "inline", label: AppLocalization.string("Inline")),
+                (value: "background", label: AppLocalization.string("Background")),
+            ], defaultValue: "auto"), requiresSchema: true),
+            .init(key: "delegation.inherit_mcp_toolsets", label: AppLocalization.string("Delegates keep connectors"), help: AppLocalization.string("A delegate given fewer tools still keeps your connectors' tools."), control: .toggle(defaultValue: true), requiresSchema: true),
+            .init(key: "delegation.max_summary_chars", label: AppLocalization.string("Delegate result limit"), help: AppLocalization.string("Most characters of one delegate's result; the rest is saved to a file. 0 means no limit."), control: .number(defaultValue: 24000), requiresSchema: true),
+            .init(key: "delegation.compression_threshold_tokens", label: AppLocalization.string("Delegate compression cap"), help: AppLocalization.string("Tokens at which a delegate compresses its context, 16000 or more. 0 follows the main setting."), control: .number(defaultValue: 0), requiresSchema: true),
+            .init(key: "delegation.surface_child_process_notifications", label: AppLocalization.string("Delegate command alerts"), help: AppLocalization.string("Tell the chat when a delegate's background command finishes or matches what it watches for."), control: .toggle(defaultValue: false), requiresSchema: true),
+            .init(key: "delegation.prefix_stagger_seconds", label: AppLocalization.string("Delegate start wait"), help: AppLocalization.string("Seconds delegates started together wait for the first to begin answering, so they share its cached prompt. 0 means off."), control: .number(defaultValue: 0), requiresSchema: true),
         ]),
     ]
     }
@@ -1147,7 +1241,6 @@ private struct SettingsHome: View {
     @ObservedObject var appLanguage = AppLanguageStore.shared
     /// Redraws when an inbox's key or waiting events change (showsShortcutInboxSettings).
     @ObservedObject private var shortcutInbox = ShortcutInboxLocalState.shared
-    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     let snapshot: SettingsSnapshot
     @Binding var path: [SettingsDestination]
     /// V2's grouping: the selected profile first, then Voice, Hermes, App.
@@ -1195,61 +1288,16 @@ private struct SettingsHome: View {
                             path.append(.conduitPlugin)
                         }
                     }
-                    if v2Layout {
-                        v2Sections
-                    } else {
-                    homeSection(AppLocalization.string("Profile"), symbol: "person.crop.circle", tint: .conduitAccent) {
-                        settingsLink(.profile, icon: "person.crop.circle", title: profileDisplayName, detail: AppLocalization.string("Profile-specific preferences"))
-                    }
-                    homeSection("Hermes", tint: .conduitAura) {
-                        settingsLink(.model, icon: "cpu", title: AppLocalization.string("Model"), detail: AppLocalization.string("Default model and reasoning"))
-                        settingsLink(.usage, icon: "chart.bar", title: AppLocalization.string("Usage"), detail: AppLocalization.string("Tokens, cost, and provider quota"), identifier: "settings.usage")
-                        settingsLink(.chat, icon: "bubble.left.and.bubble.right", title: AppLocalization.string("Chat"), detail: AppLocalization.string("Response behavior, visibility, and timezone"))
-                        settingsLink(.voice, icon: "mic.and.signal.meter", title: AppLocalization.string("Voice"), detail: AppLocalization.string("Speech providers, credentials, and device opt-in"))
-                        if appState.supportsHermesCalls {
-                            settingsLink(.hermesCalls, icon: "phone.arrow.down.left", title: AppLocalization.string("Calls from Hermes"), detail: AppLocalization.string("When Hermes may phone you"), identifier: "settings.hermes-calls")
+                    // Each group is a view of its own, filled from the rows
+                    // built below: the whole list as one nested view type
+                    // overflowed the main thread's stack on iOS 18 while
+                    // the runtime worked out that type (build 264).
+                    ForEach(homeGroups) { group in
+                        if v2Layout {
+                            V2SettingsHomeGroupCard(group: group, perform: perform)
+                        } else {
+                            SettingsHomeGroupSection(group: group, perform: perform)
                         }
-                        settingsLink(.workspace, icon: "folder", title: AppLocalization.string("Workspace & safety"), detail: AppLocalization.string("Working directory, approvals, and privacy"))
-                        settingsLink(.memory, icon: "brain.head.profile", title: AppLocalization.string("Memory & delegation"), detail: AppLocalization.string("Memory, compression, and child agents"))
-                        settingsLink(.advanced, icon: "wrench.and.screwdriver", title: AppLocalization.string("Advanced"), detail: AppLocalization.string("Turn limits, terminal, and tool output"))
-                        settingsLink(.capabilities, icon: "puzzlepiece.extension", title: AppLocalization.string("Capabilities"), detail: AppLocalization.string("Skills, tools, connectors, and plugins"))
-                        // Where the plugin serves Pulse (AppState+Pulse.swift).
-                        if appState.showsPulseSettings {
-                            settingsLink(.pulse, icon: "waveform.path.ecg", title: AppLocalization.string("Pulse (beta)"), detail: AppLocalization.string("What Hermes would bring up on its own"), identifier: "settings.pulse")
-                        }
-                    }
-                    homeSection(AppLocalization.string("Connection"), tint: .conduitAura) {
-                        settingsLink(.savedDashboards, icon: "server.rack", title: AppLocalization.string("Saved Dashboards"), detail: savedDashboardsDetail, identifier: "settings.saved-dashboards")
-                        settingsLink(.gateway, icon: "radio", title: AppLocalization.string("Gateway"), detail: snapshot.server ?? AppLocalization.string("Not connected"), identifier: "settings.gateway")
-                        settingsLink(.conduitPlugin, icon: "puzzlepiece.extension", title: AppLocalization.string("Conduit plugin"), detail: NotifierPluginSummary.detail(appState.notifierPlugin, update: appState.activeNotifierPluginUpdate), identifier: "settings.conduit-plugin")
-                        settingsLink(.syncedPreferences, icon: "arrow.triangle.2.circlepath", title: AppLocalization.string("Sync across devices"), detail: syncedPreferencesDetail, identifier: "settings.sync")
-                        settingsActionRow(
-                            icon: "checkmark.circle",
-                            title: AppLocalization.string("Connection Setup"),
-                            detail: AppLocalization.string("Test, troubleshoot, or change your connection"),
-                            identifier: "settings.connection-setup"
-                        ) {
-                            openConnectionSetup()
-                        }
-                    }
-                    homeSection(AppLocalization.string("On this device"), tint: .conduitAccent) {
-                        settingsLink(.appearance, icon: "circle.lefthalf.filled", title: AppLocalization.string("Appearance"), detail: AppLocalization.string("Theme and interface preferences"))
-                        settingsLink(.notifications, icon: "bell", title: AppLocalization.string("Notifications"), detail: AppLocalization.string("Delivery status and setup"))
-                        if appState.showsHealthSettings {
-                            settingsLink(.health, icon: "heart.text.square", title: AppLocalization.string("Health"), detail: AppLocalization.string("Share Apple Health data with Hermes"), identifier: "settings.health")
-                        }
-                        if appState.showsLocationSettings {
-                            settingsLink(.location, icon: "location", title: AppLocalization.string("Location"), detail: AppLocalization.string("Share where you are with Hermes"), identifier: "settings.location")
-                        }
-                        if appState.showsPhoneSettings {
-                            settingsLink(.phone, icon: "calendar", title: AppLocalization.string("Calendar & phone"), detail: AppLocalization.string("Share your calendar, reminders, Focus and phone status with Hermes"), identifier: "settings.phone")
-                        }
-                        if appState.showsShortcutInboxSettings {
-                            settingsLink(.shortcutInbox, icon: "tray.full", title: AppLocalization.string("Shortcuts inbox"), detail: AppLocalization.string("What your automations logged for Hermes"), identifier: "settings.shortcut-inbox")
-                        }
-                        settingsLink(.screenQuestion, icon: "camera.viewfinder", title: AppLocalization.string("Ask Hermes About Screen"), detail: AppLocalization.string("Action Button shortcut for screenshots"), identifier: "settings.screen-question")
-                        settingsLink(.about, icon: "shield", title: AppLocalization.string("About & privacy"), detail: AppLocalization.string("App information and data handling"))
-                    }
                     }
                     Text("Hermes settings follow the active profile. Appearance, notifications, and privacy controls stay on this device unless you turn on Sync across devices.")
                         .scaledFont(.footnote)
@@ -1362,179 +1410,153 @@ private struct SettingsHome: View {
             : AppLocalization.string("Share preferences with your other devices")
     }
 
+    /// The groups Settings home lists, in the layout's order.
+    private var homeGroups: [SettingsHomeGroup] {
+        v2Layout ? v2Groups : classicGroups
+    }
+
     /// V2's grouping: the selected profile (its connection, approvals and
     /// profile page), then Voice, Hermes, and App, each one card of rows
     /// with hairlines between them, as in the Scheduled list. Every page the
     /// drawer's Settings reached stays reachable.
-    @ViewBuilder
-    private var v2Sections: some View {
-        v2Group(profileDisplayName, symbol: "person.crop.circle") {
-            v2Link(
-                .gateway,
+    private var v2Groups: [SettingsHomeGroup] {
+        var groups: [SettingsHomeGroup] = []
+        groups.append(SettingsHomeGroup(id: "profile", title: profileDisplayName, symbol: "person.crop.circle", rows: [
+            SettingsHomeRow(
+                .open(.gateway),
                 icon: "dot.radiowaves.left.and.right",
                 title: AppLocalization.string("Connection"),
                 detail: v2ConnectionDetail,
                 identifier: "settings.gateway",
-                statusDot: appState.isConnected ? Color.green : (appState.isRecoveringConnection ? Color.orange : Color.red),
-                first: true
-            )
-            v2Link(.workspace, icon: "checkmark.shield", title: AppLocalization.string("Approvals"), detail: AppLocalization.string("Working directory, approvals, and privacy"))
-            v2Link(.profile, icon: "person.crop.circle", title: AppLocalization.string("Edit profile"), detail: AppLocalization.string("Profile-specific preferences"))
+                statusDot: appState.isConnected ? Color.green : (appState.isRecoveringConnection ? Color.orange : Color.red)
+            ),
+            SettingsHomeRow(.open(.workspace), icon: "checkmark.shield", title: AppLocalization.string("Approvals"), detail: AppLocalization.string("Working directory, approvals, and privacy")),
+            SettingsHomeRow(.open(.profile), icon: "person.crop.circle", title: AppLocalization.string("Edit profile"), detail: AppLocalization.string("Profile-specific preferences")),
+        ]))
+        var voice = [
+            SettingsHomeRow(.open(.voice), icon: "mic.and.signal.meter", title: AppLocalization.string("Voice"), detail: AppLocalization.string("Speech providers, credentials, and device opt-in")),
+        ]
+        if appState.supportsHermesCalls {
+            voice.append(SettingsHomeRow(.open(.hermesCalls), icon: "phone.arrow.down.left", title: AppLocalization.string("Calls from Hermes"), detail: AppLocalization.string("When Hermes may phone you"), identifier: "settings.hermes-calls"))
         }
-        v2Group(AppLocalization.string("Voice"), symbol: "waveform") {
-            v2Link(.voice, icon: "mic.and.signal.meter", title: AppLocalization.string("Voice"), detail: AppLocalization.string("Speech providers, credentials, and device opt-in"), first: true)
-            if appState.supportsHermesCalls {
-                v2Link(.hermesCalls, icon: "phone.arrow.down.left", title: AppLocalization.string("Calls from Hermes"), detail: AppLocalization.string("When Hermes may phone you"), identifier: "settings.hermes-calls")
-            }
+        groups.append(SettingsHomeGroup(id: "voice", title: AppLocalization.string("Voice"), symbol: "waveform", rows: voice))
+        var hermes = [
+            SettingsHomeRow(.open(.model), icon: "cpu", title: AppLocalization.string("Models & providers"), detail: AppLocalization.string("Default model, reasoning, and providers")),
+            SettingsHomeRow(.open(.usage), icon: "chart.bar", title: AppLocalization.string("Usage"), detail: AppLocalization.string("Tokens, cost, and provider quota"), identifier: "settings.usage"),
+            SettingsHomeRow(.open(.chat), icon: "bubble.left.and.bubble.right", title: AppLocalization.string("Chat"), detail: AppLocalization.string("Response behavior, visibility, and timezone")),
+            SettingsHomeRow(.open(.memory), icon: "brain.head.profile", title: AppLocalization.string("Memory & delegation"), detail: AppLocalization.string("Memory, compression, and child agents")),
+            SettingsHomeRow(.open(.advanced), icon: "wrench.and.screwdriver", title: AppLocalization.string("Advanced"), detail: AppLocalization.string("Turn limits, terminal, and tool output")),
+            SettingsHomeRow(.open(.capabilities), icon: "puzzlepiece.extension", title: AppLocalization.string("Capabilities"), detail: AppLocalization.string("Skills, tools, connectors, and plugins")),
+            SettingsHomeRow(.open(.credentialVault), icon: "key", title: AppLocalization.string("Passwords & logins"), detail: AppLocalization.string("Logins, cards and password managers Hermes signs in with"), identifier: "settings.vault"),
+        ]
+        if appState.canLinkRooms {
+            hermes.append(SettingsHomeRow(.open(.people), icon: "person.2", title: AppLocalization.string("Multiplayer"), detail: AppLocalization.string("Rooms with other people's agents"), identifier: "settings.people"))
         }
-        v2Group(AppLocalization.string("Hermes"), symbol: "gearshape.2") {
-            v2Link(.model, icon: "cpu", title: AppLocalization.string("Model"), detail: AppLocalization.string("Default model and reasoning"), first: true)
-            v2Link(.usage, icon: "chart.bar", title: AppLocalization.string("Usage"), detail: AppLocalization.string("Tokens, cost, and provider quota"), identifier: "settings.usage")
-            v2Link(.chat, icon: "bubble.left.and.bubble.right", title: AppLocalization.string("Chat"), detail: AppLocalization.string("Response behavior, visibility, and timezone"))
-            v2Link(.memory, icon: "brain.head.profile", title: AppLocalization.string("Memory & delegation"), detail: AppLocalization.string("Memory, compression, and child agents"))
-            v2Link(.advanced, icon: "wrench.and.screwdriver", title: AppLocalization.string("Advanced"), detail: AppLocalization.string("Turn limits, terminal, and tool output"))
-            v2Link(.capabilities, icon: "puzzlepiece.extension", title: AppLocalization.string("Capabilities"), detail: AppLocalization.string("Skills, tools, connectors, and plugins"))
-            // Where the plugin serves Pulse (AppState+Pulse.swift).
-            if appState.showsPulseSettings {
-                v2Link(.pulse, icon: "waveform.path.ecg", title: AppLocalization.string("Pulse (beta)"), detail: AppLocalization.string("What Hermes would bring up on its own"), identifier: "settings.pulse")
-            }
+        // Where the plugin serves Pulse (AppState+Pulse.swift).
+        if appState.showsPulseSettings {
+            hermes.append(SettingsHomeRow(.open(.pulse), icon: "waveform.path.ecg", title: AppLocalization.string("Pulse (beta)"), detail: AppLocalization.string("What Hermes would bring up on its own"), identifier: "settings.pulse"))
         }
-        v2Group(AppLocalization.string("App"), symbol: "slider.horizontal.3") {
-            v2Action(
-                icon: "person.2.crop.square.stack",
-                title: AppLocalization.string("Profiles"),
-                detail: AppLocalization.string("Rename, reorder, or change profile photos"),
-                identifier: "settings.profiles",
-                first: true
-            ) {
-                showProfileManager = true
-            }
-            v2Link(.appearance, icon: "circle.lefthalf.filled", title: AppLocalization.string("Appearance"), detail: AppLocalization.string("Theme and interface preferences"))
-            v2Link(.notifications, icon: "bell", title: AppLocalization.string("Notifications"), detail: AppLocalization.string("Delivery status and setup"))
-            v2Link(.syncedPreferences, icon: "arrow.triangle.2.circlepath", title: AppLocalization.string("Sync across devices"), detail: syncedPreferencesDetail, identifier: "settings.sync")
-            v2Link(.screenQuestion, icon: "camera.viewfinder", title: AppLocalization.string("Ask Hermes About Screen"), detail: AppLocalization.string("Action Button shortcut for screenshots"), identifier: "settings.screen-question")
+        groups.append(SettingsHomeGroup(id: "hermes", title: AppLocalization.string("Hermes"), symbol: "gearshape.2", rows: hermes))
+        groups.append(SettingsHomeGroup(id: "app", title: AppLocalization.string("App"), symbol: "slider.horizontal.3", rows: [
+            SettingsHomeRow(.profiles, icon: "person.2.crop.square.stack", title: AppLocalization.string("Profiles"), detail: AppLocalization.string("Rename, reorder, or change profile photos"), identifier: "settings.profiles"),
+            SettingsHomeRow(.open(.appearance), icon: "circle.lefthalf.filled", title: AppLocalization.string("Appearance"), detail: AppLocalization.string("Theme and interface preferences")),
+            SettingsHomeRow(.open(.notifications), icon: "bell", title: AppLocalization.string("Notifications"), detail: AppLocalization.string("Delivery status and setup")),
+            SettingsHomeRow(.open(.syncedPreferences), icon: "arrow.triangle.2.circlepath", title: AppLocalization.string("Sync across devices"), detail: syncedPreferencesDetail, identifier: "settings.sync"),
+            SettingsHomeRow(.open(.screenQuestion), icon: "camera.viewfinder", title: AppLocalization.string("Ask Hermes About Screen"), detail: AppLocalization.string("Action Button shortcut for screenshots"), identifier: "settings.screen-question"),
+        ]))
+        let device = deviceRows
+        if !device.isEmpty {
+            groups.append(SettingsHomeGroup(id: "device", title: AppLocalization.string("On this device"), symbol: "iphone", rows: device))
         }
-        if appState.showsHealthSettings || appState.showsLocationSettings || appState.showsPhoneSettings || appState.showsShortcutInboxSettings {
-            v2Group(AppLocalization.string("On this device"), symbol: "iphone") {
-                if appState.showsHealthSettings {
-                    v2Link(.health, icon: "heart.text.square", title: AppLocalization.string("Health"), detail: AppLocalization.string("Share Apple Health data with Hermes"), identifier: "settings.health", first: true)
-                }
-                if appState.showsLocationSettings {
-                    v2Link(.location, icon: "location", title: AppLocalization.string("Location"), detail: AppLocalization.string("Share where you are with Hermes"), identifier: "settings.location", first: !appState.showsHealthSettings)
-                }
-                if appState.showsPhoneSettings {
-                    v2Link(.phone, icon: "calendar", title: AppLocalization.string("Calendar & phone"), detail: AppLocalization.string("Share your calendar, reminders, Focus and phone status with Hermes"), identifier: "settings.phone", first: !appState.showsHealthSettings && !appState.showsLocationSettings)
-                }
-                if appState.showsShortcutInboxSettings {
-                    v2Link(.shortcutInbox, icon: "tray.full", title: AppLocalization.string("Shortcuts inbox"), detail: AppLocalization.string("What your automations logged for Hermes"), identifier: "settings.shortcut-inbox", first: !appState.showsHealthSettings && !appState.showsLocationSettings && !appState.showsPhoneSettings)
-                }
-            }
-        }
-        v2Group(AppLocalization.string("Server"), symbol: "server.rack") {
-            v2Link(.savedDashboards, icon: "server.rack", title: AppLocalization.string("Saved Dashboards"), detail: savedDashboardsDetail, identifier: "settings.saved-dashboards", first: true)
-            v2Link(.conduitPlugin, icon: "puzzlepiece.extension", title: AppLocalization.string("Conduit plugin"), detail: NotifierPluginSummary.detail(appState.notifierPlugin, update: appState.activeNotifierPluginUpdate), identifier: "settings.conduit-plugin")
-            v2Action(
-                icon: "checkmark.circle",
-                title: AppLocalization.string("Connection Setup"),
-                detail: AppLocalization.string("Test, troubleshoot, or change your connection"),
-                identifier: "settings.connection-setup"
-            ) {
-                openConnectionSetup()
-            }
-        }
-        v2Group(AppLocalization.string("About"), symbol: "info.circle") {
-            v2Link(.about, icon: "shield", title: AppLocalization.string("About & privacy"), detail: AppLocalization.string("App information and data handling"), first: true)
-        }
+        groups.append(SettingsHomeGroup(id: "server", title: AppLocalization.string("Server"), symbol: "server.rack", rows: [
+            SettingsHomeRow(.open(.savedDashboards), icon: "server.rack", title: AppLocalization.string("Saved Dashboards"), detail: savedDashboardsDetail, identifier: "settings.saved-dashboards"),
+            SettingsHomeRow(.open(.conduitPlugin), icon: "puzzlepiece.extension", title: AppLocalization.string("Conduit plugin"), detail: NotifierPluginSummary.detail(appState.notifierPlugin, update: appState.activeNotifierPluginUpdate), identifier: "settings.conduit-plugin"),
+            SettingsHomeRow(.connectionSetup, icon: "checkmark.circle", title: AppLocalization.string("Connection Setup"), detail: AppLocalization.string("Test, troubleshoot, or change your connection"), identifier: "settings.connection-setup"),
+        ]))
+        groups.append(SettingsHomeGroup(id: "about", title: AppLocalization.string("About"), symbol: "info.circle", rows: [
+            SettingsHomeRow(.open(.about), icon: "shield", title: AppLocalization.string("About & privacy"), detail: AppLocalization.string("App information and data handling")),
+        ]))
+        return groups
     }
 
-    /// A V2 group: its name over one card of rows.
-    private func v2Group<Rows: View>(_ title: String, symbol: String, @ViewBuilder rows: () -> Rows) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            SettingsSectionHeader(title: title, symbol: symbol, tint: .conduitAccent)
-            VStack(spacing: 0) {
-                rows()
-            }
-            .settingsCard()
+    /// The pages for what this iPhone shares with Hermes, each shown once
+    /// the feature is available here.
+    private var deviceRows: [SettingsHomeRow] {
+        var rows: [SettingsHomeRow] = []
+        if appState.showsHealthSettings {
+            rows.append(SettingsHomeRow(.open(.health), icon: "heart.text.square", title: AppLocalization.string("Health"), detail: AppLocalization.string("Share Apple Health data with Hermes"), identifier: "settings.health"))
         }
+        if appState.showsLocationSettings {
+            rows.append(SettingsHomeRow(.open(.location), icon: "location", title: AppLocalization.string("Location"), detail: AppLocalization.string("Share where you are with Hermes"), identifier: "settings.location"))
+        }
+        if appState.showsPhoneSettings {
+            rows.append(SettingsHomeRow(.open(.phone), icon: "calendar", title: AppLocalization.string("Calendar & phone"), detail: AppLocalization.string("Share your calendar, reminders, Focus and phone status with Hermes"), identifier: "settings.phone"))
+        }
+        if appState.showsShortcutInboxSettings {
+            rows.append(SettingsHomeRow(.open(.shortcutInbox), icon: "tray.full", title: AppLocalization.string("Shortcuts inbox"), detail: AppLocalization.string("What your automations logged for Hermes"), identifier: "settings.shortcut-inbox"))
+        }
+        return rows
     }
 
-    private func v2Link(
-        _ destination: SettingsDestination,
-        icon: String,
-        title: String,
-        detail: String,
-        identifier: String = "",
-        statusDot: Color? = nil,
-        first: Bool = false
-    ) -> some View {
-        Button {
-            Haptics.selection()
-            path.append(destination)
-        } label: {
-            v2RowLabel(icon: icon, title: title, detail: detail, statusDot: statusDot, first: first)
+    /// The classic layout's groups: Profile, Hermes, Connection, and this
+    /// device.
+    private var classicGroups: [SettingsHomeGroup] {
+        var hermes = [
+            SettingsHomeRow(.open(.model), icon: "cpu", title: AppLocalization.string("Models & providers"), detail: AppLocalization.string("Default model, reasoning, and providers")),
+            SettingsHomeRow(.open(.usage), icon: "chart.bar", title: AppLocalization.string("Usage"), detail: AppLocalization.string("Tokens, cost, and provider quota"), identifier: "settings.usage"),
+            SettingsHomeRow(.open(.chat), icon: "bubble.left.and.bubble.right", title: AppLocalization.string("Chat"), detail: AppLocalization.string("Response behavior, visibility, and timezone")),
+            SettingsHomeRow(.open(.voice), icon: "mic.and.signal.meter", title: AppLocalization.string("Voice"), detail: AppLocalization.string("Speech providers, credentials, and device opt-in")),
+        ]
+        if appState.supportsHermesCalls {
+            hermes.append(SettingsHomeRow(.open(.hermesCalls), icon: "phone.arrow.down.left", title: AppLocalization.string("Calls from Hermes"), detail: AppLocalization.string("When Hermes may phone you"), identifier: "settings.hermes-calls"))
         }
-        .buttonStyle(.plain)
-        .accessibilityIdentifier(identifier)
+        hermes += [
+            SettingsHomeRow(.open(.workspace), icon: "folder", title: AppLocalization.string("Workspace & safety"), detail: AppLocalization.string("Working directory, approvals, and privacy")),
+            SettingsHomeRow(.open(.memory), icon: "brain.head.profile", title: AppLocalization.string("Memory & delegation"), detail: AppLocalization.string("Memory, compression, and child agents")),
+            SettingsHomeRow(.open(.advanced), icon: "wrench.and.screwdriver", title: AppLocalization.string("Advanced"), detail: AppLocalization.string("Turn limits, terminal, and tool output")),
+            SettingsHomeRow(.open(.capabilities), icon: "puzzlepiece.extension", title: AppLocalization.string("Capabilities"), detail: AppLocalization.string("Skills, tools, connectors, and plugins")),
+            SettingsHomeRow(.open(.credentialVault), icon: "key", title: AppLocalization.string("Passwords & logins"), detail: AppLocalization.string("Logins, cards and password managers Hermes signs in with"), identifier: "settings.vault"),
+        ]
+        if appState.canLinkRooms {
+            hermes.append(SettingsHomeRow(.open(.people), icon: "person.2", title: AppLocalization.string("Multiplayer"), detail: AppLocalization.string("Rooms with other people's agents"), identifier: "settings.people"))
+        }
+        // Where the plugin serves Pulse (AppState+Pulse.swift).
+        if appState.showsPulseSettings {
+            hermes.append(SettingsHomeRow(.open(.pulse), icon: "waveform.path.ecg", title: AppLocalization.string("Pulse (beta)"), detail: AppLocalization.string("What Hermes would bring up on its own"), identifier: "settings.pulse"))
+        }
+        var device = [
+            SettingsHomeRow(.open(.appearance), icon: "circle.lefthalf.filled", title: AppLocalization.string("Appearance"), detail: AppLocalization.string("Theme and interface preferences")),
+            SettingsHomeRow(.open(.notifications), icon: "bell", title: AppLocalization.string("Notifications"), detail: AppLocalization.string("Delivery status and setup")),
+        ]
+        device += deviceRows
+        device += [
+            SettingsHomeRow(.open(.screenQuestion), icon: "camera.viewfinder", title: AppLocalization.string("Ask Hermes About Screen"), detail: AppLocalization.string("Action Button shortcut for screenshots"), identifier: "settings.screen-question"),
+            SettingsHomeRow(.open(.about), icon: "shield", title: AppLocalization.string("About & privacy"), detail: AppLocalization.string("App information and data handling")),
+        ]
+        return [
+            SettingsHomeGroup(id: "profile", title: AppLocalization.string("Profile"), symbol: "person.crop.circle", tint: .conduitAccent, rows: [
+                SettingsHomeRow(.open(.profile), icon: "person.crop.circle", title: profileDisplayName, detail: AppLocalization.string("Profile-specific preferences")),
+            ]),
+            SettingsHomeGroup(id: "hermes", title: "Hermes", symbol: "gearshape.2", tint: .conduitAura, rows: hermes),
+            SettingsHomeGroup(id: "connection", title: AppLocalization.string("Connection"), symbol: "gearshape.2", tint: .conduitAura, rows: [
+                SettingsHomeRow(.open(.savedDashboards), icon: "server.rack", title: AppLocalization.string("Saved Dashboards"), detail: savedDashboardsDetail, identifier: "settings.saved-dashboards"),
+                SettingsHomeRow(.open(.gateway), icon: "radio", title: AppLocalization.string("Gateway"), detail: snapshot.server ?? AppLocalization.string("Not connected"), identifier: "settings.gateway"),
+                SettingsHomeRow(.open(.conduitPlugin), icon: "puzzlepiece.extension", title: AppLocalization.string("Conduit plugin"), detail: NotifierPluginSummary.detail(appState.notifierPlugin, update: appState.activeNotifierPluginUpdate), identifier: "settings.conduit-plugin"),
+                SettingsHomeRow(.open(.syncedPreferences), icon: "arrow.triangle.2.circlepath", title: AppLocalization.string("Sync across devices"), detail: syncedPreferencesDetail, identifier: "settings.sync"),
+                SettingsHomeRow(.connectionSetup, icon: "checkmark.circle", title: AppLocalization.string("Connection Setup"), detail: AppLocalization.string("Test, troubleshoot, or change your connection"), identifier: "settings.connection-setup"),
+            ]),
+            SettingsHomeGroup(id: "device", title: AppLocalization.string("On this device"), symbol: "gearshape.2", tint: .conduitAccent, rows: device),
+        ]
     }
 
-    private func v2Action(
-        icon: String,
-        title: String,
-        detail: String,
-        identifier: String,
-        first: Bool = false,
-        action: @escaping () -> Void
-    ) -> some View {
-        Button {
-            Haptics.selection()
-            action()
-        } label: {
-            v2RowLabel(icon: icon, title: title, detail: detail, first: first)
-        }
-        .buttonStyle(.plain)
-        .accessibilityIdentifier(identifier)
-    }
-
-    /// A row in a V2 group: the gold glyph, the name over a short detail,
-    /// a chevron, and a hairline above every row but the first, from the
-    /// text column.
-    private func v2RowLabel(icon: String, title: String, detail: String, statusDot: Color? = nil, first: Bool) -> some View {
-        HStack(spacing: 14) {
-            Image(systemName: icon)
-                .scaledFont(.body.weight(.medium))
-                .conduitFixedGlyph()
-                .foregroundStyle(Color.conduitAccent)
-                .frame(width: 26)
-                .accessibilityHidden(true)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title)
-                    .scaledFont(.callout.weight(.semibold))
-                    .foregroundStyle(.primary)
-                HStack(spacing: 5) {
-                    if let statusDot {
-                        Circle().fill(statusDot).frame(width: 7, height: 7).accessibilityHidden(true)
-                    }
-                    Text(detail)
-                        .scaledFont(.subheadline)
-                        .foregroundStyle(Color.primary.opacity(0.58))
-                        .lineLimit(dynamicTypeSize.isAccessibilitySize ? nil : 2)
-                }
-            }
-            Spacer(minLength: 8)
-            Image(systemName: "chevron.right")
-                .scaledFont(.footnote.weight(.semibold))
-                .foregroundStyle(.conduitTertiary)
-                .accessibilityHidden(true)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.horizontal, 16)
-        .padding(.vertical, 11)
-        .contentShape(Rectangle())
-        .overlay(alignment: .top) {
-            if !first { V2RowDivider(leadingInset: 56) }
+    /// What a row's tap does.
+    private func perform(_ action: SettingsHomeRow.Action) {
+        switch action {
+        case .open(let destination): path.append(destination)
+        case .profiles: showProfileManager = true
+        case .connectionSetup: openConnectionSetup()
         }
     }
-
     /// The Connection row's second line: the state in a word, and the host.
     private var v2ConnectionDetail: String {
         let state = appState.isConnected
@@ -1574,45 +1596,152 @@ private struct SettingsHome: View {
     private var profileDisplayName: String {
         appState.profileDisplayName(snapshot.profile)
     }
+}
 
-    private func homeSection<Content: View>(_ title: String, symbol: String = "gearshape.2", tint: Color, @ViewBuilder content: () -> Content) -> some View {
-        ConduitSettingsSection(title: title, symbol: symbol, tint: tint, content: content)
+/// One row on Settings home: a page it opens, or a sheet.
+private struct SettingsHomeRow: Identifiable {
+    enum Action: Hashable {
+        case open(SettingsDestination)
+        case profiles
+        case connectionSetup
     }
 
-    private func settingsLink(_ destination: SettingsDestination, icon: String, title: String, detail: String, identifier: String = "", statusDot: Color? = nil) -> some View {
-        Button {
-            Haptics.selection()
-            path.append(destination)
-        } label: {
-            settingsRowLabel(icon: icon, title: title, detail: detail, statusDot: statusDot)
+    let action: Action
+    let icon: String
+    let title: String
+    let detail: String
+    var identifier = ""
+    var statusDot: Color?
+
+    init(_ action: Action, icon: String, title: String, detail: String, identifier: String = "", statusDot: Color? = nil) {
+        self.action = action
+        self.icon = icon
+        self.title = title
+        self.detail = detail
+        self.identifier = identifier
+        self.statusDot = statusDot
+    }
+
+    var id: String { "\(icon)|\(title)" }
+}
+
+/// A named group of rows on Settings home.
+private struct SettingsHomeGroup: Identifiable {
+    let id: String
+    let title: String
+    let symbol: String
+    var tint: Color = .conduitAccent
+    let rows: [SettingsHomeRow]
+}
+
+/// A V2 group: its name over one card of rows, with a hairline above every
+/// row but the first.
+private struct V2SettingsHomeGroupCard: View {
+    let group: SettingsHomeGroup
+    let perform: (SettingsHomeRow.Action) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            SettingsSectionHeader(title: group.title, symbol: group.symbol, tint: group.tint)
+            VStack(spacing: 0) {
+                ForEach(Array(group.rows.enumerated()), id: \.element.id) { index, row in
+                    Button {
+                        Haptics.selection()
+                        perform(row.action)
+                    } label: {
+                        V2SettingsHomeRowLabel(row: row, first: index == 0)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityIdentifier(row.identifier)
+                }
+            }
+            .settingsCard()
         }
-        .buttonStyle(.plain)
-        .accessibilityHint(detail)
-        .accessibilityIdentifier(identifier)
     }
+}
 
-    private func settingsActionRow(icon: String, title: String, detail: String, identifier: String, action: @escaping () -> Void) -> some View {
-        Button {
-            Haptics.selection()
-            action()
-        } label: {
-            settingsRowLabel(icon: icon, title: title, detail: detail)
-        }
-        .buttonStyle(.plain)
-        .accessibilityIdentifier(identifier)
-        .accessibilityHint(detail)
-    }
+/// A row in a V2 group: the gold glyph, the name over a short detail,
+/// a chevron, and a hairline above every row but the first, from the
+/// text column.
+private struct V2SettingsHomeRowLabel: View {
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    let row: SettingsHomeRow
+    let first: Bool
 
-    private func settingsRowLabel(icon: String, title: String, detail: String, statusDot: Color? = nil) -> some View {
-        HStack(spacing: 12) {
-            Image(systemName: icon).scaledFont(.subheadline.weight(.semibold)).conduitFixedGlyph().foregroundStyle(.conduitAccent).frame(width: 25)
+    var body: some View {
+        HStack(spacing: 14) {
+            Image(systemName: row.icon)
+                .scaledFont(.body.weight(.medium))
+                .conduitFixedGlyph()
+                .foregroundStyle(Color.conduitAccent)
+                .frame(width: 26)
+                .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 2) {
-                Text(title).scaledFont(.subheadline.weight(.semibold))
+                Text(row.title)
+                    .scaledFont(.callout.weight(.semibold))
+                    .foregroundStyle(.primary)
                 HStack(spacing: 5) {
-                    if let statusDot {
+                    if let statusDot = row.statusDot {
                         Circle().fill(statusDot).frame(width: 7, height: 7).accessibilityHidden(true)
                     }
-                    Text(detail).scaledFont(.caption).foregroundStyle(.secondary).lineLimit(dynamicTypeSize.isAccessibilitySize ? nil : 2)
+                    Text(row.detail)
+                        .scaledFont(.subheadline)
+                        .foregroundStyle(Color.primary.opacity(0.58))
+                        .lineLimit(dynamicTypeSize.isAccessibilitySize ? nil : 2)
+                }
+            }
+            Spacer(minLength: 8)
+            Image(systemName: "chevron.right")
+                .scaledFont(.footnote.weight(.semibold))
+                .foregroundStyle(.conduitTertiary)
+                .accessibilityHidden(true)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 11)
+        .contentShape(Rectangle())
+        .overlay(alignment: .top) {
+            if !first { V2RowDivider(leadingInset: 56) }
+        }
+    }
+}
+
+/// A classic-layout group: a settings section of rows.
+private struct SettingsHomeGroupSection: View {
+    let group: SettingsHomeGroup
+    let perform: (SettingsHomeRow.Action) -> Void
+
+    var body: some View {
+        ConduitSettingsSection(title: group.title, symbol: group.symbol, tint: group.tint) {
+            ForEach(group.rows) { row in
+                Button {
+                    Haptics.selection()
+                    perform(row.action)
+                } label: {
+                    SettingsHomeRowLabel(row: row)
+                }
+                .buttonStyle(.plain)
+                .accessibilityHint(row.detail)
+                .accessibilityIdentifier(row.identifier)
+            }
+        }
+    }
+}
+
+private struct SettingsHomeRowLabel: View {
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    let row: SettingsHomeRow
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: row.icon).scaledFont(.subheadline.weight(.semibold)).conduitFixedGlyph().foregroundStyle(.conduitAccent).frame(width: 25)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(row.title).scaledFont(.subheadline.weight(.semibold))
+                HStack(spacing: 5) {
+                    if let statusDot = row.statusDot {
+                        Circle().fill(statusDot).frame(width: 7, height: 7).accessibilityHidden(true)
+                    }
+                    Text(row.detail).scaledFont(.caption).foregroundStyle(.secondary).lineLimit(dynamicTypeSize.isAccessibilitySize ? nil : 2)
                 }
             }
             Spacer(minLength: 8)
@@ -1673,6 +1802,8 @@ private struct ProfileSettingsDetail: View {
                     .buttonStyle(.settingsPrimary)
                     .disabled(isSaving)
             }
+            // The profile's SOUL.md, on the page Edit Bot opens too.
+            ProfilePersonalitySection(profile: profile)
         }
         .navigationTitle("Profile")
         // A rename elsewhere (Edit Bot, the Profiles sheet) shows here
@@ -1740,7 +1871,6 @@ struct ChatSettingsDetail: View {
             load: load,
             keptValues: keptValues,
             save: save,
-            showsNavigationTitle: false,
             optionOverrides: ["display.personality": ["", "helpful", "concise", "technical", "creative", "teacher", "kawaii", "catgirl", "pirate", "shakespeare", "surfer", "noir", "uwu", "philosopher", "hype"] + shownOptions.personalities],
             fieldsHeader: AppLocalization.string("Hermes"),
             leadingSection: AnyView(
@@ -1770,7 +1900,6 @@ struct ChatSettingsDetail: View {
             loadSchema: loadSchema,
             keptSchema: keptSchema
         )
-        .navigationTitle("Chat")
         .task { options = await loadOptions() }
     }
 
@@ -1917,12 +2046,26 @@ private struct ComposerReturnKeySettings: View {
             Toggle("Return key sends", isOn: $returnKeySends)
                 .tint(.conduitAccent)
                 .accessibilityHint(onMac ? Text(verbatim: "") : Text("Applies to hardware keyboards only. The on-screen keyboard's Return key is unchanged."))
+            // Issue 2219: ⌘Return and the rest of the shortcuts.
+            Text("⌘Return always sends, whatever this setting says.")
+                .scaledFont(.footnote)
+                .foregroundStyle(.secondary)
+            Button {
+                showsShortcuts = true
+            } label: {
+                Label(AppLocalization.string("Keyboard Shortcuts"), systemImage: "command")
+            }
+            .sheet(isPresented: $showsShortcuts) {
+                KeyboardShortcutsSheet()
+            }
         }
     }
+
+    @State private var showsShortcuts = false
 }
 
 /// A reply longer than the screen stops at its start (#365), and an
-/// unread chat opens there (ChatReplyStartPreference, ChatScrollEngine).
+/// unread chat opens there (ChatReplyStartPreference, TranscriptScroller).
 private struct ReplyStartSettings: View {
     @ObservedObject var appLanguage = AppLanguageStore.shared
     @AppStorage(ChatReplyStartPreference.key) private var stopsAtStart = ChatReplyStartPreference.defaultOn
@@ -2009,7 +2152,7 @@ private struct ChatTakeoverSettings: View {
 }
 
 /// Device-only and off by default: a few lines on a finished run of
-/// steps, asked of Hermes with a hidden /btw (ChatStepSummaries). A run's
+/// steps, asked of Hermes as a side question (ChatStepSummaries). A run's
 /// menu asks for one whatever the switch says.
 private struct StepSummarySettings: View {
     @ObservedObject var appLanguage = AppLanguageStore.shared
@@ -2055,8 +2198,9 @@ private struct NotifierPluginUpdateNotice: View {
 
     var body: some View {
         ConduitSettingsSection(
-            // Missing, or on the host but not running: there's nothing to update.
-            title: status.offersInstall || status.isNotServed
+            // Missing, on the host but not running, or managed by the host:
+            // there's nothing to update.
+            title: status.offersInstall || status.isNotServed || status.isManaged
                 ? AppLocalization.string("Conduit plugin")
                 : AppLocalization.string("Update the Conduit plugin"),
             symbol: "arrow.down.circle",
@@ -2125,7 +2269,8 @@ private struct ChatReturnBehaviorSettings: View {
     let persistSurface: (ChatReturnSurface) -> Void
     @State private var behavior: ChatResumeBehavior
     @State private var surface: ChatReturnSurface
-    /// V2 always opens on the Chats list, so it has no "Open to" choice.
+    /// V2 opens on Chats, or on the chat iOS closed it on (#1559), so it
+    /// has no "Open to" choice.
     @AppStorage(V2ShellPreference.key) private var usesV2 = V2ShellPreference.defaultValue
 
     init(
@@ -2146,9 +2291,15 @@ private struct ChatReturnBehaviorSettings: View {
             symbol: "arrow.uturn.backward.circle",
             tint: .conduitAccent
         ) {
-            Text("Stored only on this device, not in your Hermes profile. Choose which surface Conduit opens to and whether it preserves your exact reading position or follows the newest conversation.")
-                .scaledFont(.footnote)
-                .foregroundStyle(.secondary)
+            Group {
+                if usesV2 {
+                    Text("Stored only on this device, not in your Hermes profile. If iOS closes Conduit while you're away, it reopens a chat when you come back. If you swipe Conduit away, it opens on Chats. Choose whether that chat is the one you left, at your exact reading position, or the newest conversation.")
+                } else {
+                    Text("Stored only on this device, not in your Hermes profile. Choose which surface Conduit opens to and whether it preserves your exact reading position or follows the newest conversation.")
+                }
+            }
+            .scaledFont(.footnote)
+            .foregroundStyle(.secondary)
             if !usesV2 {
                 VStack(alignment: .leading, spacing: 8) {
                     Text("Open to")
@@ -2242,6 +2393,14 @@ private struct ResponseBehaviorSettings: View {
     }
 }
 
+/// A titled run of a menu picker's choices, shown as a submenu that opens
+/// in place, so a long list (every provider's models) reads as its groups.
+/// An untitled group's choices sit in the menu itself.
+struct ConduitMenuGroup<ID: Hashable> {
+    var title: String?
+    var choices: [(id: ID, title: String)]
+}
+
 /// A custom menu picker matching the Chat settings selector style,
 /// used by Model and Delegate model settings for visual consistency.
 /// The settings picker row: the setting's name on the left and its current
@@ -2252,18 +2411,43 @@ struct ConduitMenuPicker<ID: Hashable, Label: View>: View {
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     let label: Label
     let value: ID
-    let choices: [(id: ID, title: String)]
+    let groups: [ConduitMenuGroup<ID>]
     let onSelect: (ID) -> Void
 
     init(value: ID, choices: [(id: ID, title: String)], onSelect: @escaping (ID) -> Void, @ViewBuilder label: () -> Label) {
+        self.init(value: value, groups: [ConduitMenuGroup(title: nil, choices: choices)], onSelect: onSelect, label: label)
+    }
+
+    init(value: ID, groups: [ConduitMenuGroup<ID>], onSelect: @escaping (ID) -> Void, @ViewBuilder label: () -> Label) {
         self.value = value
-        self.choices = choices
+        self.groups = groups
         self.onSelect = onSelect
         self.label = label()
     }
 
+    /// The pick's name in the row: a grouped choice names its group too
+    /// ("gpt-5 · openrouter"), as the row stands without the menu.
     private var displayedTitle: String {
-        choices.first(where: { $0.id == value })?.title ?? (value as? String) ?? String(describing: value)
+        for group in groups {
+            if let choice = group.choices.first(where: { $0.id == value }) {
+                guard let groupTitle = group.title else { return choice.title }
+                return "\(choice.title) · \(groupTitle)"
+            }
+        }
+        return (value as? String) ?? String(describing: value)
+    }
+
+    private func choiceButton(_ choice: (id: ID, title: String)) -> some View {
+        Button {
+            onSelect(choice.id)
+        } label: {
+            if choice.id == value {
+                SwiftUI.Label(choice.title, systemImage: "checkmark")
+            } else {
+                Text(verbatim: choice.title)
+            }
+        }
+        .accessibilityAddTraits(choice.id == value ? .isSelected : [])
     }
 
     private var valueText: Text {
@@ -2276,18 +2460,26 @@ struct ConduitMenuPicker<ID: Hashable, Label: View>: View {
 
     var body: some View {
         Menu {
-            ForEach(choices.indices, id: \.self) { index in
-                let choice = choices[index]
-                Button {
-                    onSelect(choice.id)
-                } label: {
-                    if choice.id == value {
-                        SwiftUI.Label(choice.title, systemImage: "checkmark")
-                    } else {
-                        Text(verbatim: choice.title)
+            ForEach(groups.indices, id: \.self) { groupIndex in
+                let group = groups[groupIndex]
+                if let title = group.title {
+                    Menu {
+                        ForEach(group.choices.indices, id: \.self) { index in
+                            choiceButton(group.choices[index])
+                        }
+                    } label: {
+                        // The group holding the pick says so while closed.
+                        if group.choices.contains(where: { $0.id == value }) {
+                            SwiftUI.Label(title, systemImage: "checkmark")
+                        } else {
+                            Text(verbatim: title)
+                        }
+                    }
+                } else {
+                    ForEach(group.choices.indices, id: \.self) { index in
+                        choiceButton(group.choices[index])
                     }
                 }
-                .accessibilityAddTraits(choice.id == value ? .isSelected : [])
             }
         } label: {
             Group {
@@ -2303,11 +2495,26 @@ struct ConduitMenuPicker<ID: Hashable, Label: View>: View {
                         }
                     }
                 } else {
-                    HStack {
-                        label
-                        Spacer(minLength: 8)
-                        valueText.multilineTextAlignment(.trailing).accessibilityHidden(true)
-                        chevron
+                    // The value never wraps beside the name: when both
+                    // don't fit on one line ("Right away, with a
+                    // notification"), it goes under the name, on one line.
+                    ViewThatFits(in: .horizontal) {
+                        HStack {
+                            // One line here, so a long name can't fit this
+                            // candidate by wrapping beside the value.
+                            label.lineLimit(1)
+                            Spacer(minLength: 8)
+                            valueText.fixedSize().accessibilityHidden(true)
+                            chevron
+                        }
+                        VStack(alignment: .leading, spacing: 2) {
+                            label
+                            HStack {
+                                valueText.lineLimit(1).accessibilityHidden(true)
+                                Spacer(minLength: 8)
+                                chevron
+                            }
+                        }
                     }
                 }
             }
@@ -2322,9 +2529,10 @@ struct ConduitMenuPicker<ID: Hashable, Label: View>: View {
     }
 }
 
-/// A Model page editor's stand-in for its pickers until the catalog has
-/// rows: loading, a failed fetch with Try Again, or a gateway with none.
-private struct ModelCatalogPlaceholder: View {
+/// A models list's state when it isn't drawn as models: the Model page
+/// editors' stand-in for their pickers until the catalog has rows, and the
+/// failed row with Try Again under the voice and Pulse pickers' models.
+struct ModelCatalogPlaceholder: View {
     let state: ModelCatalogState
     let retry: () -> Void
 
@@ -2348,6 +2556,16 @@ private struct ModelCatalogPlaceholder: View {
     }
 }
 
+/// When a page that opens on a kept answer (#1533) can save: a single
+/// setting saves at once, but a save that writes several values or a
+/// whole list waits for Hermes' answer, since the kept one may be stale,
+/// and for a save already on its way. `ready`: what it writes is complete.
+enum KeptAnswerGate {
+    static func canSave(answered: Bool, saving: Bool, ready: Bool = true) -> Bool {
+        answered && !saving && ready
+    }
+}
+
 private struct ProfileModelSettingsDetail: View {
     @ObservedObject var appLanguage = AppLanguageStore.shared
     /// The catalog and defaults Hermes gave last time, kept on the phone:
@@ -2355,6 +2573,9 @@ private struct ProfileModelSettingsDetail: View {
     let kept: () -> ProfileModelDefaults?
     let load: () async -> ProfileModelDefaults?
     let save: (String, String, String) async -> Bool
+    /// Raised when a provider or the default changed elsewhere on the page:
+    /// Hermes is asked again, and picks changed here stay.
+    var refresh = 0
     @State private var defaults: ProfileModelDefaults?
     @State private var provider = ""
     @State private var model = ""
@@ -2365,54 +2586,68 @@ private struct ProfileModelSettingsDetail: View {
     /// Hermes has answered. Until then the page shows what it kept, and
     /// Save waits: it writes all three, and a kept one may be stale.
     @State private var answered = false
+    /// Counts the catalog reads, so a read again a later read overtook
+    /// never lands.
+    @State private var catalogRead = 0
+    /// Counts the whole-page reads, so an older one never lands over a
+    /// newer one.
+    @State private var pageRead = 0
+    /// The newest catalog read whose models are shown.
+    @State private var catalogLanded = 0
+    /// Counts the saves Hermes took, so a read asked before one never puts
+    /// back what the save replaced.
+    @State private var savesLanded = 0
     /// A pick was changed here: Hermes' answer then updates the catalog
     /// under the picks, not the picks.
     @State private var edited = false
 
-    private var models: [ModelInfo] { defaults?.providers.first(where: { $0.name == provider })?.models ?? [] }
-    /// Keeps a saved model the catalog no longer lists visible instead of
-    /// silently showing a different one.
-    private var modelChoices: [(id: String, title: String)] {
-        let listed = models.map { (id: $0.id, title: $0.label ?? $0.id) }
-        return model.isEmpty || models.contains(where: { $0.id == model }) ? listed : [(id: model, title: model)] + listed
+    /// What the Model page lists: the catalog kept or Hermes', picked from
+    /// once Hermes answers. A saved model the catalog no longer lists shows
+    /// on top as the pick, never as a different one.
+    private var chooserCatalog: ModelChooserCatalog {
+        ModelChooserCatalog(providers: defaults?.providers ?? [], loaded: defaults != nil, answered: answered, failed: loadFailed)
     }
 
-    /// Keeps a saved provider the catalog does not list (e.g. `auto`)
-    /// visible instead of showing the first provider. Exact `name` equality
-    /// is enough: `provider` only ever holds a row's `name` (from `selection`
-    /// or a menu pick) or a saved value no row matched.
-    private func providerChoices(_ providers: [ProviderInfo]) -> [(id: String, title: String)] {
-        let listed = providers.map { (id: $0.name, title: $0.title) }
-        return provider.isEmpty || providers.contains(where: { $0.name == provider }) ? listed : [(id: provider, title: provider)] + listed
+    private func chooseReasoning(_ next: String) {
+        guard next != reasoning else { return }
+        reasoning = next
+        edited = true
     }
 
     /// The top of the Model page; the page around it scrolls and titles it.
     var body: some View {
         VStack(alignment: .leading, spacing: 24) {
             ConduitSettingsSection(title: AppLocalization.string("Default model"), symbol: "cpu", tint: .conduitAccent) {
-                Text("Select a provider first, then one of its available models. These defaults apply to new sessions in this profile.")
+                Text("These defaults apply to new sessions in this profile.")
                     .scaledFont(.footnote).foregroundStyle(.secondary)
                 let catalog = ModelCatalogState.of(providers: defaults?.providers, failed: loadFailed)
-                if catalog == .ready, let defaults {
-                    ConduitMenuPicker(
-                        value: provider,
-                        choices: providerChoices(defaults.providers),
-                        onSelect: chooseProvider
-                    ) {
-                        Text("Provider").foregroundStyle(.secondary)
+                if catalog == .ready || (defaults != nil && loadFailed) {
+                    NavigationLink {
+                        ModelChooserPage(
+                            title: AppLocalization.string("Default model"),
+                            catalog: chooserCatalog,
+                            retry: { Task { await reload() } },
+                            pick: provider.isEmpty && model.isEmpty ? nil : ModelChooserPick(provider: provider, model: model),
+                            reasoning: ModelChooserReasoning(effort: reasoning, set: chooseReasoning),
+                            onDefault: {},
+                            onPick: { option, item in
+                                guard option.name != provider || item.id != model else { return }
+                                provider = option.name
+                                model = item.id
+                                edited = true
+                            }
+                        )
+                    } label: {
+                        let lines = ModelChooserLinkRow.lines(
+                            pick: provider.isEmpty && model.isEmpty ? nil : ModelChooserPick(provider: provider, model: model),
+                            providers: defaults?.providers ?? [],
+                            defaultTitle: AppLocalization.string("Not set"),
+                            reasoning: ReasoningEffortLevel.displayTitle(for: reasoning)
+                        )
+                        ModelChooserLinkRow(title: AppLocalization.string("Model"), value: lines.value, detail: lines.detail)
                     }
-                    ConduitMenuPicker(
-                        value: model,
-                        choices: modelChoices,
-                        onSelect: { next in
-                            guard next != model else { return }
-                            model = next
-                            edited = true
-                        }
-                    ) {
-                        Text("Model").foregroundStyle(.secondary)
-                    }
-                    .disabled(modelChoices.isEmpty)
+                    .buttonStyle(.plain)
+                    .accessibilityIdentifier("settings.defaultModel")
                     if loadFailed && !answered {
                         // The kept catalog stays up; Save waits for Hermes.
                         ModelCatalogPlaceholder(state: .failed) { Task { await reload() } }
@@ -2421,21 +2656,9 @@ private struct ProfileModelSettingsDetail: View {
                     ModelCatalogPlaceholder(state: catalog) { Task { await reload() } }
                 }
             }
-            ConduitSettingsSection(title: AppLocalization.string("Reasoning"), symbol: "brain.head.profile", tint: .conduitAura) {
-                ConduitMenuPicker(
-                    value: reasoning,
-                    choices: ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"].map { (id: $0, title: $0.capitalized) },
-                    onSelect: { next in
-                        guard next != reasoning else { return }
-                        reasoning = next
-                        edited = true
-                    }
-                ) {
-                    Text("Default reasoning").foregroundStyle(.secondary)
-                }
-            }
             Button { persist() } label: { Label(saving ? AppLocalization.string("Saving…") : AppLocalization.string("Save model defaults"), systemImage: "checkmark").frame(maxWidth: .infinity).padding(.vertical, 6).frame(minHeight: 46) }
-                .disabled(saving || !answered || provider.isEmpty || model.isEmpty).conduitGlassControl(cornerRadius: 17, tint: .conduitAccent.opacity(0.18))
+                .disabled(!KeptAnswerGate.canSave(answered: answered, saving: saving, ready: !provider.isEmpty && !model.isEmpty))
+                .conduitGlassControl(cornerRadius: 17, tint: .conduitAccent.opacity(0.18))
             if let error { Label(error, systemImage: "exclamationmark.triangle.fill").scaledFont(.footnote).foregroundStyle(.red) }
         }
         // What it showed last time, before the first frame; Hermes'
@@ -2444,41 +2667,56 @@ private struct ProfileModelSettingsDetail: View {
             guard defaults == nil, let keptDefaults = kept() else { return }
             show(keptDefaults)
         }
-        .task { await reload() }
+        .task {
+            await reload()
+            // Hermes fetches a stale provider list in the background
+            // meanwhile (issue 1807).
+            await ModelCatalogSettle.readAgain { await settleCatalog() }
+        }
+        .onChange(of: refresh) { _, _ in Task { await reload() } }
     }
 
     private func reload() async {
+        catalogRead += 1
+        pageRead += 1
+        let read = (catalog: catalogRead, page: pageRead, saves: savesLanded)
         loadFailed = false
-        guard let loaded = await load() else {
+        let loaded = await load()
+        // A whole-page read asked since has the newer answer.
+        guard read.page == pageRead else { return }
+        guard let loaded else {
             loadFailed = true
             return
         }
-        show(loaded)
+        // A read again that landed since keeps its newer models; a save
+        // that landed meanwhile keeps its picks.
+        let newerModels = catalogLanded > read.catalog ? defaults?.providers : nil
+        show(loaded, picks: read.saves == savesLanded)
+        if let newerModels { defaults?.providers = newerModels } else { catalogLanded = read.catalog }
         answered = true
     }
 
+    /// The read again (issue 1807) takes only Hermes' models, so a save
+    /// that lands while it's asked keeps its picks; one that fails leaves
+    /// the page as it is.
+    private func settleCatalog() async {
+        // After a first read that failed, the whole page reads again.
+        guard answered else { return await reload() }
+        catalogRead += 1
+        let asked = catalogRead
+        guard let loaded = await load(), asked == catalogRead, defaults != nil else { return }
+        defaults?.providers = loaded.providers
+        catalogLanded = asked
+    }
+
     /// The catalog, and the picks unless they were changed here.
-    private func show(_ loaded: ProfileModelDefaults) {
+    private func show(_ loaded: ProfileModelDefaults, picks: Bool = true) {
         defaults = loaded
-        guard !edited else { return }
+        guard picks, !edited else { return }
         (provider, model) = loaded.selection
         reasoning = loaded.reasoning
     }
 
-    /// Menus fire on the current item too; re-picking it must not swap out
-    /// a saved model.
-    private func chooseProvider(_ next: String) {
-        guard next != provider else { return }
-        edited = true
-        provider = next
-        // The unlisted saved entry has no model list, so keep the model.
-        // Otherwise keep a model the new provider also lists (e.g. one saved
-        // with no provider) rather than swapping it for the row's first model.
-        guard let models = defaults?.providers.first(where: { $0.name == next })?.models else { return }
-        if !models.contains(where: { $0.id == model }) {
-            model = models.first?.id ?? ""
-        }
-    }
     private func persist() {
         Task {
             guard defaults != nil else { return }
@@ -2487,6 +2725,7 @@ private struct ProfileModelSettingsDetail: View {
             if await save(provider, model, reasoning) {
                 // Hermes holds the picks now; its next answer shows them.
                 edited = false
+                savesLanded += 1
             } else {
                 error = AppLocalization.string("Could not save model defaults.")
             }
@@ -2514,68 +2753,83 @@ private struct DelegationModelSettings: View {
     /// Hermes' catalog is in. Until then Save waits: it writes all three,
     /// and a kept one may be stale.
     @State private var answered = false
+    /// Counts the catalog reads, so a read again a later read overtook
+    /// never lands.
+    @State private var catalogRead = 0
+    /// Counts the whole-page reads, so an older one never lands over a
+    /// newer one.
+    @State private var pageRead = 0
+    /// The newest catalog read whose models are shown.
+    @State private var catalogLanded = 0
+    /// Counts the saves Hermes took, so a read asked before one never puts
+    /// back what the save replaced.
+    @State private var savesLanded = 0
     /// A pick was changed here: Hermes' answer leaves the picks alone.
     @State private var edited = false
 
     private static let settingKeys = ["delegation.provider", "delegation.model", "delegation.reasoning_effort"]
-    /// An inherited provider offers the chat row's models, since that is the
-    /// provider the delegate will run on.
-    private var models: [ModelInfo] {
-        let row = provider.isEmpty
-            ? defaults?.providers.first(where: \.isCurrent)
-            : defaults?.providers.first(where: { $0.name == provider })
-        return row?.models ?? []
-    }
-    /// A saved provider or model the catalog does not list stays visible
-    /// instead of the picker silently showing a different one.
-    private var providerChoices: [(id: String, title: String)] {
-        let listed = (defaults?.providers ?? []).map { (id: $0.name, title: $0.title) }
-        let unlisted = provider.isEmpty || listed.contains(where: { $0.id == provider }) ? [] : [(id: provider, title: provider)]
-        return [(id: "", title: AppLocalization.string("Inherit chat provider"))] + unlisted + listed
-    }
-    private var modelChoices: [(id: String, title: String)] {
-        let listed = models.map { (id: $0.id, title: $0.label ?? $0.id) }
-        let unlisted = model.isEmpty || models.contains(where: { $0.id == model }) ? [] : [(id: model, title: model)]
-        return [(id: "", title: AppLocalization.string("Inherit chat model"))] + unlisted + listed
+    /// The delegate's own pick; nil inherits the chat model. A model saved
+    /// without a provider runs on the chat's provider.
+    private var chooserPick: ModelChooserPick? {
+        guard !provider.isEmpty || !model.isEmpty else { return nil }
+        let chatProvider = provider.isEmpty ? defaults?.providers.first(where: \.isCurrent)?.name ?? "" : provider
+        return ModelChooserPick(provider: chatProvider, model: model)
     }
 
     var body: some View {
         ConduitSettingsSection(title: AppLocalization.string("Delegate model"), symbol: "point.3.connected.trianglepath.dotted", tint: .conduitAccent) {
-            Text("Leave both selections empty to inherit the chat model. Set a provider and model to route delegate agents separately.")
+            Text("Delegate agents run on the chat model unless you pick one of their own.")
                 .scaledFont(.footnote).foregroundStyle(.secondary)
             let catalog = ModelCatalogState.of(providers: defaults?.providers, failed: loadFailed)
-            if catalog == .ready {
-                ConduitMenuPicker(
-                    value: provider,
-                    choices: providerChoices,
-                    onSelect: chooseProvider
-                ) {
-                    Text("Delegate provider").foregroundStyle(.secondary)
-                }
-                if !provider.isEmpty || !model.isEmpty {
-                    ConduitMenuPicker(
-                        value: model,
-                        choices: modelChoices,
-                        onSelect: { next in
-                            guard next != model else { return }
-                            model = next
+            if catalog == .ready || (defaults != nil && loadFailed) {
+                NavigationLink {
+                    ModelChooserPage(
+                        title: AppLocalization.string("Delegate model"),
+                        catalog: ModelChooserCatalog(providers: defaults?.providers ?? [], loaded: defaults != nil, answered: answered, failed: loadFailed),
+                        retry: { Task { await reload() } },
+                        defaultChoice: ModelChooserDefault(title: AppLocalization.string("Inherit chat model")),
+                        pick: chooserPick,
+                        isPicked: { option, item in
+                            // An inherited provider is the chat row's.
+                            (provider.isEmpty ? option.isCurrent : option.name == provider) && item.id == model
+                        },
+                        reasoning: ModelChooserReasoning(
+                            effort: reasoning,
+                            inheritTitle: AppLocalization.string("Inherit chat reasoning"),
+                            levels: ReasoningEffortLevel.allCases.filter { $0 != .off },
+                            set: { next in
+                                guard next != reasoning else { return }
+                                reasoning = next
+                                edited = true
+                            }
+                        ),
+                        onDefault: {
+                            guard !provider.isEmpty || !model.isEmpty else { return }
+                            provider = ""
+                            model = ""
+                            edited = true
+                        },
+                        onPick: { option, item in
+                            // The row already picked keeps how it's saved.
+                            guard !((provider.isEmpty ? option.isCurrent : option.name == provider) && item.id == model) else { return }
+                            // A model on the chat's provider leaves the
+                            // provider inherited, so it follows the chats'.
+                            if !(provider.isEmpty && option.isCurrent) { provider = option.name }
+                            model = item.id
                             edited = true
                         }
-                    ) {
-                        Text("Delegate model").foregroundStyle(.secondary)
-                    }
+                    )
+                } label: {
+                    let lines = ModelChooserLinkRow.lines(
+                        pick: chooserPick,
+                        providers: defaults?.providers ?? [],
+                        defaultTitle: AppLocalization.string("Inherit chat model"),
+                        reasoning: reasoning.isEmpty ? nil : ReasoningEffortLevel.displayTitle(for: reasoning)
+                    )
+                    ModelChooserLinkRow(title: AppLocalization.string("Delegate model"), value: lines.value, detail: lines.detail)
                 }
-                ConduitMenuPicker(
-                    value: reasoning,
-                    choices: [(id: "", title: AppLocalization.string("Inherit chat reasoning"))] + ["minimal", "low", "medium", "high", "xhigh", "max", "ultra"].map { (id: $0, title: $0.capitalized) },
-                    onSelect: { next in
-                        guard next != reasoning else { return }
-                        reasoning = next
-                        edited = true
-                    }
-                ) {
-                    Text("Delegate reasoning").foregroundStyle(.secondary)
-                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("settings.delegateModel")
                 if loadFailed && !answered {
                     // The kept catalog stays up; Save waits for Hermes.
                     ModelCatalogPlaceholder(state: .failed) { Task { await reload() } }
@@ -2584,7 +2838,8 @@ private struct DelegationModelSettings: View {
                 ModelCatalogPlaceholder(state: catalog) { Task { await reload() } }
             }
             Button { persist() } label: { Label(saving ? AppLocalization.string("Saving…") : AppLocalization.string("Save delegate defaults"), systemImage: "checkmark").frame(maxWidth: .infinity).padding(.vertical, 6).frame(minHeight: 42) }
-                .disabled(saving || !answered || defaults == nil).conduitGlassControl(cornerRadius: 15, tint: .conduitAccent.opacity(0.18))
+                .disabled(!KeptAnswerGate.canSave(answered: answered, saving: saving, ready: defaults != nil))
+                .conduitGlassControl(cornerRadius: 15, tint: .conduitAccent.opacity(0.18))
             if let error { Text(error).scaledFont(.caption).foregroundStyle(.red) }
         }
         // What it showed last time, before the first frame; Hermes'
@@ -2593,26 +2848,53 @@ private struct DelegationModelSettings: View {
             guard defaults == nil, let models = keptModels(), let settings = keptSettings(Self.settingKeys) else { return }
             show(models, settings: settings)
         }
-        .task { await reload() }
+        .task {
+            await reload()
+            // Hermes fetches a stale provider list in the background
+            // meanwhile (issue 1807).
+            await ModelCatalogSettle.readAgain { await settleCatalog() }
+        }
     }
 
     private func reload() async {
+        catalogRead += 1
+        pageRead += 1
+        let read = (catalog: catalogRead, page: pageRead, saves: savesLanded)
         loadFailed = false
         async let modelRequest = loadModels()
         async let settingRequest = loadSettings(Self.settingKeys)
         let (loaded, settings) = await (modelRequest, settingRequest)
+        // A whole-page read asked since has the newer answer.
+        guard read.page == pageRead else { return }
         // A catalog that didn't load says so, with Try Again, instead of
         // loading forever; a re-load that fails keeps the one it had.
         if loaded == nil { loadFailed = true }
-        show(loaded, settings: settings)
+        // A read again that landed since keeps its newer models; a save
+        // that landed meanwhile keeps its picks.
+        let newerModels = catalogLanded > read.catalog ? defaults?.providers : nil
+        show(loaded, settings: settings, picks: read.saves == savesLanded)
+        if let newerModels { defaults?.providers = newerModels } else if loaded != nil { catalogLanded = read.catalog }
         if loaded != nil { answered = true }
+    }
+
+    /// The read again (issue 1807) takes only Hermes' models, so a save
+    /// that lands while it's asked keeps its picks; one that fails leaves
+    /// the page as it is.
+    private func settleCatalog() async {
+        // After a first read that failed, the whole page reads again.
+        guard answered else { return await reload() }
+        catalogRead += 1
+        let asked = catalogRead
+        guard let loaded = await loadModels(), asked == catalogRead, defaults != nil else { return }
+        defaults?.providers = loaded.providers
+        catalogLanded = asked
     }
 
     /// The catalog when there is one, and the picks unless they were
     /// changed here.
-    private func show(_ loaded: ProfileModelDefaults?, settings: [String: ProfileSettingValue]) {
+    private func show(_ loaded: ProfileModelDefaults?, settings: [String: ProfileSettingValue], picks: Bool = true) {
         if let loaded { defaults = loaded }
-        guard !edited else { return }
+        guard picks, !edited else { return }
         let configuredProvider = settings["delegation.provider"]?.textValue ?? ""
         let configuredModel = settings["delegation.model"]?.textValue ?? ""
         (provider, model) = defaults?.delegateSelection(provider: configuredProvider, model: configuredModel)
@@ -2620,19 +2902,6 @@ private struct DelegationModelSettings: View {
         reasoning = settings["delegation.reasoning_effort"]?.textValue ?? ""
     }
 
-    private func chooseProvider(_ next: String) {
-        guard next != provider else { return }
-        edited = true
-        provider = next
-        guard !next.isEmpty else {
-            model = ""
-            return
-        }
-        guard let models = defaults?.providers.first(where: { $0.name == next })?.models else { return }
-        if !models.contains(where: { $0.id == model }) {
-            model = models.first?.id ?? ""
-        }
-    }
     private func persist() {
         Task {
             saving = true
@@ -2642,6 +2911,7 @@ private struct DelegationModelSettings: View {
             let reasoningSaved = modelSaved ? await save("delegation.reasoning_effort", .text(reasoning)) : false
             if reasoningSaved {
                 edited = false
+                savesLanded += 1
             } else {
                 error = AppLocalization.string("Could not save delegate defaults.")
             }
@@ -2728,32 +2998,68 @@ private struct DelegationPauseSettings: View {
 }
 
 /// The Model page's `fallback_providers`: the models Hermes tries, in
-/// order, when the default model fails.
+/// order, when the default model fails. Memory & delegation's subagent
+/// fallbacks (`delegation.fallback_providers`) too, which follow the
+/// chat's until they have their own (`offersInherit`).
 private struct FallbackModelsSettings: View {
     @ObservedObject var appLanguage = AppLanguageStore.shared
+    var title = AppLocalization.string("Fallback models")
+    var caption = AppLocalization.string("If the default model fails, Hermes tries these in order.")
+    /// The list can follow another one (null) instead of having its own.
+    var offersInherit = false
     /// The catalog and list Hermes gave last time, kept on the phone: the
     /// editor opens on them while it asks again (#1533).
     let keptModels: () -> ProfileModelDefaults?
-    let kept: () -> [ProfileFallbackModel]?
+    let kept: () -> ProfileFallbackChain?
     let loadModels: () async -> ProfileModelDefaults?
-    let load: () async -> [ProfileFallbackModel]?
-    let save: ([ProfileFallbackModel]) async -> Bool
+    let load: () async -> ProfileFallbackChain?
+    let save: (ProfileFallbackChain) async -> Bool
+    /// Raised when a provider was added or removed: the catalog is read
+    /// again, the rows being edited stay.
+    var refresh = 0
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var defaults: ProfileModelDefaults?
     @State private var entries: [ProfileFallbackModel] = []
     @State private var saved: [ProfileFallbackModel] = []
+    /// Follows the other list (only with `offersInherit`).
+    @State private var inherits = false
+    @State private var savedInherits = false
     @State private var loaded = false
     /// Hermes' list is in. Until then the kept list can't be edited or
     /// saved: a save replaces the whole list, and the kept one may be
     /// stale and has no credentials (an entry's `api_key`) to write back.
     @State private var answered = false
+    /// Counts the catalog reads, so a read again a later read overtook
+    /// never lands.
+    @State private var catalogRead = 0
+    /// Counts the whole-page reads, so an older one never lands over a
+    /// newer one.
+    @State private var pageRead = 0
+    /// The newest catalog read whose models are shown.
+    @State private var catalogLanded = 0
+    /// Counts the saves Hermes took, so a read asked before one never puts
+    /// back what the save replaced.
+    @State private var savesLanded = 0
     @State private var saving = false
     @State private var error: String?
+    /// Add fallback's Model page is open.
+    @State private var addingFallback = false
+    /// The last read of the models failed (not a save).
+    @State private var catalogFailed = false
 
     private var providers: [ProviderInfo] { defaults?.providers ?? [] }
 
+    /// Changed since Hermes' list, and every listed fallback complete
+    /// unless the list follows the other one.
+    private var canSave: Bool {
+        let shownInherits = offersInherit && inherits
+        guard shownInherits != savedInherits || (!shownInherits && entries != saved) else { return false }
+        return shownInherits || entries.allSatisfy(\.isComplete)
+    }
+
     var body: some View {
-        ConduitSettingsSection(title: AppLocalization.string("Fallback models"), symbol: "arrow.triangle.branch", tint: .conduitAura) {
-            Text("If the default model fails, Hermes tries these in order.")
+        ConduitSettingsSection(title: title, symbol: "arrow.triangle.branch", tint: .conduitAura) {
+            Text(caption)
                 .scaledFont(.footnote).foregroundStyle(.secondary)
             if !loaded {
                 // A list that didn't load is never edited: saving it would
@@ -2765,23 +3071,40 @@ private struct FallbackModelsSettings: View {
                         .buttonStyle(.settings)
                 }
             } else {
-                if entries.isEmpty {
-                    Text("No fallback models yet.")
-                        .scaledFont(.footnote).foregroundStyle(.secondary)
+                if offersInherit {
+                    Picker(AppLocalization.string("Fallbacks"), selection: Binding(
+                        get: { inherits },
+                        set: { next in withAnimation(ConduitMotion.ease(reduceMotion: reduceMotion)) { inherits = next } }
+                    )) {
+                        Text("Same as the chat").tag(true)
+                        Text("Their own").tag(false)
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .disabled(!answered || saving)
+                    .accessibilityIdentifier("settings.delegateFallbacks.inherit")
                 }
-                ForEach(Array(entries.enumerated()), id: \.element.id) { index, entry in
-                    entryRow(index: index, entry: entry)
-                        .disabled(!answered)
+                if !(offersInherit && inherits) {
+                    if entries.isEmpty {
+                        Text(offersInherit ? AppLocalization.string("None: a subagent's model that fails isn't retried on another.") : AppLocalization.string("No fallback models yet."))
+                            .scaledFont(.footnote).foregroundStyle(.secondary)
+                    }
+                    ForEach(Array(entries.enumerated()), id: \.element.id) { index, entry in
+                        entryRow(index: index, entry: entry)
+                            .disabled(!answered)
+                    }
                 }
                 AdaptiveStack(spacing: 8) {
-                    Button { addEntry() } label: { Label(AppLocalization.string("Add fallback"), systemImage: "plus") }
-                        .buttonStyle(.settings)
-                        .disabled(saving || !answered || providers.isEmpty)
+                    if !(offersInherit && inherits) {
+                        Button { addingFallback = true } label: { Label(AppLocalization.string("Add fallback"), systemImage: "plus") }
+                            .buttonStyle(.settings)
+                            .disabled(!KeptAnswerGate.canSave(answered: answered, saving: saving, ready: !providers.isEmpty))
+                    }
                     Button(saving ? AppLocalization.string("Saving…") : AppLocalization.string("Save fallbacks")) { persist() }
                         .buttonStyle(.settingsPrimary)
-                        .disabled(saving || !answered || entries == saved || entries.contains { !$0.isComplete })
+                        .disabled(!KeptAnswerGate.canSave(answered: answered, saving: saving, ready: canSave))
                 }
-                if entries.contains(where: { !$0.isComplete }) {
+                if !(offersInherit && inherits), entries.contains(where: { !$0.isComplete }) {
                     Text("Pick a provider and model for every fallback to save.")
                         .scaledFont(.caption).foregroundStyle(.secondary)
                 }
@@ -2793,16 +3116,35 @@ private struct FallbackModelsSettings: View {
             }
             if let error { Text(error).scaledFont(.caption).foregroundStyle(.red) }
         }
+        .navigationDestination(isPresented: $addingFallback) { addChooser }
         // What it showed last time, before the first frame; Hermes'
         // answer follows.
         .onAppear {
-            guard !loaded, let models = keptModels(), let keptEntries = kept() else { return }
+            guard !loaded, let models = keptModels(), let keptChain = kept() else { return }
             defaults = models
-            entries = keptEntries
-            saved = keptEntries
+            entries = keptChain.entries
+            saved = keptChain.entries
+            inherits = keptChain.inherits
+            savedInherits = keptChain.inherits
             loaded = true
         }
-        .task { await reload() }
+        .task {
+            await reload()
+            // Hermes fetches a stale provider list in the background
+            // meanwhile (issue 1807).
+            await ModelCatalogSettle.readAgain { await settleCatalog() }
+        }
+        .onChange(of: refresh) { _, _ in
+            Task {
+                catalogRead += 1
+                let asked = catalogRead
+                // A read asked since has the newer models.
+                if let models = await loadModels(), asked == catalogRead {
+                    defaults = models
+                    catalogLanded = asked
+                }
+            }
+        }
     }
 
     private func entryRow(index: Int, entry: ProfileFallbackModel) -> some View {
@@ -2829,51 +3171,64 @@ private struct FallbackModelsSettings: View {
                 .accessibilityLabel(Text(AppLocalization.string("More")))
                 .accessibilityValue(Text(verbatim: entry.model))
             }
-            ConduitMenuPicker(value: entry.provider, choices: providerChoices(entry), onSelect: { chooseProvider($0, for: entry.id) }) {
-                Text("Provider").foregroundStyle(.secondary)
+            NavigationLink {
+                chooser(for: entry.id)
+            } label: {
+                let lines = ModelChooserLinkRow.lines(
+                    pick: ModelChooserPick(provider: entry.provider, model: entry.model),
+                    providers: providers,
+                    defaultTitle: AppLocalization.string("Not set")
+                )
+                ModelChooserLinkRow(title: AppLocalization.string("Model"), value: lines.value, detail: lines.detail)
             }
-            ConduitMenuPicker(value: entry.model, choices: modelChoices(entry), onSelect: { chooseModel($0, for: entry.id) }) {
-                Text("Model").foregroundStyle(.secondary)
-            }
-            .disabled(modelChoices(entry).isEmpty)
+            .buttonStyle(.plain)
         }
     }
 
-    /// A provider or model the catalog doesn't list stays visible, so a
-    /// hand-written entry is never shown as a different one.
-    private func providerChoices(_ entry: ProfileFallbackModel) -> [(id: String, title: String)] {
-        let listed = providers.map { (id: $0.name, title: $0.title) }
-        return entry.provider.isEmpty || listed.contains(where: { $0.id == entry.provider }) ? listed : [(id: entry.provider, title: entry.provider)] + listed
+    /// The Model page for a fallback, found again by id: the row may have
+    /// moved or gone while the page was open. A model the catalog doesn't
+    /// list stays shown as the pick, never as a different one.
+    private func chooser(for id: UUID) -> some View {
+        let entry = entries.first { $0.id == id }
+        return ModelChooserPage(
+            title: AppLocalization.string("Fallback model"),
+            catalog: chooserCatalog,
+            retry: { Task { await reload() } },
+            pick: entry.map { ModelChooserPick(provider: $0.provider, model: $0.model) },
+            disabled: !answered || saving,
+            onDefault: {},
+            onPick: { option, item in choose(option, item, for: id) }
+        )
     }
 
-    private func modelChoices(_ entry: ProfileFallbackModel) -> [(id: String, title: String)] {
-        let models = providers.first(where: { $0.name == entry.provider })?.models ?? []
-        let listed = models.map { (id: $0.id, title: $0.label ?? $0.id) }
-        return entry.model.isEmpty || listed.contains(where: { $0.id == entry.model }) ? listed : [(id: entry.model, title: entry.model)] + listed
+    /// Add fallback's page: the model picked is added at the end.
+    private var addChooser: some View {
+        ModelChooserPage(
+            title: AppLocalization.string("Add fallback"),
+            catalog: chooserCatalog,
+            retry: { Task { await reload() } },
+            pick: nil,
+            disabled: !answered || saving,
+            onDefault: {},
+            onPick: { option, item in
+                entries.append(ProfileFallbackModel(provider: option.name, model: item.id))
+            }
+        )
     }
 
-    /// Menus act on the entry they were drawn for, found again by id: the
-    /// row may have moved or gone while the menu was open.
-    private func chooseModel(_ next: String, for id: UUID) {
+    private var chooserCatalog: ModelChooserCatalog {
+        ModelChooserCatalog(providers: providers, loaded: defaults != nil, answered: answered, failed: catalogFailed)
+    }
+
+    private func choose(_ option: ProviderInfo, _ item: ModelInfo, for id: UUID) {
         guard let index = entries.firstIndex(where: { $0.id == id }) else { return }
-        entries[index].model = next
-    }
-
-    private func chooseProvider(_ next: String, for id: UUID) {
-        guard let index = entries.firstIndex(where: { $0.id == id }), next != entries[index].provider else { return }
-        entries[index].provider = next
-        let models = providers.first(where: { $0.name == next })?.models ?? []
-        if !models.contains(where: { $0.id == entries[index].model }) {
-            entries[index].model = models.first?.id ?? ""
+        if option.name != entries[index].provider {
+            // Routing written for the old provider would send the new one to
+            // the wrong endpoint.
+            entries[index].extras = [:]
         }
-        // Routing written for the old provider would send the new one to
-        // the wrong endpoint.
-        entries[index].extras = [:]
-    }
-
-    private func addEntry() {
-        guard let row = providers.first(where: { !$0.isCurrent }) ?? providers.first else { return }
-        entries.append(ProfileFallbackModel(provider: row.name, model: row.models.first?.id ?? ""))
+        entries[index].provider = option.name
+        entries[index].model = item.id
     }
 
     private func move(_ id: UUID, by offset: Int) {
@@ -2884,19 +3239,37 @@ private struct FallbackModelsSettings: View {
     }
 
     private func reload() async {
+        catalogRead += 1
+        pageRead += 1
+        let read = (catalog: catalogRead, page: pageRead, saves: savesLanded)
         error = nil
+        catalogFailed = false
         async let modelRequest = loadModels()
         async let entryRequest = load()
-        let (models, loadedEntries) = await (modelRequest, entryRequest)
+        let (models, loadedChain) = await (modelRequest, entryRequest)
+        // A whole-page read asked since has the newer answer.
+        guard read.page == pageRead else { return }
+        let loadedEntries = loadedChain?.entries
         // Without the model catalog no fallback can be added or changed, so
         // a half-loaded list fails with Try Again instead of a silently
         // disabled Add. A re-load (the editor re-appearing) that fails keeps
         // the catalog and rows it already had: only the error is new.
         guard let loadedEntries, let models else {
             error = AppLocalization.string("Could not load fallback models.")
+            catalogFailed = true
             return
         }
-        defaults = models
+        // A read again that landed since has the newer models.
+        if catalogLanded < read.catalog || defaults == nil {
+            defaults = models
+            catalogLanded = max(catalogLanded, read.catalog)
+        }
+        // A save that landed meanwhile holds the newer list.
+        guard read.saves == savesLanded else {
+            loaded = true
+            answered = true
+            return
+        }
         // A re-load keeps fallbacks the user is still editing, but what
         // they compare against is what the host holds now: an edit changed
         // back to the old list still differs from another client's save.
@@ -2904,9 +3277,25 @@ private struct FallbackModelsSettings: View {
         if !loaded || (entries == saved && entries != loadedEntries) {
             entries = loadedEntries
         }
+        let loadedInherits = offersInherit && (loadedChain?.inherits ?? false)
+        if !loaded || inherits == savedInherits { inherits = loadedInherits }
         saved = loadedEntries
+        savedInherits = loadedInherits
         loaded = true
         answered = true
+    }
+
+    /// The read again (issue 1807) takes only Hermes' models, so a save
+    /// that lands while it's asked keeps its picks; one that fails leaves
+    /// the page as it is.
+    private func settleCatalog() async {
+        // After a first read that failed, the whole page reads again.
+        guard answered else { return await reload() }
+        catalogRead += 1
+        let asked = catalogRead
+        guard let models = await loadModels(), asked == catalogRead, defaults != nil else { return }
+        defaults?.providers = models.providers
+        catalogLanded = asked
     }
 
     private func persist() {
@@ -2914,8 +3303,11 @@ private struct FallbackModelsSettings: View {
             saving = true
             error = nil
             let next = entries
-            if await save(next) {
+            let nextInherits = offersInherit && inherits
+            if await save(ProfileFallbackChain(inherits: nextInherits, entries: next)) {
                 saved = next
+                savedInherits = nextInherits
+                savesLanded += 1
             } else {
                 error = AppLocalization.string("Could not save fallback models.")
             }
@@ -2939,7 +3331,21 @@ private struct MemorySettingsDetail: View {
     let loadDelegationPaused: () async -> Bool?
     let keptDelegationPaused: () -> Bool?
     let setDelegationPaused: (Bool) async -> Bool?
+    let routing: DelegationRoutingActions
+    let keptDelegateFallbacks: () -> ProfileFallbackChain?
+    let loadDelegateFallbacks: () async -> ProfileFallbackChain?
+    let saveDelegateFallbacks: (ProfileFallbackChain) async -> Bool
     @State private var options: ProfileConfigOptions?
+    /// The routing the section shows: in a routed mode Delegate model
+    /// isn't used, and says so.
+    @State private var shownRouting: DelegationRouting?
+    @State private var schema: ProfileConfigSchema?
+
+    /// The subagents' fallbacks show only when this Hermes has them.
+    private var hasDelegateFallbacks: Bool {
+        guard let schema, !schema.isEmpty else { return false }
+        return schema["delegation.fallback_providers"] != nil
+    }
 
     var body: some View {
         let shownOptions = options ?? keptOptions() ?? ProfileConfigOptions()
@@ -2953,6 +3359,8 @@ private struct MemorySettingsDetail: View {
             optionOverrides: ["memory.provider": shownOptions.memoryProviders, "context.engine": shownOptions.contextEngines],
             trailingSection: AnyView(
                 VStack(spacing: 24) {
+                    DelegationRoutingSettings(actions: routing, onRouting: { shownRouting = $0 })
+                    let routed = shownRouting?.routesOwnSubagentModel ?? false
                     DelegationModelSettings(
                         keptModels: keptModels,
                         keptSettings: keptValues,
@@ -2960,6 +3368,21 @@ private struct MemorySettingsDetail: View {
                         loadSettings: load,
                         save: save
                     )
+                    .disabled(routed)
+                    .opacity(routed ? 0.45 : 1)
+                    .accessibilityHint(routed ? Text(AppLocalization.string("Not used while routes pick each subagent's model.")) : Text(verbatim: ""))
+                    if hasDelegateFallbacks {
+                        FallbackModelsSettings(
+                            title: AppLocalization.string("Delegate fallback models"),
+                            caption: AppLocalization.string("If a subagent's model fails, Hermes tries these in order. A subagent on the chat's model can use the chat's fallbacks; one on its own delegate model or route gets none unless these are its own."),
+                            offersInherit: true,
+                            keptModels: keptModels,
+                            kept: keptDelegateFallbacks,
+                            loadModels: loadModels,
+                            load: loadDelegateFallbacks,
+                            save: saveDelegateFallbacks
+                        )
+                    }
                     DelegationPauseSettings(kept: keptDelegationPaused, load: loadDelegationPaused, save: setDelegationPaused)
                 }
             ),
@@ -2967,7 +3390,14 @@ private struct MemorySettingsDetail: View {
             loadSchema: loadSchema,
             keptSchema: keptSchema
         )
-        .task { options = await loadOptions() }
+        .onAppear { if schema == nil { schema = keptSchema() } }
+        .task {
+            async let loadedOptions = loadOptions()
+            async let loadedSchema = loadSchema()
+            let (nextOptions, nextSchema) = await (loadedOptions, loadedSchema)
+            options = nextOptions
+            if !nextSchema.isEmpty { schema = nextSchema }
+        }
     }
 }
 
@@ -3006,7 +3436,6 @@ struct ProfileConfigSettingsPage: View {
     /// on them while it asks again (#1533). Nil when none are kept.
     var keptValues: (([String]) -> [String: ProfileSettingValue]?)? = nil
     let save: (String, ProfileSettingValue) async -> Bool
-    var showsNavigationTitle = true
     var optionOverrides: [String: [String]] = [:]
     /// Names the fields' card when other sections share the page.
     var fieldsHeader: String? = nil
@@ -3061,7 +3490,7 @@ struct ProfileConfigSettingsPage: View {
             }
             if let trailingSection { trailingSection }
         }
-        .navigationTitle(showsNavigationTitle ? title : "")
+        .navigationTitle(title)
         // What it showed last time, before the first frame; Hermes'
         // answer follows.
         .onAppear(perform: showKept)
@@ -3462,15 +3891,15 @@ private struct GatewaySettingsDetail: View {
                     .scaledFont(.footnote).foregroundStyle(.secondary)
                 // The gateway's state, connectors, last connection and logs,
                 // which the chat header used to open.
+                // Open while disconnected too: that's when its logs, traces
+                // and device reports are needed most.
                 NavigationLink {
-                    GatewayDiagnosticsSheet(embedded: true)
+                    GatewayDiagnosticsSheet(placement: .settings)
                         .v2TabBarClearance()
                 } label: {
-                    Label(AppLocalization.string("Diagnostics & logs"), systemImage: "doc.text.magnifyingglass")
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .frame(minHeight: 44)
+                    SettingsLinkRow(title: AppLocalization.string("Diagnostics & logs"))
                 }
-                .disabled(snapshot.server == nil)
+                .buttonStyle(.plain)
                 .accessibilityIdentifier("settings.gateway.diagnostics")
             }
             ConduitSettingsSection(title: "Cloudflare Access", symbol: "shield.lefthalf.filled", tint: .conduitAccent) {
@@ -3524,8 +3953,12 @@ private struct AppearanceSettingsDetail: View {
     @AppStorage(V2ShellPreference.key) private var usesV2 = V2ShellPreference.defaultValue
     @AppStorage(V2MainButtonPreference.key) private var mainButtonNewChat = V2MainButtonPreference.defaultValue
     @AppStorage(V2ChatListPreference.key) private var chatListBeside = V2ChatListPreference.defaultValue
+    @AppStorage(V2SessionsBarPreferences.Profiles.key) private var sessionsBarProfiles = V2SessionsBarPreferences.Profiles.defaultValue
+    @AppStorage(V2SessionsBarPreferences.showsProjectsKey) private var sessionsBarProjects = V2SessionsBarPreferences.showsProjectsDefault
+    @AppStorage(V2SessionsBarPreferences.showsPulseKey) private var sessionsBarPulse = V2SessionsBarPreferences.showsPulseDefault
+    @AppStorage(V2SessionsBarPreferences.showsArtifactsKey) private var sessionsBarArtifacts = V2SessionsBarPreferences.showsArtifactsDefault
     @AppStorage(ChatVoiceButtonAction.key) private var chatVoiceButton = ChatVoiceButtonAction.defaultValue.rawValue
-    @AppStorage(ProjectChatsInChats.key) private var projectChats = ProjectChatsInChats.deviceDefault()
+    @AppStorage(ProjectChatsInChats.key) private var projectChats = ProjectChatsInChats.defaultValue
     @AppStorage(ConduitAccent.storageKey) private var accentChoice = ConduitAccent.defaultValue
     @State private var selected: ThemePreference
     @State private var isChangingIcon = false
@@ -3645,25 +4078,50 @@ private struct AppearanceSettingsDetail: View {
                     .pickerStyle(.segmented)
                 }
 
+                ConduitSettingsSection(title: AppLocalization.string("Sessions bar"), symbol: "rectangle.topthird.inset.filled", tint: .conduitAccent) {
+                    Text("Choose what the bar above Chats, Tasks and Settings shows. Current only keeps the active profile's name, so switching takes one more tap; tapping it still opens the profiles list. Applies on iPhone, iPad and Mac.")
+                        .scaledFont(.footnote)
+                        .foregroundStyle(.secondary)
+                    Picker("Profiles", selection: $sessionsBarProfiles) {
+                        Text("All").tag(V2SessionsBarPreferences.Profiles.all)
+                        Text("Current only").tag(V2SessionsBarPreferences.Profiles.currentOnly)
+                    }
+                    .pickerStyle(.segmented)
+                    Toggle("Projects", isOn: Binding(
+                        get: { sessionsBarProjects },
+                        set: { on in
+                            sessionsBarProjects = on
+                            // Turning it off takes a stored Projects page with
+                            // it here too, so turning it back on while the
+                            // list isn't drawing still starts on Sessions.
+                            if !on { V2SessionsBarControls.clearStoredProjectsPage() }
+                        }
+                    ))
+                        .tint(.conduitAccent)
+                    Toggle("Pulse", isOn: $sessionsBarPulse)
+                        .tint(.conduitAccent)
+                    Toggle("Artifacts", isOn: $sessionsBarArtifacts)
+                        .tint(.conduitAccent)
+                }
+
                 // The big button beside a chat's composer. A profile can
                 // choose its own in Settings > Voice.
                 ConduitSettingsSection(title: AppLocalization.string("Chat voice button"), symbol: "mic.circle", tint: .conduitAccent) {
                     Text("Choose what the round button beside a chat's message box does. A live call stays in the chat's top bar and in the button's touch-and-hold menu. Each profile can choose its own in Voice settings.")
                         .scaledFont(.footnote)
                         .foregroundStyle(.secondary)
-                    Picker("Chat voice button", selection: Binding(
-                        get: { ChatVoiceButtonAction.resolved(profile: nil, app: chatVoiceButton) },
-                        set: {
+                    // Three choices whose names run long in some languages:
+                    // Settings' dropdown field, not a segmented control.
+                    ConduitMenuPicker(
+                        value: ChatVoiceButtonAction.resolved(profile: nil, app: chatVoiceButton),
+                        choices: ChatVoiceButtonAction.offered.map { (id: $0, title: $0.title) },
+                        onSelect: {
                             Haptics.selection()
                             chatVoiceButton = $0.rawValue
                         }
-                    )) {
-                        ForEach(ChatVoiceButtonAction.offered, id: \.self) { action in
-                            Text(action.title).tag(action)
-                        }
+                    ) {
+                        Text("Tap").foregroundStyle(.secondary)
                     }
-                    // Three choices whose names run long in some languages.
-                    .pickerStyle(.menu)
                 }
 
                 // A project's chats otherwise show only on its page.
@@ -3980,25 +4438,28 @@ private struct NotificationsSettingsDetail: View {
 
             // #605: a running turn on the Lock Screen and in the Dynamic
             // Island. Updated by Conduit while it runs; in the background
-            // only through the relay, so it needs notifications on.
-            ConduitSettingsSection(title: AppLocalization.string("Lock Screen"), symbol: "lock.iphone", tint: .conduitAccent) {
-                Toggle(isOn: Binding(
-                    get: { liveActivitiesEnabled },
-                    set: { value in
-                        Haptics.selection()
-                        liveActivitiesEnabled = value
-                        if !value { LiveTurnActivities.shared.endAll() }
+            // only through the relay, so it needs notifications on. A Mac
+            // has neither (issue 1877).
+            if LiveTurnActivities.isAvailable {
+                ConduitSettingsSection(title: AppLocalization.string("Lock Screen"), symbol: "lock.iphone", tint: .conduitAccent) {
+                    Toggle(isOn: Binding(
+                        get: { liveActivitiesEnabled },
+                        set: { value in
+                            Haptics.selection()
+                            liveActivitiesEnabled = value
+                            if !value { LiveTurnActivities.shared?.endAll() }
+                        }
+                    )) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(AppLocalization.string("Show progress on the Lock Screen"))
+                            Text(AppLocalization.string("While Hermes works on a message you sent: what it's doing, how long it has run, its tools and context. Keeps updating in the background when notifications are on."))
+                                .scaledFont(.caption)
+                                .foregroundStyle(.secondary)
+                        }
                     }
-                )) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(AppLocalization.string("Show progress on the Lock Screen"))
-                        Text(AppLocalization.string("While Hermes works on a message you sent: what it's doing, how long it has run, its tools and context. Keeps updating in the background when notifications are on."))
-                            .scaledFont(.caption)
-                            .foregroundStyle(.secondary)
-                    }
+                    .tint(.conduitAccent)
+                    .accessibilityIdentifier("notifications.live-activities")
                 }
-                .tint(.conduitAccent)
-                .accessibilityIdentifier("notifications.live-activities")
             }
 
             if notifications.isEnabled {
@@ -4010,6 +4471,10 @@ private struct NotificationsSettingsDetail: View {
                             .foregroundStyle(.secondary)
                     }
                     notifyMeWhenToggles
+                    // Linked Rooms: while the host's plugin keeps invites.
+                    if appState.notifierPlugin.reports(RoomInvitesClient.capability) {
+                        notificationToggle(AppLocalization.string("Room invites"), detail: AppLocalization.string("Someone you've linked with invites you to a room"), keyPath: \.roomInvite)
+                    }
                     notificationDetailPicker
                     notificationToggle(AppLocalization.string("Approval cards in pushes"), detail: AppLocalization.string("Include approval details so cards work from notifications. Disable for maximum privacy."), keyPath: \.decisionCards)
                 }
@@ -4033,7 +4498,9 @@ private struct NotificationsSettingsDetail: View {
                     // when it needs attention.
                     if appState.notifierPlugin.needsAttention {
                         // Missing, or on the host but not running: nothing to update.
+                        // A managed host's only offer is its restart: nothing to update.
                         pluginPageLink(appState.notifierPlugin.offersInstall || appState.notifierPlugin.isNotServed
+                            || appState.notifierPlugin.isManaged
                             ? AppLocalization.string("Open Conduit plugin")
                             : AppLocalization.string("Update the Conduit plugin"))
                     }
@@ -4091,8 +4558,10 @@ private struct NotificationsSettingsDetail: View {
                         // pairings are behind. The host row above already
                         // offers them when the plugin itself reports it is
                         // behind.
+                        // Not on a host that manages the plugin: it isn't
+                        // Conduit's to update there.
                         if !appState.notifierPlugin.needsAttention,
-                           pairings.thisDashboard.contains(where: Self.isOutdated) {
+                           pairings.thisDashboard.contains(where: { Self.isOutdated($0) && !managesPairing($0) }) {
                             pluginPageLink(AppLocalization.string("Update the Conduit plugin"))
                         }
                         ForEach(pairings.unscoped) { gateway in
@@ -4139,8 +4608,9 @@ private struct NotificationsSettingsDetail: View {
                     if appState.notifierPlugin.reports("pairing") {
                         oneTapPairing
                     } else {
-                        // Installed but not running: installing again can't help.
-                        if appState.notifierPlugin.isNotServed {
+                        // Installed but not running: installing again can't
+                        // help, nor on a managed host, whose copy is the host's.
+                        if appState.notifierPlugin.isNotServed || appState.notifierPlugin.isManaged {
                             Text("Installed on this dashboard's host, but the dashboard doesn't run it. Turn it on in Hermes, then restart the gateway and the dashboard.")
                                 .scaledFont(.footnote)
                                 .foregroundStyle(.secondary)
@@ -4374,18 +4844,34 @@ private struct NotificationsSettingsDetail: View {
             || (gateway.pluginVersion != nil && !(gateway.supportsApprovalCards && gateway.supportsClarifyCards))
     }
 
+    /// A pairing known to be this dashboard's, on a host that manages the
+    /// plugin: nothing for Conduit to update there.
+    private func managesPairing(_ gateway: RelayMetaInfo.Gateway) -> Bool {
+        // By the relay id this dashboard recorded, not a `dashboard_id`
+        // binding: an entry moved to another host keeps its id, and the old
+        // host's pairing isn't the new host's to keep up to date.
+        appState.notifierPlugin.isManaged && appState.activeDashboardRelayGatewayIDs.contains(gateway.id)
+    }
+
     /// One relay pairing of the active dashboard: whether its notifier
     /// sends decision cards, from the plugin version its last push carried.
     @ViewBuilder
     private func gatewayRow(_ gateway: RelayMetaInfo.Gateway) -> some View {
         let isSupported = gateway.supportsApprovalCards && gateway.supportsClarifyCards
         let isOutdated = Self.isOutdated(gateway)
+        // A host that manages the plugin updates it itself: say what's
+        // missing without asking for an update. Only for a pairing known to
+        // be this dashboard's (`managesPairing`): a legacy one may belong to
+        // another host.
+        let managed = isOutdated && managesPairing(gateway)
         compatibilityRow(
             title: gateway.name,
             version: gateway.pluginVersion,
-            mark: isSupported ? .supported : (isOutdated ? .updateNeeded : .unknown),
+            mark: isSupported ? .supported : (managed ? .notOnHost : isOutdated ? .updateNeeded : .unknown),
             detail: isSupported
                 ? AppLocalization.string("Notifier supports approval and clarify cards")
+                : managed
+                ? AppLocalization.string("Approval and clarify cards need a newer plugin. This dashboard's host keeps the plugin up to date.")
                 : gateway.hasSentEventsButNeverReported
                     ? AppLocalization.string("This profile's notifier predates decision cards — update it to receive them")
                     : gateway.pluginVersion == nil
@@ -4458,6 +4944,8 @@ private struct NotificationsSettingsDetail: View {
     private enum CompatibilityMark {
         case supported
         case updateNeeded
+        /// Missing on a host that manages the plugin: nothing to do here.
+        case notOnHost
         case actionNeeded
         case unknown
     }
@@ -4480,6 +4968,10 @@ private struct NotificationsSettingsDetail: View {
                     Image(systemName: "exclamationmark.circle")
                         .foregroundStyle(.orange)
                         .accessibilityLabel(AppLocalization.string("Update needed"))
+                case .notOnHost:
+                    Image(systemName: "minus.circle")
+                        .foregroundStyle(.secondary)
+                        .accessibilityLabel(AppLocalization.string("Not on this host"))
                 case .actionNeeded:
                     Image(systemName: "exclamationmark.triangle")
                         .foregroundStyle(.orange)
@@ -4530,7 +5022,11 @@ private struct NotificationsSettingsDetail: View {
                 .foregroundStyle(.secondary)
             #if !targetEnvironment(macCatalyst)
             if detail != .generic {
-                Text(AppLocalization.string("To keep them off the Lock Screen, set Show Previews to When Unlocked in iOS Settings > Notifications > Conduit."))
+                Text(verbatim: SystemSettings.worded(
+                    iPhone: AppLocalization.string("To keep them off the Lock Screen, set Show Previews to When Unlocked in iOS Settings > Notifications > Conduit."),
+                    iPad: AppLocalization.string("To keep them off the Lock Screen, set Show Previews to When Unlocked in iPad Settings > Notifications > Conduit."),
+                    mac: AppLocalization.string("To keep them off the Lock Screen, set Show Previews to When Unlocked in System Settings → Notifications → Conduit.")
+                ))
                     .scaledFont(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -4751,6 +5247,119 @@ struct ConduitSettingsSection<Content: View>: View {
     }
 }
 
+/// A Settings card with no name over it, for a group whose first row
+/// names it (Edit Bot's Advanced).
+struct SettingsCard<Content: View>: View {
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            content
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(16)
+        .settingsCard()
+    }
+}
+
+/// A row in a Settings card that opens a page: its name, what it's set
+/// to in grey, and a chevron, as Settings > Pulse's What Pulse remembers.
+/// The caller's NavigationLink takes `.buttonStyle(.plain)`, so the row
+/// reads like the rows beside it rather than in the accent.
+struct SettingsLinkRow: View {
+    let title: String
+    var value: String?
+
+    var body: some View {
+        HStack {
+            Text(verbatim: title)
+                .foregroundStyle(.primary)
+            Spacer(minLength: 8)
+            if let value {
+                Text(verbatim: value)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            SettingsChevron()
+        }
+        .frame(minHeight: 44)
+        .contentShape(Rectangle())
+    }
+}
+
+extension View {
+    /// A caption inside a Settings card, under the control it explains.
+    func settingsCaption() -> some View {
+        scaledFont(.footnote)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
+    /// A multi-line editor's field inside a Settings card, beside the
+    /// rounded-border text fields.
+    func settingsEditorBox() -> some View {
+        scrollContentBackground(.hidden)
+            .padding(6)
+            .background(Color(uiColor: .tertiarySystemFill), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+}
+
+/// Names a Settings card shows the same in every language.
+enum SettingsNames {
+    static let mcp = "MCP"
+    static let json = "JSON"
+}
+
+/// A row in a Settings card that folds the rows after it: its name, an
+/// optional grey line under it (what's on in there), and a chevron that
+/// turns down while open. Not a DisclosureGroup: outside a List it indents
+/// its rows without narrowing them, so their switches ran off the card (as
+/// Settings > Phone found).
+struct SettingsFoldRow: View {
+    let title: String
+    var detail: String?
+    @Binding var isOn: Bool
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        Button {
+            withAnimation(ConduitMotion.ease(reduceMotion: reduceMotion)) { isOn.toggle() }
+        } label: {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(verbatim: title)
+                        .scaledFont(.subheadline)
+                        .foregroundStyle(.primary)
+                    if let detail {
+                        Text(verbatim: detail)
+                            .scaledFont(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                Spacer(minLength: 8)
+                Image(systemName: "chevron.right")
+                    .scaledFont(.footnote.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .rotationEffect(.degrees(isOn ? 90 : 0))
+                    .accessibilityHidden(true)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityValue(Text(isOn ? AppLocalization.string("Expanded") : AppLocalization.string("Collapsed")))
+    }
+}
+
+/// The chevron at the end of a Settings row that opens a page.
+struct SettingsChevron: View {
+    var body: some View {
+        Image(systemName: "chevron.right")
+            .scaledFont(.caption.weight(.semibold))
+            .foregroundStyle(.secondary)
+            .accessibilityHidden(true)
+    }
+}
+
 /// A settings page's still backdrop, its glow in `settingsGlowTint`: the
 /// active profile's color in V2's Settings tab, as on its home page, so
 /// pushing a page keeps it. An environment value rather than AppState, so a
@@ -4760,6 +5369,42 @@ struct SettingsBackdrop: View {
 
     var body: some View {
         ConduitBackdrop(glowTint: glowTint)
+    }
+}
+
+/// A sheet's list you reorder or swipe, in Settings' look: the Settings
+/// backdrop behind it and quiet card rows over it, rather than the system's
+/// plain grey. Every other sheet is built from Settings' own pieces
+/// (SettingsDetailContainer, ConduitSettingsSection, SettingsCard), as
+/// the Settings tab is (Eric 2026-11-05); only a List keeps move and swipe.
+struct ConduitList<Content: View>: View {
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        List {
+            content.listRowBackground(ConduitFormRowFill())
+        }
+        .conduitFormBackdrop()
+    }
+}
+
+/// The fill of a `ConduitList` row: `settingsCard`'s faint fill, a little
+/// stronger in dark mode, where 0.05 left rows hard to tell from the glow.
+struct ConduitFormRowFill: View {
+    @Environment(\.colorScheme) private var colorScheme
+
+    var body: some View {
+        Color.primary.opacity(colorScheme == .dark ? 0.08 : 0.05)
+    }
+}
+
+extension View {
+    /// The Settings backdrop behind a grouped Form or List, for a list whose
+    /// rows take `ConduitFormRowFill` themselves.
+    func conduitFormBackdrop() -> some View {
+        scrollContentBackground(.hidden)
+            .background { SettingsBackdrop().ignoresSafeArea() }
+            .tint(.conduitAccent)
     }
 }
 
@@ -4817,15 +5462,19 @@ extension View {
 /// that commits what was typed (Save, Add key, Apply).
 struct SettingsButtonStyle: ButtonStyle {
     var isPrimary = false
+    /// `.settings` in red, for an action that stops something (a
+    /// workstream's Stop).
+    var isDestructive = false
 
     func makeBody(configuration: Configuration) -> some View {
-        SettingsButtonLabel(configuration: configuration, isPrimary: isPrimary)
+        SettingsButtonLabel(configuration: configuration, isPrimary: isPrimary, isDestructive: isDestructive)
     }
 }
 
 extension ButtonStyle where Self == SettingsButtonStyle {
     static var settings: SettingsButtonStyle { SettingsButtonStyle() }
     static var settingsPrimary: SettingsButtonStyle { SettingsButtonStyle(isPrimary: true) }
+    static var settingsDestructive: SettingsButtonStyle { SettingsButtonStyle(isDestructive: true) }
 }
 
 private struct SettingsButtonLabel: View {
@@ -4834,6 +5483,9 @@ private struct SettingsButtonLabel: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let configuration: ButtonStyleConfiguration
     let isPrimary: Bool
+    var isDestructive = false
+
+    private var tint: Color { isDestructive ? .red : .conduitAccent }
 
     /// Dark text on the bright dark-mode gold; white on the light-mode
     /// brown, where dark text read poorly.
@@ -4844,13 +5496,13 @@ private struct SettingsButtonLabel: View {
     var body: some View {
         configuration.label
             .scaledFont(.subheadline.weight(.semibold))
-            .foregroundStyle(isPrimary ? primaryText : Color.conduitAccent)
+            .foregroundStyle(isPrimary ? primaryText : tint)
             .padding(.horizontal, isPrimary ? 16 : 14)
             .frame(minHeight: isPrimary ? 38 : 36)
-            .background(isPrimary ? Color.conduitAccent : Color.conduitAccent.opacity(0.15), in: Capsule())
+            .background(isPrimary ? tint : tint.opacity(isDestructive ? 0.12 : 0.15), in: Capsule())
             .overlay {
                 if !isPrimary {
-                    Capsule().strokeBorder(Color.conduitAccent.opacity(0.4), lineWidth: 0.5)
+                    Capsule().strokeBorder(tint.opacity(0.4), lineWidth: 0.5)
                 }
             }
             // A 44 pt touch target around the smaller capsule.

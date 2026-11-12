@@ -12,14 +12,26 @@ import SwiftUI
 struct GatewayDiagnosticsSheet: View {
     @ObservedObject var appLanguage = AppLanguageStore.shared
     @EnvironmentObject private var appState: AppState
+    @Environment(\.dismiss) private var dismiss
     /// The report copied last, so "Copied" clears once a newer step lands.
     @State private var copiedTimelineReport: String?
     @State private var confirmingRestart = false
-    /// Pushed inside Settings > Connection rather than shown as its own sheet.
-    var embedded = false
+    var placement: Placement = .chat
+
+    /// Where the page opens. What this device keeps (the last connection,
+    /// device reports, chat traces) shows in each, connected or not: that is
+    /// when they're needed most.
+    enum Placement {
+        /// The chat's Gateway sheet (the header's menu or status dot).
+        case chat
+        /// Pushed inside Settings > Connection.
+        case settings
+        /// A sheet from the sign-in screen, which has no gateway to read.
+        case signIn
+    }
 
     var body: some View {
-        if embedded {
+        if placement == .settings {
             page
         } else {
             NavigationStack { page }
@@ -31,46 +43,79 @@ struct GatewayDiagnosticsSheet: View {
             ConduitBackdrop()
             ScrollView {
                 VStack(spacing: 22) {
-                    summary
+                    if placement != .signIn { summary }
                     lastConnection
                     DeviceReportsSection()
-                    connectors
-                    logs
+                    ChatTracesSection()
+                    if showsGatewayReports {
+                        connectors
+                        logs
+                    }
                 }
                 .padding(16)
             }
         }
-        .navigationTitle(embedded ? AppLocalization.string("Diagnostics & logs") : AppLocalization.string("Gateway"))
+        .navigationTitle(placement == .chat ? AppLocalization.string("Gateway") : AppLocalization.string("Diagnostics & logs"))
         .navigationBarTitleDisplayMode(.inline)
         // Pushed, it keeps the Settings pages' bar.
-        .toolbarBackground(embedded ? .automatic : .hidden, for: .navigationBar)
+        .toolbarBackground(placement == .settings ? .automatic : .hidden, for: .navigationBar)
         .toolbar {
-            ToolbarItemGroup(placement: .topBarTrailing) {
-                Button { confirmingRestart = true } label: {
-                    Image(systemName: "restart")
+            if placement != .settings {
+                // A sheet on a Mac has no swipe to close it.
+                ToolbarItem(placement: .cancellationAction) {
+                    Button(AppLocalization.string("Done")) { dismiss() }
+                        .accessibilityIdentifier("diagnostics.done")
                 }
-                .disabled(!appState.canRestartGateway)
-                .accessibilityLabel(AppLocalization.string("Restart Gateway"))
-                .accessibilityIdentifier("gateway.restart")
-                Button { Task { await appState.refreshGatewayDiagnostics() } } label: {
-                    if appState.gatewayDiagnosticsLoading {
-                        ProgressView().controlSize(.small)
-                    } else {
-                        Image(systemName: "arrow.clockwise")
+            }
+            if placement != .signIn {
+                ToolbarItemGroup(placement: .topBarTrailing) {
+                    Button { confirmingRestart = true } label: {
+                        Image(systemName: "restart")
                     }
+                    .disabled(!appState.canRestartGateway)
+                    .accessibilityLabel(AppLocalization.string("Restart Gateway"))
+                    .accessibilityIdentifier("gateway.restart")
+                    Button { Task { await appState.refreshGatewayDiagnostics() } } label: {
+                        if appState.gatewayDiagnosticsLoading {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Image(systemName: "arrow.clockwise")
+                        }
+                    }
+                    .accessibilityLabel(AppLocalization.string("Refresh gateway diagnostics"))
                 }
-                .accessibilityLabel(AppLocalization.string("Refresh gateway diagnostics"))
             }
         }
         .gatewayRestartConfirmation(isPresented: $confirmingRestart)
-        // Pushed from Settings it only reloads; loading also raises the sheet.
+        // Opening only reloads: the chat's sheet is already up, and the
+        // sign-in screen has no gateway to ask.
         .task {
-            if embedded {
-                await appState.refreshGatewayDiagnostics()
-            } else {
-                await appState.loadGatewayDiagnostics()
-            }
+            guard placement != .signIn else { return }
+            await appState.refreshGatewayDiagnostics()
         }
+        // A reconnect (Retry, or a gateway restart coming back) or a drop
+        // while the page is open reads the gateway again, so the summary
+        // and the sections under it agree.
+        .onChange(of: appState.isConnected) { _, _ in
+            guard placement != .signIn else { return }
+            Task { await appState.refreshGatewayDiagnostics() }
+        }
+        // A restart that ends while the page is open, from here or from
+        // Settings > Connection, reads what the gateway did: the socket goes
+        // through the dashboard and usually stays up, so the line above
+        // rarely fires for one.
+        .onChange(of: appState.activeGatewayRestart.isInProgress) { _, inProgress in
+            guard placement != .signIn, !inProgress else { return }
+            Task { await appState.refreshGatewayDiagnostics() }
+        }
+    }
+
+    /// Connectors and gateway logs come from the gateway: shown while
+    /// connected, or while an answer from before still has some.
+    private var showsGatewayReports: Bool {
+        guard placement != .signIn else { return false }
+        let diagnostics = appState.gatewayDiagnostics
+        return appState.isConnected || !(diagnostics?.connectors.isEmpty ?? true) || !(diagnostics?.logs.isEmpty ?? true)
     }
 
     private var summary: some View {
@@ -113,10 +158,11 @@ struct GatewayDiagnosticsSheet: View {
         }
     }
 
-    /// The connection timeline, then the last call from Hermes (#449) and
-    /// the last Grok Live, Qwen Live or Local Live call's steps, so one Copy takes them all.
+    /// The connection timeline, then the last call from Hermes (#449), the
+    /// last Grok Live, Qwen Live or Local Live call's steps and the last
+    /// Read Aloud reading's (issue 1641), so one Copy takes them all.
     private var lastConnectionReport: String? {
-        let reports = [appState.connectionTimeline?.report, HermesCallTrace.shared.timeline?.report, LiveCallTrace.shared.report].compactMap { $0 }
+        let reports = [appState.connectionTimeline?.report, HermesCallTrace.shared.timeline?.report, LiveCallTrace.shared.report, LiveCallTrace.readAloud.report].compactMap { $0 }
         return reports.isEmpty ? nil : reports.joined(separator: "\n\n")
     }
 
@@ -546,5 +592,73 @@ private struct DeviceReportsSection: View {
         loading = true
         loaded = await MetricKitReports.shared.load()
         loading = false
+    }
+}
+
+/// Chat traces (#1533): what the chat recorder saved when a chat jumped,
+/// stalled or stopped scrolling, and what it holds now, to send to
+/// Conduit's developer or share.
+private struct ChatTracesSection: View {
+    @ObservedObject var appLanguage = AppLanguageStore.shared
+    @State private var exportURL: URL?
+    @State private var canSend = false
+    @State private var sending = false
+    @State private var result: ChatTraceUpload.Result?
+
+    var body: some View {
+        ConduitSettingsSection(title: AppLocalization.string("Chat traces"), symbol: "waveform.path.ecg", tint: .conduitAccent) {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Conduit notes how the open chat scrolls and lays out: row counts, sizes and timings, never what the messages say. When a chat jumps, freezes, stops scrolling or shows none of its messages, it saves the last few minutes on this device.")
+                    .scaledFont(.footnote)
+                    .foregroundStyle(.secondary)
+                Text("If a chat jumped or got stuck, send its traces right after, while they still hold that moment.")
+                    .scaledFont(.footnote)
+                    .foregroundStyle(.secondary)
+                if sending {
+                    ProgressView().controlSize(.small)
+                        .accessibilityLabel(Text(AppLocalization.string("Sending…")))
+                } else if let result, result != .nothing {
+                    Text(verbatim: result == .sent ? AppLocalization.string("Report sent. Thank you!") : AppLocalization.string("Couldn't send the report"))
+                        .scaledFont(.footnote)
+                        .foregroundStyle(result == .sent ? Color.secondary : Color.red)
+                }
+                Button { Task { await send() } } label: {
+                    Label("Send to Conduit's developer", systemImage: "paperplane")
+                }
+                .buttonStyle(.settings)
+                .disabled(!canSend || sending)
+                .accessibilityLabel(AppLocalization.string("Send to Conduit's developer"))
+                .accessibilityIdentifier("diagnostics.sendChatTraces")
+                if let exportURL {
+                    ShareLink(item: exportURL) {
+                        Label("Share chat traces", systemImage: "square.and.arrow.up")
+                    }
+                    .buttonStyle(.settings)
+                    .accessibilityLabel(AppLocalization.string("Share chat traces"))
+                    .accessibilityIdentifier("diagnostics.shareChatTraces")
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .task { await load() }
+    }
+
+    /// The share file and whether there's anything to send, off the main
+    /// thread: up to five traces of a few hundred kilobytes.
+    private func load() async {
+        let current = ChatViewportTrace.shared.lines(last: ChatTraceStore.maxRingLines)
+        let (url, saved) = await Task.detached(priority: .utility) { () -> (URL?, Int) in
+            let store = ChatTraceStore()
+            return (store.writeExport(current: current), store.traces().count)
+        }.value
+        exportURL = url
+        canSend = !current.isEmpty || saved > 0
+    }
+
+    private func send() async {
+        sending = true
+        result = await ChatTraceUpload.sendAll()
+        sending = false
+        await load()
     }
 }

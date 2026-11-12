@@ -24,13 +24,23 @@ struct ShortcutLogError: LocalizedError, Equatable {
     /// Kept on the phone: the host keeps events, but this plugin answered
     /// without its inbox.
     static var pluginTooOld: ShortcutLogError {
-        ShortcutLogError(message: AppLocalization.string("Update the Conduit plugin on your Hermes host to log events. This one was kept on the phone and goes after the update."))
+        ShortcutLogError(message: PluginUpdateAsk.text(
+            AppLocalization.string("Update the Conduit plugin on your Hermes host to log events. This one was kept on the phone and goes after the update."),
+            then: AppLocalization.string("This one was kept on the phone and goes once the host's plugin keeps events.")))
+    }
+
+    /// Kept on the phone: the profile turned the plugin off. `remedy` says
+    /// how to turn it on (issue 1671).
+    static func pluginOff(_ remedy: String) -> ShortcutLogError {
+        ShortcutLogError(message: AppLocalization.string("\(remedy) This one was kept on the phone and goes once the plugin is on."))
     }
 
     /// Not kept: the plugin doesn't keep events, so nothing on the phone
     /// would show or delete it.
     static var pluginMissing: ShortcutLogError {
-        ShortcutLogError(message: AppLocalization.string("Update the Conduit plugin on your Hermes host to log events. This one wasn't kept."))
+        ShortcutLogError(message: PluginUpdateAsk.text(
+            AppLocalization.string("Update the Conduit plugin on your Hermes host to log events. This one wasn't kept."),
+            then: AppLocalization.string("This one wasn't kept.")))
     }
 
     /// Kept on the phone: it goes with the next event, or when Conduit
@@ -62,6 +72,8 @@ enum ShortcutLogOutcome: Equatable {
     case logged(Int)
     /// It looked like a sign-in code, so it never left the phone.
     case skippedCode
+    /// The on-device model took it for junk, so it never left the phone.
+    case skippedJunk
 }
 
 /// Whether the host in use keeps Log to Hermes events.
@@ -89,6 +101,7 @@ extension AppState {
             throw ShortcutLogError.tooOld
         }
         if ShortcutEventFilter.looksLikeCode(event) { return .skippedCode }
+        if await ShortcutJunkFilter.shouldLeaveOut(event) { return .skippedJunk }
         // Right after a cold launch in the background the dashboard
         // connection takes a moment.
         for _ in 0..<10 where dashboardTicketBridge == nil && Date().addingTimeInterval(8) < deadline {
@@ -110,7 +123,11 @@ extension AppState {
         let sender = ShortcutInboxSender(queue: queue, keys: keys, deviceName: UIDevice.current.conduitName)
         do {
             return .logged(try await Self.shortcutInboxGate.run { try await sender.send(request: request) })
-        } catch DashboardTicketBridgeError.http(let status, _) where status == 404 {
+        } catch DashboardTicketBridgeError.http(let status, let detail) where status == 404 {
+            // The profile turned the plugin off: the event waits for it.
+            if let remedy = DashboardTicketBridgeError.pluginOffDetail(of: DashboardTicketBridgeError.http(status: status, detail: detail)) {
+                throw ShortcutLogError.pluginOff(remedy)
+            }
             // A plugin without /inbox: the event waits for the update.
             throw ShortcutLogError.pluginTooOld
         } catch DashboardTicketBridgeError.http(let status, let detail) where status == 409 && HostKeyConflict.isNewerPluginStore(detail) {
@@ -148,9 +165,26 @@ extension AppState {
         var state = notifierPlugin.state
         let remaining = Int(deadline.timeIntervalSinceNow * 1_000)
         if state == .unknown, let bridge = dashboardTicketBridge, remaining > 0 {
+            let dashboardID = activeDashboardID
             do {
-                state = NotifierPluginStatus.state(
-                    from: try await bridge.requestJSON(path: NotifierPluginStatus.path, timeoutMilliseconds: min(5_000, remaining)))
+                let response = try await bridge.requestJSON(
+                    path: NotifierPluginStatus.path, timeoutMilliseconds: min(5_000, remaining))
+                state = NotifierPluginStatus.state(from: response)
+                // A host that manages the plugin, answering before any status
+                // load said so (a cold launch in the background): the run's
+                // "plugin missing" names who keeps it up to date rather than
+                // asking for an update (issue 2063). Only while the answer is
+                // still the active dashboard's and nothing newer knows more.
+                // An answer that says nothing (state unknown) keeps what's remembered.
+                if state != .unknown, bridge === dashboardTicketBridge, dashboardID == activeDashboardID,
+                   notifierPlugin.state == .unknown {
+                    let managedBy = NotifierPluginStatus.managedBy(from: response)
+                    NotifierPluginStatus.Remembered.remember(managedBy, for: dashboardID, in: appDefaults)
+                    let askedBefore = PluginUpdateAsk.managedAsk
+                    PluginUpdateAsk.setActive(managedBy: managedBy)
+                    // The Watch words its plugin failures from the phone's shared context.
+                    if PluginUpdateAsk.managedAsk != askedBefore { shareWatchCallVoices() }
+                }
             } catch {
                 state = NotifierPluginStatus.state(from: error)
             }

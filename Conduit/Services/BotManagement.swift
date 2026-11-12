@@ -439,6 +439,15 @@ enum BotAvatarImage {
         return rendered.pngData()
     }
 
+    /// What a photo kept on the phone alone becomes on Hermes: a moving
+    /// picture as it is, since it's already a small square APNG
+    /// (AnimatedAvatar) and redrawing it would keep one frame; a still
+    /// normalized like any pick.
+    static func hermesPicture(fromPhoneCopy data: Data) -> Data? {
+        if AnimatedAvatar.isAnimated(data) { return data }
+        return UIImage(data: data).flatMap { normalizedPNG(from: $0) }
+    }
+
     static func dataURL(png: Data) -> String {
         "data:image/png;base64," + png.base64EncodedString()
     }
@@ -462,8 +471,9 @@ enum BotAvatarImage {
 
 // MARK: - Editor models
 
-/// What `profiles.describe` returns that the bot editor needs.
-struct BotProfileDetails: Equatable {
+/// What `profiles.describe` returns that the bot editor needs. Codable
+/// for the copy the editor opens on (AppState's KeptRoute.botDetails).
+struct BotProfileDetails: Equatable, Codable {
     var description: String
     var soul: String
     /// The profile's own `model.provider` / `model.default`; empty when it
@@ -474,7 +484,7 @@ struct BotProfileDetails: Equatable {
 }
 
 /// One skill, toolset or MCP server a profile can turn on or off.
-struct BotCapability: Equatable, Identifiable {
+struct BotCapability: Equatable, Identifiable, Codable {
     var name: String
     var label: String?
     var description: String = ""
@@ -486,7 +496,7 @@ struct BotCapability: Equatable, Identifiable {
 
 /// `profiles.describe`'s skills, toolsets and MCP servers (upstream
 /// `profile-config.tsx` `AdvancedProfileConfig`).
-struct BotCapabilities: Equatable {
+struct BotCapabilities: Equatable, Codable {
     var skills: [BotCapability] = []
     var toolsets: [BotCapability] = []
     var mcpServers: [BotCapability] = []
@@ -548,6 +558,36 @@ struct BotCapabilities: Equatable {
     func canTurnOffToolset(at index: Int) -> Bool {
         guard toolsets.indices.contains(index), toolsets[index].enabled else { return true }
         return toolsets.filter(\.enabled).count > 1
+    }
+
+    /// Turns one row of `list` on or off by name (Hermes' answer can
+    /// replace the kept lists under the rows, so never by position). The
+    /// last toolset on stays on: no tools would save as Hermes' defaults.
+    mutating func setEnabled(_ list: WritableKeyPath<BotCapabilities, [BotCapability]>, name: String, on: Bool) {
+        guard let index = self[keyPath: list].firstIndex(where: { $0.name == name }) else { return }
+        if list == \BotCapabilities.toolsets, !on, !canTurnOffToolset(at: index) { return }
+        self[keyPath: list][index].enabled = on
+    }
+
+    /// "12 of 20 on" for a list, or nil when it's empty: what Edit Bot's
+    /// Skills, Tools and MCP rows say beside their names.
+    static func onSummary(_ rows: [BotCapability]) -> String? {
+        guard !rows.isEmpty else { return nil }
+        // Both as text: a count of a count, which no language's plural
+        // follows.
+        let onText = String(rows.filter(\.enabled).count)
+        let allText = String(rows.count)
+        return AppLocalization.string("\(onText) of \(allText) on")
+    }
+
+    /// The lists as Hermes holds them once it took `sections` (as
+    /// `appliedSections` names them) of `edited`.
+    func taking(_ sections: [String], from edited: BotCapabilities) -> BotCapabilities {
+        var lists = self
+        if sections.contains("skills") { lists.skills = edited.skills }
+        if sections.contains("toolsets") { lists.toolsets = edited.toolsets }
+        if sections.contains("mcp_servers") { lists.mcpServers = edited.mcpServers }
+        return lists
     }
 
     /// The `applied` keys `configureParams` sections report under (the
@@ -665,4 +705,63 @@ enum BotSaveResult: Equatable {
     /// the gateway's message.
     case confirmModel(String)
     case failed(String)
+}
+
+/// One category of a bot's skills on Edit Bot's Skills page, as Hermes
+/// files them (`skills/<category>/<skill>`).
+struct BotSkillGroup: Identifiable, Equatable {
+    /// The category as Conduit shows it ("Software Development").
+    let title: String
+    let rows: [BotCapability]
+
+    var id: String { title }
+}
+
+enum BotSkillGrouping {
+    /// The skills `query` matches by name, label or description, in order:
+    /// the Skills page with no dashboard list to group them by.
+    static func matching(_ skills: [BotCapability], query: String) -> [BotCapability] {
+        let query = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return skills }
+        return skills.filter {
+            $0.name.localizedCaseInsensitiveContains(query)
+                || ($0.label ?? "").localizedCaseInsensitiveContains(query)
+                || $0.description.localizedCaseInsensitiveContains(query)
+        }
+    }
+
+    /// The skills by category, A-Z by shown name, each A-Z as given, with
+    /// the description the dashboard gives where the row has none. Only
+    /// the skills `query` matches (name, label, description or category).
+    /// `details` are the dashboard's skills for the profile; a skill it
+    /// doesn't list (or names another way) goes under General, where
+    /// Hermes files a skill with no category.
+    static func grouped(_ skills: [BotCapability], details: [CapabilitySkill], query: String = "") -> [BotSkillGroup] {
+        var byName: [String: CapabilitySkill] = [:]
+        for detail in details {
+            byName[detail.name] = byName[detail.name] ?? detail
+            byName[detail.name.lowercased()] = byName[detail.name.lowercased()] ?? detail
+        }
+        let query = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        var groups: [String: [BotCapability]] = [:]
+        for var skill in skills {
+            let detail = byName[skill.name] ?? byName[skill.name.lowercased()]
+            if skill.description.isEmpty, let description = detail?.description {
+                skill.description = description
+            }
+            let title = CapabilitySkillOrdering.prettyCategory(detail?.category)
+            if !query.isEmpty {
+                let matches = skill.name.localizedCaseInsensitiveContains(query)
+                    || (skill.label ?? "").localizedCaseInsensitiveContains(query)
+                    || skill.description.localizedCaseInsensitiveContains(query)
+                    || title.localizedCaseInsensitiveContains(query)
+                    || detail?.category?.localizedCaseInsensitiveContains(query) == true
+                guard matches else { continue }
+            }
+            groups[title, default: []].append(skill)
+        }
+        return groups
+            .map { BotSkillGroup(title: $0.key, rows: $0.value) }
+            .sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
+    }
 }

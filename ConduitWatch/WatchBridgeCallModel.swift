@@ -231,6 +231,10 @@ final class WatchBridgeCallModel: ObservableObject {
     /// line counts as handled when it lands, so it isn't sent again.
     private var openLineDelegated = false
     private var assistantLine = ""
+    /// Builds the turns the GA events don't end themselves (issue 2236),
+    /// and when its open turn last grew, for `tick` to end a quiet one.
+    private var turns = GPTLiveProtocol.TurnAssembler()
+    private var turnGrewAt: TimeInterval?
     /// When GPT-Live's transcript of the user's last turn came.
     private var heardAt: TimeInterval?
     private var lastModelTurnEndedAt: TimeInterval?
@@ -397,7 +401,9 @@ final class WatchBridgeCallModel: ObservableObject {
         // dropped; the microphone opens, and GPT-Live stops when it hears
         // the user.
         audio.stopPlayback()
-        suppressingTurn = true
+        // Only a stretch still arriving is dropped: pressed while an ended
+        // one's tail plays, the next must be heard (issue 1790).
+        suppressingTurn = modelSpeaking
         modelSpeaking = false
         lastPlaybackEndedAt = now
         awaitingFirstAudio = false
@@ -641,6 +647,8 @@ final class WatchBridgeCallModel: ObservableObject {
         self.stream = stream
         live = false
         started = nil
+        turns = GPTLiveProtocol.TurnAssembler()
+        turnGrewAt = nil
         socketOpenedAt = nil
         startSentAt = nil
         connectStartedAt = now
@@ -813,6 +821,7 @@ final class WatchBridgeCallModel: ObservableObject {
                 "outputRate": info.outputRate,
                 "briefingApplied": info.briefingApplied,
                 "greetingApplied": info.greetingApplied,
+                "gaEvents": info.gaEvents,
             ])
             // The host's rates are fixed for wire version 1; other rates
             // would play at the wrong speed and send mis-framed audio.
@@ -822,10 +831,25 @@ final class WatchBridgeCallModel: ObservableObject {
                 return
             }
             // A call from Hermes: the model says what it called about, as
-            // the phone's GPT-Live call asks it to. Once, never on a rejoin,
-            // and only when the host didn't already have it speak first.
-            if WatchAudioBridgeWire.sendsOpeningTurn(rejoining: rejoining, started: info), let openingTurn {
-                pendingSends.insert(Pending(text: openingTurn, channel: .speakable, delegationID: nil), at: 0)
+            // the phone's GPT-Live call asks it to; any other call greets when
+            // the user asked for a greeting. Once, never on a rejoin, and only
+            // when the host didn't already have it speak first (an older
+            // plugin did; the model no longer does from its instructions,
+            // notifier #541).
+            if WatchAudioBridgeWire.sendsOpeningTurn(rejoining: rejoining, started: info),
+               let opening = openingTurn ?? greeting.map(LiveVoiceGreeting.turn) {
+                pendingSends.insert(Pending(text: opening, channel: .speakable, delegationID: nil), at: 0)
+            }
+            // Codex's GA endpoint drops the briefing the start carried, so
+            // each session it starts, a rejoin's too, gets it as
+            // instructions first, as on the iPhone (issue 2236). Sent here,
+            // ahead of anything pending, and left out of the backlog count:
+            // a long briefing is dozens of appends at once, which would read
+            // as a socket that stopped taking text.
+            if info.gaEvents, let briefing, !briefing.isEmpty {
+                for message in GPTLiveProtocol.contextAppendMessages(briefing, channel: .instructions, dialect: .ga) {
+                    sendEvent(message, counted: false)
+                }
             }
             flushPending()
         case .ended(let reason):
@@ -866,6 +890,26 @@ final class WatchBridgeCallModel: ObservableObject {
             events[type, default: 0] += 1
         }
         guard let event = GPTLiveProtocol.decode(text) else { return }
+        guard started?.gptLiveDialect == .ga else {
+            handleEngineEvent(event)
+            return
+        }
+        for assembled in turns.receive(event) { handleEngineEvent(assembled) }
+        switch event {
+        case .inputTranscript, .outputTranscript: turnGrewAt = now
+        default: if !turns.hasOpenTurn { turnGrewAt = nil }
+        }
+    }
+
+    /// Ends the open GA turn once the talk has gone quiet for a moment.
+    private func endQuietTurnIfDue(at time: TimeInterval) {
+        guard let grewAt = turnGrewAt, turns.hasOpenTurn else { return }
+        guard time - grewAt >= turns.openTurnQuietInterval / .seconds(1) else { return }
+        turnGrewAt = nil
+        if let done = turns.flush() { handleEngineEvent(done) }
+    }
+
+    private func handleEngineEvent(_ event: GPTLiveProtocol.ServerEvent) {
         switch event {
         case .sessionStarted:
             break
@@ -918,12 +962,20 @@ final class WatchBridgeCallModel: ObservableObject {
         audioChunksDown += 1
         guard !samples.isEmpty, endRequestedAt == nil, phase != .needsTap else { return }
         let loud = samples.contains { abs(Int($0)) > Self.speechPeak }
+        // Quiet before this chunk: with no chunks between stretches, a new
+        // stretch's first loud chunk still shows the old one ended.
+        let quietBefore = lastLoudAt.map { now - $0 } ?? .infinity
         if loud { lastLoudAt = now }
         let quietFor = lastLoudAt.map { now - $0 } ?? .infinity
         if suppressingTurn {
-            // Dropped until this stretch of speech ends.
-            if quietFor > Self.speechGap { suppressingTurn = false }
-            return
+            // Dropped until this stretch of speech ends; the next is heard
+            // (issue 1790).
+            if quietBefore > Self.speechGap {
+                suppressingTurn = false
+            } else {
+                if quietFor > Self.speechGap { suppressingTurn = false }
+                return
+            }
         }
         if modelSpeaking {
             audio.enqueue(samples, sampleRate: Self.playbackRate)
@@ -1047,8 +1099,14 @@ final class WatchBridgeCallModel: ObservableObject {
         }
     }
 
-    private func sendEvent(_ message: [String: Any]) {
+    /// `counted: false` keeps a one-off burst (the GA briefing) out of
+    /// the backlog check.
+    private func sendEvent(_ message: [String: Any], counted: Bool = true) {
         guard let text = try? GPTLiveProtocol.encode(message) else { return }
+        guard counted else {
+            send(Data(text.utf8), kind: .event)
+            return
+        }
         eventsInFlight += 1
         let number = connection
         send(Data(text.utf8), kind: .event) { [weak self] _ in
@@ -1553,7 +1611,8 @@ final class WatchBridgeCallModel: ObservableObject {
                 // Only its first result waited on the user, as on the phone.
                 delegationUserLines[asked] = nil
             }
-            for message in GPTLiveProtocol.contextAppendMessages(text, channel: item.channel, delegationID: delegationID) {
+            let dialect = started?.gptLiveDialect ?? .frameless
+            for message in GPTLiveProtocol.contextAppendMessages(text, channel: item.channel, delegationID: delegationID, dialect: dialect) {
                 sendEvent(message)
             }
         }
@@ -1796,6 +1855,7 @@ final class WatchBridgeCallModel: ObservableObject {
             finish(nil)
             return
         }
+        endQuietTurnIfDue(at: at)
         endAfterGoodbyeIfDue(at: at)
         reactivateIfDue()
         audio.checkPlayback()
@@ -1983,6 +2043,8 @@ final class WatchBridgeCallModel: ObservableObject {
         userLine = ""
         openLineDelegated = false
         assistantLine = ""
+        turns = GPTLiveProtocol.TurnAssembler()
+        turnGrewAt = nil
         heardAt = nil
         lastModelTurnEndedAt = nil
         endRequestedAt = nil

@@ -32,14 +32,24 @@ struct LocationSyncState: Codable, Equatable {
 enum LocationSyncPause: Codable, Equatable {
     case signInRequired
     case pluginMissing
+    /// The profile turned the plugin off: how to turn it on (issue 1671).
+    case pluginOff(String)
     case refused(String)
 
-    var message: String {
+    var message: String { message(managedBy: PluginUpdateAsk.managedBy) }
+
+    /// The words for a destination whose host's plugin is kept up to date
+    /// by `managedBy` (nil when the host doesn't manage it), which may not
+    /// be the active dashboard's.
+    func message(managedBy: String?) -> String {
         switch self {
         case .signInRequired:
             return AppLocalization.string("Paused: sign in to this dashboard again. Location is sent again once you open Conduit.")
         case .pluginMissing:
-            return AppLocalization.string("Paused: update the Conduit plugin on this host to share your location.")
+            return PluginUpdateAsk.text(AppLocalization.string("Paused: update the Conduit plugin on this host to share your location."),
+                                        lead: AppLocalization.string("Sharing is paused."), managedBy: managedBy)
+        case .pluginOff(let remedy):
+            return AppLocalization.string("Paused: \(remedy)")
         case .refused(let detail):
             return AppLocalization.string("Paused: the host refused location data (\(detail)).")
         }
@@ -307,6 +317,9 @@ final class LocationSyncEngine: ObservableObject {
             switch error {
             case .signInRequired:
                 state.pause = .signInRequired
+            case .http(let status, _) where status == 404 && DashboardTicketBridgeError.pluginOffDetail(of: error) != nil:
+                // The profile turned the plugin off: say how to turn it on.
+                state.pause = DashboardTicketBridgeError.pluginOffDetail(of: error).map(LocationSyncPause.pluginOff)
             case .http(let status, let detail) where status == 404:
                 // A bare 404 could be a proxy or a restarting host. The key
                 // is kept; the status route tells whether the plugin is gone.
@@ -424,7 +437,10 @@ final class LocationSyncEngine: ObservableObject {
                 "device_name": deviceName(),
                 "public_key": NotificationE2E.base64URL(devicePrivate.publicKey.rawRepresentation),
             ])
-        } catch DashboardTicketBridgeError.http(let status, _) where status == 404 {
+        } catch let error as DashboardTicketBridgeError {
+            // A profile that turned the plugin off answers 404 too: the
+            // pass says how to turn it on, not that the plugin is missing.
+            guard case .http(404, _) = error, DashboardTicketBridgeError.pluginOffDetail(of: error) == nil else { throw error }
             throw LocationSyncEngineError.keyRouteMissing
         }
         guard let hostPublic = answer["host_public_key"] as? String, let kid = answer["kid"] as? String else {
@@ -482,8 +498,10 @@ final class LocationSyncEngine: ObservableObject {
     func wipe(deviceID: String, everything: Bool, request: Request) async throws {
         do {
             _ = try await request("\(Self.base)/wipe", "POST", everything ? ["all": true] : ["device_id": deviceID])
-        } catch DashboardTicketBridgeError.http(let status, _) where status == 404 {
+        } catch DashboardTicketBridgeError.http(let status, let detail)
+                    where status == 404 && !DashboardTicketBridgeError.isPluginOffDetail(detail) {
             // No location sync on this host any more: nothing left to delete.
+            // A profile that turned the plugin off deleted nothing: it throws.
         }
         forgetHost()
     }

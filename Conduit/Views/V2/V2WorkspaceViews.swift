@@ -75,8 +75,8 @@ struct WorkspaceFolderView: View {
     /// The latest open; one that lands after another, or after the folder,
     /// profile or server changed, is dropped.
     @State private var openToken: UUID?
-    /// The tool count this tab last refreshed for.
-    @State private var seenChanges: Int?
+    /// The tool count and plugin routes this tab last refreshed for.
+    @State private var seenChanges: Changes?
 
     private struct OpenPage: Identifiable {
         let id = UUID()
@@ -104,6 +104,26 @@ struct WorkspaceFolderView: View {
         let dashboard: UUID?
         let profile: String
         let root: String?
+    }
+
+    /// What reads the open folders again: Hermes finishing a tool that may
+    /// have changed files, and the plugin saying whether it serves the
+    /// workspace routes, so a folder read before it said so (through
+    /// Hermes' own listing, without sizes, dates or recent files) reads
+    /// through them once it does, and a kept listing, which waits for its
+    /// word, gives way to Hermes' own once it says it doesn't.
+    private struct Changes: Equatable {
+        let tools: Int
+        let routes: Bool
+        let mayServe: Bool
+    }
+
+    private var changes: Changes {
+        Changes(
+            tools: appState.workspaceChanges,
+            routes: appState.supportsWorkspaceFiles,
+            mayServe: appState.notifierPlugin.mayServe(WorkspaceFilesClient.capability)
+        )
     }
 
     private var key: Key {
@@ -155,10 +175,10 @@ struct WorkspaceFolderView: View {
             await explorer.runSearch(query)
         }
         // Tied to the view: a refresh ends with it.
-        .task(id: appState.workspaceChanges) {
+        .task(id: changes) {
             // Marked seen only once its refresh ran: a refresh cut short by
             // the next change leaves that change to the next task.
-            let target = appState.workspaceChanges
+            let target = changes
             guard let seen = seenChanges else {
                 seenChanges = target
                 return
@@ -280,10 +300,8 @@ struct WorkspaceFolderView: View {
                 Menu {
                     actions(in: root.path)
                 } label: {
-                    Image(systemName: "plus")
-                        .scaledFont(.body.weight(.semibold))
-                        .frame(width: 36, height: 36)
-                        .contentShape(Rectangle())
+                    // Bots Home's glass +.
+                    V2AddGlyph()
                 }
                 .accessibilityLabel(AppLocalization.string("Add to Folder"))
             }
@@ -358,9 +376,10 @@ struct WorkspaceFolderView: View {
         } else if !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, explorer.canChange {
             searchResults
         } else {
-            if !explorer.canChange {
+            // Not while the plugin hasn't said (offline, just connected).
+            if !explorer.canChange, !appState.notifierPlugin.mayServe(WorkspaceFilesClient.capability) {
                 Label {
-                    Text("Update the Conduit plugin on your Hermes host to search this folder and make, move or delete files here. Settings › Conduit plugin can update it.")
+                    Text(PluginUpdateAsk.text(AppLocalization.string("Update the Conduit plugin on your Hermes host to search this folder and make, move or delete files here. Settings › Conduit plugin can update it.")))
                 } icon: {
                     Image(systemName: "arrow.down.circle")
                 }
@@ -368,11 +387,13 @@ struct WorkspaceFolderView: View {
                 .foregroundStyle(.secondary)
                 .padding(.vertical, 8)
             }
-            if !explorer.recent.isEmpty {
+            // Kept ones show until the plugin says it doesn't serve them.
+            if !explorer.recent.isEmpty, appState.notifierPlugin.mayServe(WorkspaceFilesClient.capability) {
                 recentSection
             }
             let rows = explorer.rows()
-            if rows.isEmpty, let root, explorer.loading.contains(root.path) {
+            // A folder kept empty says so at once.
+            if rows.isEmpty, let root, explorer.loading.contains(root.path), explorer.entries[root.path] == nil {
                 ProgressView()
                     .frame(maxWidth: .infinity, minHeight: 160)
             } else if rows.isEmpty {
@@ -833,7 +854,15 @@ struct WorkspaceFolderView: View {
     private func show(_ reveal: WorkspaceReveal) async {
         // The folder holding it, the chat's first: a file in none of them
         // opens to read, outside the tree, with nothing to change.
-        if let holder = roots.first(where: { Self.path(reveal.path, isIn: $0.path) }) {
+        let holder = roots.first(where: { Self.path(reveal.path, isIn: $0.path) })
+        // A file to read starts reading now, while its folders are listed,
+        // in the profile `explorer.view` will read it in (issue 1964).
+        let kind = WorkspaceFileKind(name: (reveal.path as NSString).lastPathComponent)
+        if kind == .text || kind == .markdown, !(reveal.path as NSString).pathExtension.isEmpty {
+            let profile = holder == nil ? (explorer.scope?.profile ?? appState.workspaceProfile) : appState.workspaceProfile
+            explorer.prefetchText(reveal.path, profile: profile)
+        }
+        if let holder {
             if root?.path != holder.path { rootPath = holder.path }
             // Also when the picker already names it but the explorer hasn't
             // opened it yet (the first appearance); opening it again is free.
@@ -1161,7 +1190,7 @@ struct WorkspaceCodeText: View {
                     HStack(alignment: .firstTextBaseline, spacing: 10) {
                         Text(verbatim: "\(index + 1)")
                             .scaledFont(.caption2.monospacedDigit())
-                            .foregroundStyle(.tertiary)
+                            .foregroundStyle(.conduitTertiary)
                             .frame(minWidth: 30, alignment: .trailing)
                             .accessibilityHidden(true)
                         Text(verbatim: line.isEmpty ? " " : line)
@@ -1196,8 +1225,8 @@ struct WorkspaceMoveSheet: View {
 
     var body: some View {
         NavigationStack {
-            List {
-                Section {
+            SettingsDetailContainer {
+                SettingsCard {
                     Text(verbatim: current)
                         .scaledFont(.caption)
                         .foregroundStyle(.secondary)
@@ -1209,11 +1238,13 @@ struct WorkspaceMoveSheet: View {
                         } label: {
                             Label(AppLocalization.string("Up One Folder"), systemImage: "arrow.turn.left.up")
                         }
+                        .buttonStyle(.settings)
                     }
                 }
-                Section {
+                ConduitSettingsSection(title: AppLocalization.string("Folders"), symbol: "folder", tint: .blue) {
                     if loading {
                         ProgressView()
+                            .frame(maxWidth: .infinity)
                     } else if let failure {
                         Text(verbatim: failure)
                             .foregroundStyle(.secondary)
@@ -1225,8 +1256,19 @@ struct WorkspaceMoveSheet: View {
                         Button {
                             folder = child.path
                         } label: {
-                            Label(child.name, systemImage: "folder.fill")
+                            HStack(spacing: 10) {
+                                Image(systemName: "folder.fill")
+                                    .foregroundStyle(.blue)
+                                Text(child.name)
+                                    .foregroundStyle(.primary)
+                                    .lineLimit(1)
+                                Spacer(minLength: 8)
+                                SettingsChevron()
+                            }
+                            .frame(minHeight: 36)
+                            .contentShape(Rectangle())
                         }
+                        .buttonStyle(.plain)
                     }
                 }
             }

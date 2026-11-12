@@ -1,0 +1,106 @@
+name: Mac Catalyst
+
+on:
+  pull_request:
+    branches: [macos-port]
+  push:
+    branches: [macos-port]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mac-catalyst-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  source-checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Validate source and test inventory
+        run: |
+          python3 scripts/check-feature-map.py --repo-root .
+          python3 scripts/check-l10n-coverage.py --repo-root .
+          python3 scripts/plan-tests.py validate --repo-root . --baseline scripts/test-timings.json
+      - name: Test CI tooling on Linux
+        env:
+          CONDUIT_CI_SKIP_BASH_WRAPPER_TESTS: "1"
+        run: python3 -m unittest discover -s scripts/tests -p 'test_*.py'
+
+  catalyst:
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Select Metal toolchain when separately installed
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! xcrun -sdk macosx metal --version >/dev/null 2>&1; then
+            if xcrun --toolchain com.apple.dt.toolchain.Metal metal --version >/dev/null 2>&1; then
+              echo 'TOOLCHAINS=com.apple.dt.toolchain.Metal' >> "$GITHUB_ENV"
+            else
+              echo "Xcode's Metal Toolchain is unavailable" >&2
+              exit 1
+            fi
+          fi
+
+      - name: Generate Mac Catalyst project
+        run: xcodegen generate --quiet --spec scripts/mac-catalyst/project.yml --project-root . --project .
+
+      - name: Build sandboxed Debug app
+        shell: bash
+        run: |
+          set -uo pipefail
+          log="$RUNNER_TEMP/mac-catalyst-build.log"
+          if ! xcodebuild build \
+            -project ConduitMac.xcodeproj \
+            -scheme ConduitMac \
+            -configuration Debug \
+            -destination 'platform=macOS,variant=Mac Catalyst' \
+            -derivedDataPath "$RUNNER_TEMP/ConduitMacDerivedData" \
+            >"$log" 2>&1; then
+            grep -E 'error:|BUILD FAILED' "$log" | tail -30 >&2 || true
+            exit 1
+          fi
+
+      - name: Run focused Mac Catalyst regressions
+        shell: bash
+        run: |
+          set -uo pipefail
+          log="$RUNNER_TEMP/mac-catalyst-tests.log"
+          if ! xcodebuild test \
+            -project ConduitMac.xcodeproj \
+            -scheme ConduitMac \
+            -configuration Debug \
+            -destination 'platform=macOS,variant=Mac Catalyst' \
+            -derivedDataPath "$RUNNER_TEMP/ConduitMacDerivedData" \
+            -parallel-testing-enabled NO \
+            -test-timeouts-enabled YES \
+            -maximum-test-execution-time-allowance 180 \
+            -only-testing:ConduitTests/MacWheelSwipeGuardTests \
+            -only-testing:ConduitTests/CredentialVaultTests \
+            -only-testing:ConduitTests/DashboardRequestAuthorizerTests \
+            -only-testing:ConduitTests/NotificationE2ETests \
+            -only-testing:ConduitTests/CarPlayVoiceCoordinatorTests \
+            -only-testing:ConduitTests/ComposerFullEditorTests \
+            -only-testing:ConduitTests/NotificationCopyTests \
+            -only-testing:ConduitTests/ComposerPasteTextViewTests \
+            -only-testing:ConduitTests/ComposerReturnKeyTests \
+            -only-testing:ConduitTests/WidgetLaunchLinkTests \
+            -only-testing:ConduitTests/AppStateReasoningStreamTests \
+            >"$log" 2>&1; then
+            grep -E 'error:|failed|TEST FAILED' "$log" | tail -40 >&2 || true
+            exit 1
+          fi

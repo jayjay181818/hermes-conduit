@@ -118,6 +118,10 @@ final class MediaPreviewPresenter {
     }
 
     private var sessions: [ObjectIdentifier: Session] = [:]
+    /// Kept for the system's Open In menu's lifetime, and released when it
+    /// closes. The menu is the app handoff for a file another reader can
+    /// take (MDReader, a Markdown editor) without Conduit displaying it.
+    private let openInDelegate = OpenInDelegate()
 
     /// Previews a file already on disk (a local attachment). The file is
     /// left in place afterwards. A type Quick Look must not render opens the
@@ -282,6 +286,34 @@ final class MediaPreviewPresenter {
         return true
     }
 
+    /// The system share sheet for a staged file that has no Open In app,
+    /// or when the Open In menu can't present. The caller keeps the file.
+    @discardableResult
+    func presentShare(fileURL: URL) -> Bool {
+        guard FileManager.default.fileExists(atPath: fileURL.path) else { return false }
+        return share(fileURL: fileURL, ownedDirectory: nil)
+    }
+
+    /// The system's Open In menu for a file another app can read (MDReader,
+    /// a Markdown editor), so the reader the user already trusts opens it
+    /// without a Files-app detour. The staged file belongs to the caller.
+    @discardableResult
+    func presentOpenIn(fileURL: URL) -> Bool {
+        guard FileManager.default.fileExists(atPath: fileURL.path) else { return false }
+        // A menu still up (or coming up) keeps its controller: a second tap
+        // must not drop the only reference to the one on screen.
+        guard openInDelegate.controller == nil else { return true }
+        guard let presenter = Self.topViewController() else { return false }
+        let controller = UIDocumentInteractionController(url: fileURL)
+        controller.delegate = openInDelegate
+        openInDelegate.controller = controller
+        let source = CGRect(x: presenter.view.bounds.midX, y: presenter.view.bounds.midY,
+                            width: 0, height: 0)
+        let presented = controller.presentOpenInMenu(from: source, in: presenter.view, animated: true)
+        if !presented { openInDelegate.controller = nil }
+        return presented
+    }
+
     private static func topViewController() -> UIViewController? {
         let scenes = UIApplication.shared.connectedScenes
             .compactMap { $0 as? UIWindowScene }
@@ -366,6 +398,12 @@ final class MediaPreviewPresenter {
     nonisolated static let stagingRoot = FileManager.default.temporaryDirectory
         .appendingPathComponent("Conduit-Media-Preview", isDirectory: true)
 
+    /// Writes `text` to `<tmp>/Conduit-Media-Preview/<uuid>/<filename>`.
+    nonisolated static func stage(text: String, filename: String) -> (directory: URL, file: URL)? {
+        guard let data = text.data(using: .utf8) else { return nil }
+        return stage(data: data, filename: filename)
+    }
+
     /// Writes `data` to `<tmp>/Conduit-Media-Preview/<uuid>/<filename>`.
     nonisolated static func stage(data: Data, filename: String) -> (directory: URL, file: URL)? {
         let directory = stagingRoot.appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -422,6 +460,26 @@ final class MediaPreviewPresenter {
     }
 }
 
+/// Retains the Open In controller until the system menu closes: UIKit
+/// holds its delegate weakly.
+private final class OpenInDelegate: NSObject, UIDocumentInteractionControllerDelegate {
+    var controller: UIDocumentInteractionController?
+
+    func documentInteractionControllerDidDismissOpenInMenu(_ controller: UIDocumentInteractionController) {
+        release(controller)
+    }
+
+    func documentInteractionController(_ controller: UIDocumentInteractionController,
+                                       didEndSendingToApplication bundleIdentifier: String?) {
+        release(controller)
+    }
+
+    /// Only the controller that closed lets go of its slot.
+    private func release(_ closed: UIDocumentInteractionController) {
+        if controller === closed { controller = nil }
+    }
+}
+
 private final class PreviewItem: NSObject, QLPreviewItem {
     let previewItemURL: URL?
     let previewItemTitle: String?
@@ -436,19 +494,22 @@ private final class PreviewItem: NSObject, QLPreviewItem {
 /// tells VoiceOver it is a button that does so.
 struct MediaPreviewTapModifier: ViewModifier {
     let action: () -> Void
+    /// In place of the opening hint, when a tap does something else (a
+    /// file that couldn't be read tries again).
+    var hint: Text? = nil
 
     func body(content: Content) -> some View {
         content
             .contentShape(Rectangle())
             .onTapGesture(perform: action)
             .accessibilityAddTraits(.isButton)
-            .accessibilityHint(Text("Opens full screen with save and share"))
+            .accessibilityHint(hint ?? Text("Opens full screen with save and share"))
     }
 }
 
 extension View {
-    func opensMediaPreview(_ action: @escaping () -> Void) -> some View {
-        modifier(MediaPreviewTapModifier(action: action))
+    func opensMediaPreview(_ action: @escaping () -> Void, hint: Text? = nil) -> some View {
+        modifier(MediaPreviewTapModifier(action: action, hint: hint))
     }
 }
 

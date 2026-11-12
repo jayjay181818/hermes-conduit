@@ -227,7 +227,7 @@ struct LocationSettingsPage: View {
                 .scaledFont(.caption)
                 .foregroundStyle(.secondary)
             if !pluginServesLocation, !settings.isOn {
-                Text("Update the Conduit plugin on your Hermes host to share your location.")
+                Text(PluginUpdateAsk.text(AppLocalization.string("Update the Conduit plugin on your Hermes host to share your location.")))
                     .scaledFont(.caption)
                     .foregroundStyle(.orange)
             }
@@ -263,7 +263,7 @@ struct LocationSettingsPage: View {
                 .scaledFont(.caption)
                 .foregroundStyle(.orange)
         } else if let pause = engine.state.pause {
-            Text(pause.message)
+            Text(pause.message(managedBy: appState.pluginManagedBy(forDashboard: controller.binding?.dashboardID)))
                 .scaledFont(.caption)
                 .foregroundStyle(.orange)
         } else if let last = engine.state.lastFixSent {
@@ -308,7 +308,7 @@ struct LocationSettingsPage: View {
 
     private var openSettingsButton: some View {
         Button(AppLocalization.string("Open Settings")) {
-            PrivacySettingsLink.open(.location)
+            SystemSettings.open(.location)
         }
         .scaledFont(.subheadline)
     }
@@ -929,22 +929,27 @@ struct LocationPlaceEditor: View {
 
     var body: some View {
         NavigationStack {
-            Form {
-                Section {
+            // Settings' own page, as Location settings that opens it (Eric 2026-11-05).
+            SettingsDetailContainer {
+                ConduitSettingsSection(title: AppLocalization.string("Name"), symbol: "mappin.and.ellipse", tint: .red) {
                     TextField("Name", text: $draft.name)
+                        .textFieldStyle(.roundedBorder)
                         .onChange(of: draft.name) { _, name in
                             if name.count > LocationSavedPlace.maxNameLength { draft.name = String(name.prefix(LocationSavedPlace.maxNameLength)) }
                         }
-                    Picker("Kind", selection: $draft.kind) {
-                        ForEach(LocationPlaceKind.allCases) { kind in
-                            Text(LocationSettingsText.kindTitle(kind)).tag(kind)
-                        }
+                    ConduitMenuPicker(
+                        value: draft.kind,
+                        choices: LocationPlaceKind.allCases.map { (id: $0, title: LocationSettingsText.kindTitle($0)) },
+                        onSelect: { draft.kind = $0 }
+                    ) {
+                        Text("Kind").foregroundStyle(.secondary)
                     }
                     Toggle("Private", isOn: $draft.isPrivate)
-                } footer: {
+                        .tint(.conduitAccent)
                     Text("At a private place Hermes hears only “at a private place”, never its name or where it is, and your visits there aren't kept.")
+                        .settingsCaption()
                 }
-                Section {
+                ConduitSettingsSection(title: AppLocalization.string("Where"), symbol: "map", tint: .blue) {
                     if let coordinate = draft.coordinate.map(MapDatum.toMap) {
                         // The draft is WGS-84 like the fixes; the map draws it where Apple Maps puts it.
                         Map(position: $camera) {
@@ -954,7 +959,7 @@ struct LocationPlaceEditor: View {
                             Marker(draft.name, coordinate: coordinate)
                         }
                         .frame(height: 180)
-                        .listRowInsets(EdgeInsets())
+                        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
                         // The caption below says the radius; the map adds nothing for VoiceOver.
                         .accessibilityHidden(true)
                     }
@@ -964,9 +969,11 @@ struct LocationPlaceEditor: View {
                         } label: {
                             Label(isLocating ? AppLocalization.string("Finding you…") : AppLocalization.string("Use my current location"), systemImage: "location.fill")
                         }
+                        .buttonStyle(.settings)
                         .disabled(isLocating)
                     }
                     TextField("Search for an address", text: $query)
+                        .textFieldStyle(.roundedBorder)
                         .textInputAutocapitalization(.words)
                         .onSubmit(search)
                     if isSearching { ProgressView() }
@@ -980,28 +987,31 @@ struct LocationPlaceEditor: View {
                                     .scaledFont(.caption)
                                     .foregroundStyle(.secondary)
                             }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .contentShape(Rectangle())
                         }
+                        .buttonStyle(.plain)
                     }
                     if let message {
                         Text(message).scaledFont(.caption).foregroundStyle(.secondary)
                     }
-                } header: {
-                    Text("Where")
                 }
-                Section {
+                ConduitSettingsSection(title: AppLocalization.string("Radius"), symbol: "circle.dashed", tint: .blue) {
                     Slider(value: $draft.radius, in: LocationSavedPlace.minRadius...LocationSavedPlace.maxRadius, step: 25)
                         .accessibilityLabel(Text("Radius"))
                         .accessibilityValue(Text(verbatim: LocationSettingsText.radius(draft.radius)))
                     Text(AppLocalization.string("Radius: \(LocationSettingsText.radius(draft.radius))"))
                         .scaledFont(.caption)
                         .foregroundStyle(.secondary)
-                } footer: {
                     Text("Arriving and leaving count once you cross this circle. A larger circle notices you sooner but can miss short visits.")
+                        .settingsCaption()
                 }
                 if !draft.isNew {
-                    Section {
-                        Button("Delete place", role: .destructive) { delete(draft.id) }
-                    }
+                    Button("Delete place", role: .destructive) { delete(draft.id) }
+                        .scaledFont(.subheadline.weight(.semibold))
+                        .foregroundStyle(.red)
+                        .frame(maxWidth: .infinity, minHeight: 44)
+                        .settingsCard()
                 }
             }
             .navigationTitle(draft.isNew ? AppLocalization.string("Add a place") : AppLocalization.string("Edit place"))

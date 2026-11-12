@@ -47,6 +47,11 @@ targets:
           DEAD_CODE_STRIPPING: YES
     dependencies:REPLACE:
       - package: WebRTC
+      # Image Playground is available to Catalyst from macOS 15.1 (iOS 18.1).
+      # Keep it weak so the app still launches on the macOS 14 minimum.
+      - sdk: ImagePlayground.framework
+        weak: true
+      # ActivityKit is intentionally absent: Catalyst has no Live Activities.
     postBuildScripts:
       # One window. The manifest allows several scenes for CarPlay, which
       # the Mac has none of, and on a Mac that adds File > New Window: a

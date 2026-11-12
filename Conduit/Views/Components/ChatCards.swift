@@ -49,9 +49,7 @@ struct ChatPlanDock: View {
                         // A tap on the line asks for the card: the
                         // keyboard goes, and the card opens.
                         if isCompact {
-                            UIApplication.shared.sendAction(
-                                #selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil
-                            )
+                            ReturnKeyTextView.putAwayFocus()
                         }
                     }
                         .transition(popTransition)
@@ -343,8 +341,8 @@ private struct PlanSheet: View {
         NavigationStack {
             Group {
                 if let plan = cards.plan, cards.showsPlan {
-                    List {
-                        Section {
+                    SettingsDetailContainer(compact: true) {
+                        SettingsCard {
                             ProgressView(value: plan.progress) {
                                 Text(PlanText.count(plan))
                                     .scaledFont(.subheadline.monospacedDigit())
@@ -352,7 +350,7 @@ private struct PlanSheet: View {
                             }
                             .tint(plan.isFinished ? .green : .conduitAccent)
                         }
-                        Section {
+                        SettingsCard {
                             ForEach(plan.items) { item in
                                 PlanItemRow(item: item, depth: plan.depth(of: item, cap: 4))
                             }

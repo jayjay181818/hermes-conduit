@@ -47,10 +47,16 @@ cd "$root"
 command -v xcodegen >/dev/null || { echo "xcodegen is required (brew install xcodegen)" >&2; exit 1; }
 # The live voice orb is a Metal shader; Xcode ships the Metal compiler as a
 # separate download.
-xcrun -sdk macosx metal --version >/dev/null 2>&1 || {
-  echo "Xcode's Metal Toolchain is required: xcodebuild -downloadComponent metaltoolchain" >&2
-  exit 1
-}
+if ! xcrun -sdk macosx metal --version >/dev/null 2>&1; then
+  # A downloaded Metal component may be registered separately from the
+  # selected Xcode toolchain. Select it for this build only.
+  if [ -z "${TOOLCHAINS:-}" ] && xcrun --toolchain com.apple.dt.toolchain.Metal metal --version >/dev/null 2>&1; then
+    export TOOLCHAINS=com.apple.dt.toolchain.Metal
+  else
+    echo "Xcode's Metal Toolchain is required: xcodebuild -downloadComponent metaltoolchain" >&2
+    exit 1
+  fi
+fi
 
 mkdir -p "$derived"
 xcodegen generate --quiet --spec scripts/mac-catalyst/project.yml --project-root . --project .

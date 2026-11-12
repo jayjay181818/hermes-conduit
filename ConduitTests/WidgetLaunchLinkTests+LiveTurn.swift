@@ -8,6 +8,15 @@ private let now = Date(timeIntervalSince1970: 1_800_000_000)
 /// An extension of an existing class, so the CI planner's lanes stay within
 /// their batch budget.
 extension WidgetLaunchLinkTests {
+    @MainActor
+    func testMacCatalystHasNoLiveActivitySingleton() {
+        XCTAssertEqual(LiveTurnActivities.shared != nil, LiveTurnActivities.isAvailable)
+#if targetEnvironment(macCatalyst)
+        XCTAssertFalse(LiveTurnActivities.isAvailable)
+        XCTAssertNil(LiveTurnActivities.shared)
+#endif
+    }
+
     func testLiveTurnToolsCountAndShowOnlyTheirCategory() throws {
         var state = State(phase: .thinking)
         state = try XCTUnwrap(LiveTurnProgress.applying(.toolStart(sessionId: "s", toolName: "terminal", toolInput: "rm -rf build"), to: state))

@@ -1,4 +1,5 @@
 import UserNotifications
+import WidgetKit
 
 /// Decrypts end-to-end encrypted Conduit notifications on the iPhone (#431).
 ///
@@ -10,7 +11,8 @@ import UserNotifications
 /// with Chat names (#1415), and the generic copy for its type otherwise. Anything that doesn't
 /// verify, is a replay, or is plaintext for a pairing that has a key shows
 /// only the generic copy and loses its routing data, so tapping it routes
-/// nowhere. Conduit itself re-verifies the envelope on tap; nothing this
+/// nowhere. A group room's replies replace each other (one notification per
+/// room, issue 2064). Conduit itself re-verifies the envelope on tap; nothing this
 /// extension writes into the notification is trusted on its own.
 final class NotificationService: UNNotificationServiceExtension {
     // didReceive and serviceExtensionTimeWillExpire may run on different
@@ -23,12 +25,18 @@ final class NotificationService: UNNotificationServiceExtension {
         lock.withLock { self.contentHandler = contentHandler }
         AppLocalization.adopt(appLanguage: NotificationSharedSettings.appLanguage)
         guard let content = request.content.mutableCopy() as? UNMutableNotificationContent else {
-            deliver(request.content)
+            // Never seen: with no copy to strip, only generic text goes out.
+            deliver(Self.generic(UNMutableNotificationContent(), type: nil))
             return
         }
+        // Only this extension writes the chat note, on a push it verified
+        // (or a keyless pairing's room push): one the push arrived with is
+        // dropped on every path.
+        content.userInfo.removeValue(forKey: ReadChatHint.userInfoKey)
         let userInfo = content.userInfo
         let type = (NotificationE2E.routingStub(userInfo)?["type"] as? String)
-        // Prepared up front so a timeout can only ever deliver generic text.
+        // Prepared up front so a timeout delivers generic text. It takes the
+        // chat note once the push verifies; a keyless room push replaces it.
         let prepared = Self.generic(content.mutableCopy() as? UNMutableNotificationContent ?? content, type: type)
         lock.withLock { fallback = prepared }
 
@@ -39,12 +47,35 @@ final class NotificationService: UNNotificationServiceExtension {
             keysProvisioned: NotificationSharedSettings.keysProvisioned
         ) {
         case .legacy:
+            // A keyless pairing's room push keeps one per room too (issue
+            // 2064), noted like a verified one: the note only clears, and
+            // replaces only another keyless push of the room.
+            let note = ReadChatHint.note(NotificationE2E.plaintextRouting(userInfo), plaintext: true)
+            if let thread = ReadChatHint.roomThread(note) {
+                content.userInfo[ReadChatHint.userInfoKey] = note
+                // A lookup that stalls still delivers it as a keyless push
+                // always went out: routable, and replaced by the room's next.
+                lock.withLock { fallback = content }
+                deliverInRoom(content, note: note, thread: thread, request: request)
+                return
+            }
             deliver(content)
         case .untrusted(let type):
             deliver(Self.generic(content, type: type))
         case .verified(let verified):
+            // Which chat this is, for Conduit to clear it once that chat is read.
+            let note = ReadChatHint.note(verified.routingPayload)
+            lock.withLock {
+                if let noted = fallback?.mutableCopy() as? UNMutableNotificationContent {
+                    noted.userInfo[ReadChatHint.userInfoKey] = note
+                    fallback = noted
+                }
+            }
             guard E2ESeenStore.shared.insert(verified.envelope.replayKey, namespace: "delivered") else {
-                deliver(Self.generic(content, type: verified.type))
+                // A second copy: generic and routing nowhere, but it clears with its chat.
+                let copy = Self.generic(content, type: verified.type)
+                copy.userInfo[ReadChatHint.userInfoKey] = note
+                deliver(copy)
                 return
             }
             let generic = NotificationCopy.generic(for: verified.type)
@@ -67,6 +98,7 @@ final class NotificationService: UNNotificationServiceExtension {
                 if let title = names.title { content.title = title }
                 if let subtitle = names.subtitle { content.subtitle = subtitle }
             }
+            content.userInfo[ReadChatHint.userInfoKey] = note
             // Quiet for today on a Pulse push, where its plugin takes it.
             if PulseNotifications.offersQuietToday(
                 titleLabel: verified.content["title_label"] as? String,
@@ -75,7 +107,63 @@ final class NotificationService: UNNotificationServiceExtension {
             ) {
                 content.categoryIdentifier = PulseNotifications.categoryIdentifier
             }
+            // Pulse brought something up: the Pulse widget reads its cards
+            // again, without Conduit running (issue 2190).
+            if PulseNotifications.isPulse(titleLabel: verified.content["title_label"] as? String) {
+                WidgetCenter.shared.reloadTimelines(ofKind: PulseNotifications.widgetKind)
+            }
+            if let thread = ReadChatHint.roomThread(note) {
+                deliverInRoom(content, note: note, thread: thread, request: request)
+                return
+            }
             deliver(content)
+        }
+    }
+
+    /// A group room keeps one notification: this one replaces the room's
+    /// last, whichever bot sent it (issue 2064), and waits for one handed
+    /// over just before it to show first.
+    private func deliverInRoom(
+        _ content: UNMutableNotificationContent, note: [String: String], thread: String, request: UNNotificationRequest
+    ) {
+        content.threadIdentifier = thread
+        let (pending, now) = RoomHandoffs.record(request.identifier, thread: thread, defaults: NotificationSharedSettings.defaults)
+        Self.replaceEarlier(
+            in: note, thread: thread, own: request.identifier, recordedAt: now, pending: Set(pending),
+            until: now.addingTimeInterval(RoomHandoffs.wait)
+        ) { [weak self] in self?.deliver(content) }
+    }
+
+    /// Removes the room's notifications already shown, and those `pending`
+    /// once they show (two bots finishing together), until `deadline`, as
+    /// `RoomHandoffs.replacing` picks them. A newer one's showing time keeps
+    /// it once its handoff has aged out of the list, on a lookup stalled
+    /// past the window.
+    private static func replaceEarlier(
+        in note: [String: String], thread: String, own: String, recordedAt: Date, pending: Set<String>,
+        until deadline: Date, then: @escaping () -> Void
+    ) {
+        let center = UNUserNotificationCenter.current()
+        center.getDeliveredNotifications { delivered in
+            let newer = RoomHandoffs.handedOver(
+                in: thread, after: recordedAt, except: own, defaults: NotificationSharedSettings.defaults
+            )
+            let shown = delivered.map {
+                RoomHandoffs.Shown(
+                    id: $0.request.identifier, date: $0.date,
+                    sameRoom: ReadChatHint.replaces(note, delivered: $0.request.content.userInfo)
+                )
+            }
+            let (gone, waiting) = RoomHandoffs.replacing(
+                shown, own: own, newer: newer, recordedAt: recordedAt, pending: pending
+            )
+            if !gone.isEmpty { center.removeDeliveredNotifications(withIdentifiers: Array(gone)) }
+            guard !waiting.isEmpty, Date() < deadline else { return then() }
+            DispatchQueue.global().asyncAfter(deadline: .now() + 0.15) {
+                Self.replaceEarlier(
+                    in: note, thread: thread, own: own, recordedAt: recordedAt, pending: waiting, until: deadline, then: then
+                )
+            }
         }
     }
 

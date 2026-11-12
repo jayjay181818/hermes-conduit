@@ -139,7 +139,7 @@ final class ConnectionRepairTests: XCTestCase {
                 [.connectionDetails, .tlsTroubleshooting]
             )
         }
-        for failure: ConnectionFailure in [.invalidAddress, .hostNotFound, .unreachable, .connectionRefused, .timedOut, .offline, .dashboardUnavailable, .unexpectedServerResponse] {
+        for failure: ConnectionFailure in [.invalidAddress, .hostNotFound, .unreachable, .connectionRefused, .timedOut, .offline, .accessDenied, .dashboardUnavailable, .unexpectedServerResponse] {
             XCTAssertEqual(
                 ConnectionSetupFlow.initialPath(for: .repairConnection, draft: draft, repairFailure: failure),
                 [.connectionDetails],
@@ -559,9 +559,11 @@ final class ConnectionRepairTests: XCTestCase {
         harness.appState.connection = HermesConnection(baseUrl: ConnectionRepairTests.failedURL, ticket: "stale-ticket")
         harness.appState.client = HermesClient(connection: HermesConnection(baseUrl: ConnectionRepairTests.failedURL, ticket: "t"), profile: "default")
 
-        // First reconnect fails: the typed classification must remain
-        // available for Repair seeding and routing.
-        await harness.appState.reconnectForRetry(purpose: .preserveCurrent)
+        // A tapped Reconnect fails: its failure shows at once (a resume's
+        // keeps quiet for the first retries, #1624, covered in
+        // AppStateChatResumeTests), and the typed classification must
+        // remain available for Repair seeding and routing.
+        await harness.appState.reconnect()
         XCTAssertFalse(harness.appState.isConnected)
         XCTAssertNotNil(harness.appState.lastConnectionFailure,
                         "A failed reconnect must leave the typed classification available for Repair")

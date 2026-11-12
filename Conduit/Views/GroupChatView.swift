@@ -12,26 +12,51 @@ struct GroupChatView: View {
     /// transcript under soft edges, and the header's menu holds the room's
     /// actions.
     @Environment(\.v2ComposerRests) private var isV2
+    @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.v2Shell) private var shell
+    /// This screen, to AppState's room poll: it stops while no room screen
+    /// shows (`noteRoomView`).
+    @State private var roomViewID = UUID()
+    /// Active, not just out of the background: the poll waits for the scene
+    /// to be active, so a return's catch-up lands when it can read. Split,
+    /// the chat column shows it beside whatever the list column holds
+    /// (Pulse, say); otherwise Back to the list or Settings covers it.
+    private var roomShows: Bool {
+        shell.isTabActive && (shell.hasChatBeside || !appState.showSidebar) && scenePhase == .active
+            // Under a Bot Chat on its way it's covered: what comes in isn't seen.
+            && !coveredByBotChatComing
+    }
+    /// V2's screen covers the room while a Bot Chat comes over it; the
+    /// legacy shell has no cover, so its room shows and keeps its controls.
+    private var coveredByBotChatComing: Bool {
+        isV2 && appState.botChatComingOverAnother != nil
+    }
     @State private var showingDisbandConfirmation = false
+    /// The ended room someone else hosts whose Delete, from the menu,
+    /// waits for its confirmation.
+    @State private var copyPendingDelete: RoomCopy?
+    @State private var showingInfo = false
     @State private var choosingPicture: GroupRoomPictureRequest?
-    /// Following the latest event, or browsing history (GroupRoomFollow).
-    /// The flag decides scrolling; the published copy draws the button.
-    @State private var followFlag = GroupRoomFollowFlag()
+    @State private var showingSettings = false
+    /// Moves the transcript by the chat's rules (#1533, the transcript
+    /// rewrite): it follows the latest event, stops at a new member
+    /// message's start, and keeps a reader browsing history on their row.
+    /// The jump button observes `scroller.chrome` on its own.
+    @StateObject private var scroller = TranscriptScroller()
+    /// The transcript's rows (GroupRoomTranscript), built again only when
+    /// what they draw changes.
+    @State private var roomTranscript = GroupRoomTranscriptBox()
+    /// A long message's "Show all" tells the scroller first, so the row
+    /// tapped stays where it is, as in a chat.
+    @State private var rowDisclosure = ChatRowDisclosure()
     /// The room's pictures, which a tapped one pages through.
     @State private var imageGallery = ImageGallerySource()
-    @State private var isFollowingLatest = true
-    /// Bumped by the jump-to-latest button; the transcript scrolls on it.
-    @State private var latestJumps = 0
-    /// The last row before the newest events, so a member message among
-    /// them can land at its top (GroupRoomFollow.replyStart).
-    @State private var lastSeenEventID: String?
-    /// Bumped to build the transcript's scroll view again when SwiftUI left
-    /// it blank (GroupRoomFollow.isBlank).
-    @State private var transcriptScrollID = 0
     /// The chat text size and style, and a wide window's steps
     /// (`readableChatColumn`): the room's messages draw as a chat's do.
     @AppStorage(ChatTypography.preferenceKey) private var chatTextSizeRaw = ChatTypography.defaultSize.rawValue
     @AppStorage(ChatTypography.fontStylePreferenceKey) private var chatFontStyleRaw = ChatFontStyle.standard.rawValue
+    /// Settings > Chat's Long replies, which rooms share with chats.
+    @AppStorage(ChatReplyStartPreference.key) private var stopsAtReplyStart = ChatReplyStartPreference.defaultOn
     @Environment(\.chatWidthTextSteps) private var chatWidthTextSteps
     @Environment(\.columnText) private var columnText
 
@@ -47,11 +72,15 @@ struct GroupChatView: View {
         Group {
             if isV2 {
                 transcript
+                    .v2EdgeBar(.top) {
+                        statusStrip
+                    }
                     .v2EdgeBar(.bottom) {
                         bottomBar
                     }
             } else {
                 VStack(spacing: 0) {
+                    statusStrip
                     transcript
                     bottomBar
                 }
@@ -60,18 +89,36 @@ struct GroupChatView: View {
         .animation(.easeInOut(duration: 0.2), value: appState.minimisedLiveVoice)
         // Each bot's color, for its name, bubble, tags and "To" chip.
         .environment(\.groupMemberTints, appState.groupMemberTints(members))
+        // Other people's agents and the people, as their own Conduits draw them.
+        .environment(\.groupRoomLooks, appState.activeRoomLooksShown)
         .environment(\.chatTextSize, chatTextSize)
         // A Desktop card reads its title and summary from the connected
-        // Hermes (#1522); the room's MEDIA: files stay off it.
+        // Hermes (#1522). A member's MEDIA: files read through its own
+        // profile's resolver, set on its bubble.
         .environment(\.gatewayMediaFiles, appState.gatewayMediaResolver)
         // Files dragged onto the room are staged in its composer (#1408);
         // a plugin that can't store them gets the composer's notice.
         .attachmentDropTarget(isEnabled: surface.map { !$0.room.isDisbanded } ?? false) { providers in
             appState.dropIntoRoomComposer(providers)
         }
-        .toolbar { toolbarContent }
+        // Under a Bot Chat on its way (a portrait tapped beside the room),
+        // the coming bot's name is the title; the room stays mounted, its
+        // picks kept should that open fail.
+        .toolbar {
+            if !coveredByBotChatComing { toolbarContent }
+        }
         // V2's screen hosts this view and owns the room menu and picker.
         .modifier(GroupRoomPicturePicker(request: $choosingPicture, isEnabled: !isV2))
+        // On the screen, not the menu: a sheet raised as a menu closes may
+        // never show.
+        .sheet(isPresented: $showingInfo) {
+            GroupRoomInfoSheet()
+                .environmentObject(appState)
+        }
+        .sheet(isPresented: $showingSettings) {
+            GroupRoomSettingsSheet()
+                .environmentObject(appState)
+        }
         .confirmationDialog(
             AppLocalization.string("Disband this group chat?"),
             isPresented: $showingDisbandConfirmation,
@@ -82,197 +129,125 @@ struct GroupChatView: View {
             }
             Button(AppLocalization.string("Cancel"), role: .cancel) {}
         } message: {
-            Text(AppLocalization.string(
-                "The room, its history, and every member's session end permanently. This cannot be undone."
-            ))
+            Text(GroupRoomDisband.warning(members: surface?.room.members ?? []))
         }
+        .modifier(RoomCopyDelete(copy: copyPendingDelete, confirming: Binding(
+            get: { copyPendingDelete != nil },
+            set: { if !$0 { copyPendingDelete = nil } }
+        )))
     }
 
     private var bottomBar: some View {
         VStack(spacing: 0) {
-            pendingApprovals
-            MinimisedLiveVoiceBar()
-            GroupRoomComposer(members: members)
-        }
-        .overlay(alignment: .topTrailing) {
-            if !isFollowingLatest {
-                jumpToLatestButton
-                    .alignmentGuide(.top) { $0[.bottom] + 10 }
+            if let copy = surface?.copy {
+                // Hosted elsewhere: its composer posts through your Hermes
+                // while it takes your posts.
+                MinimisedLiveVoiceBar()
+                RoomCopyBottomBar(copy: copy, members: members)
+            } else {
+                pendingApprovals
+                MinimisedLiveVoiceBar()
+                GroupRoomComposer(members: members)
             }
         }
     }
 
-    /// Shown while browsing, as on the chat screen.
-    private var jumpToLatestButton: some View {
-        Button {
-            followLatest()
-            latestJumps += 1
-        } label: {
-            Image(systemName: "arrow.down")
-                .font(.system(size: 15, weight: .bold))
-                .frame(width: 44, height: 44)
-        }
-        .conduitGlassControl(cornerRadius: 22, tint: Color.conduitAccent.opacity(0.14))
-        .accessibilityLabel(AppLocalization.string("Scroll to latest message"))
-        .padding(.trailing, 18)
+    /// A pill per member under the title, with how its turn went: the
+    /// room's statuses, which the transcript no longer lists (Desktop's
+    /// layout, Eric 2026-11-06).
+    private var statusStrip: some View {
+        GroupRoomStatusStrip(
+            members: members, statuses: appState.activeRoomMemberStatuses,
+            leadKey: GroupRoomTurns.leadKey(context: appState.activeRoomContext, members: members)
+        )
     }
 
     private var surface: AppState.GroupRoomSurface? { appState.activeRoomSurface }
 
     /// Named as the bots are now, not as they were when they joined.
+    /// With their owners, for a room over Links.
     private var members: [GroupMember] {
-        GroupRoomTurns.members(surface?.room.members ?? [], namedBy: appState.botRoster)
-    }
-
-    /// Log events that earn a row: a member turn that posted settles
-    /// silently, since its bubble already says so.
-    private var visibleEvents: [GroupEvent] {
-        appState.activeRoomReplay.events.filter(GroupRoomTurns.isVisible)
+        GroupRoomTurns.members(appState.activeRoomMembers, namedBy: appState.shownBotRoster)
     }
 
     /// The member whose turn is running (memoized by AppState).
     private var respondingMember: GroupMember? {
-        appState.activeRoomResponder.flatMap { GroupRoomTurns.members([$0], namedBy: appState.botRoster).first }
+        appState.activeRoomResponder.flatMap { GroupRoomTurns.members([$0], namedBy: appState.shownBotRoster).first }
     }
 
     // MARK: - Transcript
 
+    /// The room's transcript (#1533, the transcript rewrite): the chat's
+    /// collection view and scroller, so a room follows the latest event,
+    /// stops at a new member message and keeps a reader on their row by the
+    /// chat's rules. It fills the area under the bars around it and keeps
+    /// its rows clear of them with the safe area's insets.
     private var transcript: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                let rendered = self.visibleEvents
-                let _ = imageGallery.update { GroupRoomImageGallery.items(in: rendered) }
-                LazyVStack(spacing: 14) {
-                    ForEach(Array(rendered.enumerated()), id: \.element.id) { index, event in
-                        // A member's run of replies shows its picture and
-                        // name once, like a group thread in Messages.
-                        let previous = index > 0 ? rendered[index - 1] : nil
-                        GroupEventRow(
-                            event: event,
-                            members: members,
-                            continuesRun: previous.map { GroupEventRow.sameSpeaker($0, event) } ?? false
-                        )
-                        .reportsGroupRoomRowFrame(id: event.id)
-                    }
-                    if let pending = appState.pendingRoomMessage {
-                        GroupUserBubble(text: pending.text, members: members, timestamp: nil, eventID: pending.eventID) {
-                            if appState.activeRoomSendInFlight {
-                                Text(AppLocalization.string("Sending…"))
-                                    .scaledFont(.caption2)
-                                    .foregroundStyle(.secondary)
-                            } else {
-                                // Ambiguous outcome: the message may or may
-                                // not have landed. Retry reuses the SAME
-                                // event id, so the gateway deduplicates —
-                                // never a twin message.
-                                Button {
-                                    // A retry keeps its event id, so the
-                                    // send observer won't see it.
-                                    followLatest()
-                                    latestJumps += 1
-                                    Task { await appState.sendGroupRoomMessage(pending.text) }
-                                } label: {
-                                    Label(
-                                        AppLocalization.string("Not delivered — retry"),
-                                        systemImage: "arrow.clockwise"
-                                    )
-                                    .scaledFont(.caption.weight(.semibold))
-                                }
-                                .buttonStyle(.plain)
-                                .foregroundStyle(Color.conduitAccent)
-                            }
-                        }
-                        .id("pending-row")
-                        .reportsGroupRoomRowFrame(id: "pending-row")
-                    }
-                    if let responder = respondingMember {
-                        GroupRespondingRow(member: responder)
-                            .id("responding-row")
-                            .reportsGroupRoomRowFrame(id: "responding-row")
-                    }
-                    if rendered.isEmpty && appState.pendingRoomMessage == nil && respondingMember == nil {
-                        emptyState
-                    }
-                }
-                .coordinateSpace(.named(GroupRoomFollow.coordinateSpaceName))
-                .environment(\.imageGallery, imageGallery)
-                .background { GroupRoomScrollLocator(flag: followFlag, isFollowing: $isFollowingLatest) }
-                .padding(.horizontal, 16)
-                .padding(.top, 14)
-                .padding(.bottom, 18)
-            }
-            .id(transcriptScrollID)
-            .onPreferenceChange(GroupRoomRowFramesPreferenceKey.self) { frames in
-                let lostARow = followFlag.rowFrames.keys.contains { frames[$0] == nil }
-                followFlag.rowFrames = frames
-                // A stack that dropped its rows may change no size at all.
-                if frames.isEmpty || lostARow {
-                    followFlag.checkForBlankViewport?()
-                }
-            }
-            .scrollDismissesKeyboard(.interactively)
-            .modifier(V2SoftTopScrollEdge(isOn: isV2, underChatHeader: true))
-            .simultaneousGesture(TapGesture().onEnded {
-                // A tap on the transcript puts the keyboard away.
-                UIApplication.shared.sendAction(
-                    #selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil
-                )
-            })
-            // New events and a member starting its turn move the transcript
-            // only while it follows the latest; a reader scrolled up stays.
-            .onChange(of: appState.activeRoomReplay.cursor) { _, _ in
-                let previousLastID = lastSeenEventID
-                lastSeenEventID = visibleEvents.last?.id
-                guard followFlag.isFollowing else { return }
-                if ChatReplyStartPreference.isOn,
-                   let start = GroupRoomFollow.replyStart(in: visibleEvents, after: previousLastID) {
-                    landAtTop(of: start, proxy)
-                } else {
-                    withAnimation(.easeOut(duration: 0.2)) { scrollToBottom(proxy) }
-                }
-            }
-            .onChange(of: respondingMember?.identityKey) { _, _ in
-                guard followFlag.isFollowing else { return }
-                withAnimation(.easeOut(duration: 0.2)) { scrollToBottom(proxy) }
-            }
-            // Sending returns to the latest, as in a chat.
-            .onChange(of: appState.pendingRoomMessage?.eventID) { _, eventID in
-                guard eventID != nil else { return }
-                followLatest()
-                withAnimation(.easeOut(duration: 0.2)) { scrollToBottom(proxy) }
-            }
-            .onChange(of: latestJumps) { _, _ in
-                withAnimation(.easeOut(duration: 0.2)) { scrollToBottom(proxy) }
-            }
-            // A "Replying to" card's tap (issue 1420): the room stops
-            // following and shows the message it quoted.
-            .onChange(of: appState.pendingQuotedReplyJump) { _, jump in
-                guard let jump else { return }
-                appState.pendingQuotedReplyJump = nil
-                followFlag.isFollowing = false
-                isFollowingLatest = false
-                withAnimation(.easeOut(duration: 0.2)) { proxy.scrollTo(jump.messageID, anchor: .top) }
-            }
-            .onAppear {
-                lastSeenEventID = visibleEvents.last?.id
-                followLatest()
-                scrollToBottom(proxy)
-                followFlag.lastRowID = { [weak appState = appState] in
-                    guard let appState else { return nil }
-                    if appState.activeRoomResponder != nil { return "responding-row" }
-                    if appState.pendingRoomMessage != nil { return "pending-row" }
-                    return appState.activeRoomReplay.events.last(where: GroupRoomTurns.isVisible)?.id
-                }
-                // The binding, not this view: the flag would keep its own
-                // view state alive through it.
-                let scrollID = $transcriptScrollID
-                followFlag.rebuild = { scrollID.wrappedValue &+= 1 }
+        let replay = appState.activeRoomReplay
+        // In the body, before the rows are laid out: the scroller hears of
+        // new events as they're built (GroupRoomTranscriptBox).
+        let rows = roomTranscript.update(
+            GroupRoomTranscriptBox.Input(
+                replay: replay,
+                members: members,
+                pending: appState.pendingRoomMessage,
+                isSending: appState.activeRoomSendInFlight,
+                responder: respondingMember,
+                boards: appState.activeRoomPlacedBoards,
+                byline: GroupRoomByline(
+                    host: surface?.copy.map { RoomCopyText.hostName(for: $0) },
+                    attribution: appState.activeRoomPostAttribution
+                ),
+                copyPost: copyPostState,
+                responderState: appState.activeRoomResponderState,
+                takesPosts: surface?.copy == nil || appState.activeRoomCopyTakesPosts
+            ),
+            scroller: scroller
+        )
+        // The closure is kept by the gallery, so it holds the events, roster and
+        // app state, never the view.
+        let galleryEvents = replay.events.filter(GroupRoomTurns.isVisible)
+        let roster = members
+        let galleryAppState = appState
+        let roomPictures = appState.roomFilePicturesResolver
+        imageGallery.update {
+            GroupRoomImageGallery.items(in: galleryEvents, files: roomPictures) { event in
+                GroupRoomTurns.localProfile(of: GroupRoomTurns.speaker(of: event, members: roster))
+                    .map { galleryAppState.gatewayMediaResolver(for: $0) }
             }
         }
-        .background(Color.clear)
+        return GeometryReader { proxy in
+            TranscriptView(
+                appState: appState,
+                scroller: scroller,
+                rows: rows,
+                rowContent: { row in AnyView(roomRow(row)) },
+                disclosure: rowDisclosure,
+                insets: proxy.safeAreaInsets,
+                conversation: "room:\(replay.roomID)",
+                composerFloats: isV2
+            )
+            .ignoresSafeArea()
+        }
+        .modifier(V2SoftTopScrollEdge(isOn: isV2, underChatHeader: true, setsOwnEdge: true))
         // Cross-block selection chrome, and Quote on selected text into the
         // room's draft, as in a chat.
         .overlay { MarkdownSelectionChromeRoot() }
+        // Shown while browsing, centered over the composer as on the chat
+        // screen, and inside the transcript's area as there: drawn above the
+        // composer bar's bounds (#1833), it showed but iOS 26's safeAreaBar
+        // passed its taps to the transcript under it.
+        .overlay(alignment: .bottom) {
+            GroupRoomJumpButton(chrome: scroller.chrome) {
+                ChatViewportWatch.shared.command("room latest (button)")
+                scroller.explicitLatestRequested(animated: true)
+            }
+            .padding(.horizontal, 18)
+            .padding(.bottom, 14)
+        }
+        .environment(\.imageGallery, imageGallery)
+        .environment(\.roomFilePictures, roomPictures)
+        .environment(\.roomFileReads, appState.roomFileReadsResolver)
         // As in a chat, text draws until a touch needs its text view, and
         // a drawn bubble sizes to its text.
         .environment(\.selectableTextDrawsUntilTouched, true)
@@ -290,59 +265,144 @@ struct GroupChatView: View {
                 appState?.showQuotedRoomMessage(quote, quotedIn: eventID) ?? false
             }
         )
+        // Sending returns to the latest, as in a chat.
+        .onChange(of: appState.pendingRoomMessage?.eventID) { _, eventID in
+            guard eventID != nil else { return }
+            ChatViewportWatch.shared.command("room latest (send)")
+            scroller.explicitLatestRequested(animated: false)
+        }
+        // A "Replying to" card's tap (issue 1420): the message it quoted, at
+        // the top, the room browsing there.
+        .onChange(of: appState.pendingQuotedReplyJump) { _, jump in
+            guard let jump else { return }
+            appState.pendingQuotedReplyJump = nil
+            ChatViewportWatch.shared.command("room quotedReply")
+            scroller.explicitMessageRequested(id: jump.messageID)
+        }
+        // In the background iOS still lays the room out for app-switcher
+        // snapshots; the scroller leaves the offset alone until it's back.
+        .onChange(of: scenePhase) { _, phase in
+            scroller.setPaused(phase == .background)
+        }
+        // Long replies switched, here or synced from another device: a
+        // room at a member message's stop goes on to the end now, not at
+        // its next layout, as a chat does.
+        .onChange(of: stopsAtReplyStart) { _, _ in
+            scroller.replyStartPreferenceChanged()
+        }
+        .onAppear {
+            rowDisclosure.scroller = scroller
+            scroller.holdsRepliesAtStart = { ChatReplyStartPreference.isOn }
+            scroller.setPaused(scenePhase == .background)
+            appState.noteRoomView(roomViewID, shows: roomShows)
+        }
+        // Its tab hidden, or the chat column covered (Settings beside the
+        // list, Back to the list): the room isn't seen.
+        .onChange(of: roomShows) { _, shows in
+            appState.noteRoomView(roomViewID, shows: shows)
+        }
+        // Its info, settings, picture picker or disband prompt covers it:
+        // what comes in meanwhile isn't read until it closes (issue 2064).
+        .onChange(of: coveredBySheet) { _, covered in
+            appState.chatCoveredBySheet = covered
+            if !covered { appState.clearShownChatNotifications() }
+        }
+        .onDisappear {
+            scroller.viewDisappeared()
+            appState.noteRoomView(roomViewID, shows: nil)
+            if coveredBySheet { appState.chatCoveredBySheet = false }
+        }
     }
 
-    private var emptyState: some View {
-        VStack(spacing: 12) {
-            GroupRoomIcon(
-                picture: surface.flatMap { appState.groupRoomPicture(roomID: $0.room.roomID) },
-                members: members,
-                size: 56
+    /// One of the room's own sheets or prompts is up (V2's screen keeps its own).
+    private var coveredBySheet: Bool {
+        showingInfo || showingSettings || showingDisbandConfirmation || copyPendingDelete != nil || choosingPicture != nil
+    }
+
+    /// Where a member's `MEDIA:` files are read: its own profile on the
+    /// connected Hermes, where Hermes saved them. Another gateway's bot, or
+    /// a member the room no longer lists, gets none, so its tags stay text.
+    private func mediaResolver(for member: GroupMember?) -> GatewayMediaDataURLResolver? {
+        GroupRoomTurns.localProfile(of: member).map { appState.gatewayMediaResolver(for: $0) }
+    }
+
+    /// In a room someone else hosts, where the message on its way stands:
+    /// its post goes through your Hermes (RoomPosts.swift).
+    private var copyPostState: RoomPostText.RowState? {
+        guard let copy = surface?.copy, appState.pendingRoomMessage != nil else { return nil }
+        return RoomPostText.rowState(
+            post: appState.activeRoomCopyPost,
+            inFlight: appState.activeRoomSendInFlight,
+            takesPosts: appState.activeRoomCopyTakesPosts,
+            roomOver: copy.status == "ended",
+            settling: appState.activeRoomCopyPostUnsettled,
+            waitedOut: appState.activeRoomCopyPostWaitedOut,
+            canAsk: appState.canPostInRoomCopies
+        )
+    }
+
+    /// One of the transcript's rows.
+    @ViewBuilder
+    private func roomRow(_ row: TranscriptRow) -> some View {
+        switch row.kind {
+        case .room(.event(let event, let members, let continuesRun, let boards, let byline)):
+            GroupEventRow(
+                event: event, members: members, continuesRun: continuesRun,
+                host: byline.host, attribution: byline.attribution, boards: boards,
+                mediaResolver: event.isMemberMessage
+                    ? mediaResolver(for: GroupRoomTurns.speaker(of: event, members: members)) : nil
             )
-            Text(AppLocalization.string("No messages yet. Say something to the room."))
-                .scaledFont(.footnote)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-        }
-        .frame(maxWidth: .infinity)
-        .padding(.top, 48)
-    }
-
-    private func followLatest() {
-        followFlag.isFollowing = true
-        isFollowingLatest = true
-    }
-
-    /// A new member message goes to the top of the screen, and the room
-    /// stops following there, as a long chat reply does (#365); one that
-    /// fits clamps at the bottom, where following picks up again.
-    private func landAtTop(of eventID: String, _ proxy: ScrollViewProxy) {
-        followFlag.isFollowing = false
-        followFlag.isLanding = true
-        followFlag.landingGeneration &+= 1
-        let generation = followFlag.landingGeneration
-        isFollowingLatest = false
-        withAnimation(.easeOut(duration: 0.2)) { proxy.scrollTo(eventID, anchor: .top) }
-        // Decide from where it lands once the animation is over (it may not
-        // move the offset at all).
-        Task { @MainActor [followFlag] in
-            try? await Task.sleep(for: .milliseconds(300))
-            guard followFlag.landingGeneration == generation else { return }
-            // Over even if the locator has gone (the room closed).
-            followFlag.isLanding = false
-            followFlag.reevaluate?()
-        }
-    }
-
-    /// The bottom-most row: the responding member, else the pending send,
-    /// else the last visible event.
-    private func scrollToBottom(_ proxy: ScrollViewProxy) {
-        if respondingMember != nil {
-            proxy.scrollTo("responding-row", anchor: .bottom)
-        } else if appState.pendingRoomMessage != nil {
-            proxy.scrollTo("pending-row", anchor: .bottom)
-        } else if let last = visibleEvents.last {
-            proxy.scrollTo(last.id, anchor: .bottom)
+        case .room(.pending(let text, let members, let isSending, let copyPost, let files)):
+            GroupUserBubble(text: text, members: members, timestamp: nil, eventID: row.id, files: files) {
+                if let copyPost {
+                    // In a room someone else hosts, where its post through
+                    // your Hermes stands.
+                    RoomCopyPostFooter(
+                        state: copyPost,
+                        retry: {
+                            ChatViewportWatch.shared.command("room latest (retry)")
+                            scroller.explicitLatestRequested(animated: false)
+                            Task { await appState.sendGroupRoomMessage(text) }
+                        },
+                        edit: { appState.editActiveRoomCopyPost() },
+                        copy: {
+                            UIPasteboard.general.string = text
+                            Haptics.success()
+                        },
+                        dismiss: { appState.dismissActiveRoomCopyPost() }
+                    )
+                } else if isSending {
+                    Text(AppLocalization.string("Sending…"))
+                        .scaledFont(.caption2)
+                        .foregroundStyle(.secondary)
+                } else {
+                    // Ambiguous outcome: the message may or may not have
+                    // landed. Retry reuses the SAME event id, so the
+                    // gateway deduplicates — never a twin message.
+                    Button {
+                        // A retry keeps its event id, so the send observer
+                        // won't see it.
+                        ChatViewportWatch.shared.command("room latest (retry)")
+                        scroller.explicitLatestRequested(animated: false)
+                        Task { await appState.sendGroupRoomMessage(text) }
+                    } label: {
+                        Label(
+                            AppLocalization.string("Not delivered — retry"),
+                            systemImage: "arrow.clockwise"
+                        )
+                        .scaledFont(.caption.weight(.semibold))
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(Color.conduitAccent)
+                }
+            }
+        case .room(.responding(let member, let state)):
+            GroupRespondingRow(member: member, state: state)
+        case .room(.empty(let roomID, let members, let takesPosts)):
+            GroupRoomEmptyState(roomID: roomID, members: members, takesPosts: takesPosts)
+        default:
+            // A chat's rows (ChatView); a room has none.
+            EmptyView()
         }
     }
 
@@ -371,14 +431,21 @@ struct GroupChatView: View {
                 members: members,
                 picture: surface.flatMap { appState.groupRoomPicture(roomID: $0.room.roomID) }
             )
+            // The bar's items don't get the looks the screen sets above
+            // `.toolbar`: set here, so other people's agents draw in the
+            // title as in the transcript and on Bots Home.
+            .environment(\.groupRoomLooks, appState.activeRoomLooksShown)
         }
         if !isV2 {
             // V2's conversation menu carries these with the gateway's state.
             ToolbarItem(placement: .topBarTrailing) {
                 Menu {
                     GroupRoomActionItems(
+                        onShowInfo: { showingInfo = true },
                         onDisband: { showingDisbandConfirmation = true },
-                        onChoosePicture: { choosingPicture = $0 }
+                        onChoosePicture: { choosingPicture = $0 },
+                        onOpenSettings: { showingSettings = true },
+                        onDeleteCopy: { copyPendingDelete = $0 }
                     )
                 } label: {
                     Image(systemName: "ellipsis.circle")
@@ -433,27 +500,117 @@ struct GroupChatView: View {
 
     private var memberSummary: String {
         let count = surface?.room.members.count ?? 0
-        if !appState.activeRoomPendingApprovals.isEmpty {
+        if !appState.activeRoomPendingApprovals.isEmpty || !appState.activeRoomCopyApprovals.isEmpty {
             return AppLocalization.string("Approval needed")
         }
+        if case .leadChoosing(let lead)? = appState.activeRoomPendingRoute {
+            let named = GroupRoomTurns.members([lead], namedBy: appState.shownBotRoster).first ?? lead
+            return AppLocalization.string("\(GroupRoomTurns.displayName(of: named)) is choosing who answers…")
+        }
+        if case .routerChoosing? = appState.activeRoomPendingRoute {
+            return AppLocalization.string("Choosing who answers…")
+        }
         if let responder = respondingMember {
-            return AppLocalization.string("\(GroupRoomTurns.displayName(of: responder)) is responding…")
+            let name = GroupRoomTurns.displayName(of: responder)
+            switch appState.activeRoomResponderState {
+            case .responding: return AppLocalization.string("\(name) is responding…")
+            case .cutOff: return AppLocalization.string("\(name) is cut off")
+            case .unreachable: return AppLocalization.string("\(name) can't be reached")
+            }
         }
         if let driver = appState.activeRoomDriverStatus, driver.working {
             return AppLocalization.string("\(count) members · working…")
+        }
+        if appState.activeRoomSettled {
+            // Where the transcript said "The room settled.".
+            return AppLocalization.string("Settled, nobody had more to say")
         }
         return AppLocalization.string("\(count) members")
     }
 }
 
-/// The open room's actions: Stop while its members are working, and
-/// Disband. In the room's own menu (drawer shell) or V2's conversation menu.
-struct GroupRoomActionItems: View {
-    @EnvironmentObject private var appState: AppState
-    let onDisband: () -> Void
-    let onChoosePicture: (GroupRoomPictureRequest) -> Void
+/// The room's jump-to-latest button, shown while the reader browses away
+/// from the latest event. It observes the scroller's chrome on its own, so
+/// the button coming and going redraws it and not the room.
+private struct GroupRoomJumpButton: View {
+    @ObservedObject var chrome: TranscriptScrollChrome
+    let jump: @MainActor () -> Void
 
     var body: some View {
+        if chrome.inputs.showsJumpToLatest {
+            Button {
+                jump()
+            } label: {
+                Image(systemName: "arrow.down")
+                    .font(.system(size: 15, weight: .bold))
+                    .frame(width: 44, height: 44)
+            }
+            .conduitGlassControl(cornerRadius: 22, tint: Color.conduitAccent.opacity(0.14))
+            .accessibilityLabel(AppLocalization.string("Scroll to latest message"))
+        }
+    }
+}
+
+/// A room with nothing in it yet: its picture over an invitation to start.
+private struct GroupRoomEmptyState: View {
+    @EnvironmentObject private var appState: AppState
+    let roomID: String
+    let members: [GroupMember]
+    /// A room someone else hosts may not take your messages.
+    var takesPosts = true
+
+    var body: some View {
+        VStack(spacing: 12) {
+            GroupRoomIcon(picture: appState.groupRoomPicture(roomID: roomID), members: members, size: 56)
+            Text(takesPosts
+                ? AppLocalization.string("No messages yet. Say something to the room.")
+                : AppLocalization.string("No messages yet."))
+                .scaledFont(.footnote)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.top, 48)
+    }
+}
+
+/// The open room's actions: Group Info, Group Settings, its picture, Stop
+/// while its members are working, and Disband; in a room someone else
+/// hosts, Group Info and, once it's over, Delete, as its tile on Bots Home
+/// has. In the room's own menu (drawer shell) or V2's conversation menu.
+struct GroupRoomActionItems: View {
+    @EnvironmentObject private var appState: AppState
+    let onShowInfo: () -> Void
+    let onDisband: () -> Void
+    let onChoosePicture: (GroupRoomPictureRequest) -> Void
+    let onOpenSettings: () -> Void
+    /// Asks first (the dialog is the screen's, not the menu's).
+    let onDeleteCopy: (RoomCopy) -> Void
+
+    var body: some View {
+        Button(action: onShowInfo) {
+            Label(AppLocalization.string("Group Info"), systemImage: "info.circle")
+        }
+        // A room someone else hosts is theirs to change.
+        if let copy = appState.activeRoomSurface?.copy {
+            if appState.canDelete(copy) {
+                Divider()
+                Button(role: .destructive) { onDeleteCopy(copy) } label: {
+                    Label(AppLocalization.string("Delete"), systemImage: "trash")
+                }
+            }
+        } else {
+            ownRoomItems
+        }
+    }
+
+    @ViewBuilder
+    private var ownRoomItems: some View {
+        if appState.canEditActiveRoomSettings {
+            Button(action: onOpenSettings) {
+                Label(AppLocalization.string("Group Settings"), systemImage: "gearshape")
+            }
+        }
         if appState.canSetGroupRoomPictures, let roomID = appState.activeRoomSurface?.room.roomID {
             Button {
                 onChoosePicture(.choose)
@@ -465,6 +622,13 @@ struct GroupRoomActionItems: View {
                     onChoosePicture(.generate)
                 } label: {
                     Label(AppLocalization.string("Generate Group Picture"), systemImage: "sparkles")
+                }
+            }
+            if ImagePlaygroundPicture.current == .available {
+                Button {
+                    onChoosePicture(.playground)
+                } label: {
+                    Label(AppLocalization.string("Image Playground"), systemImage: "apple.image.playground")
                 }
             }
             if appState.hasCustomGroupRoomPicture(roomID: roomID) {
@@ -566,7 +730,7 @@ struct GroupApprovalCard: View {
                     Text(memberName)
                         .scaledFont(.subheadline.weight(.semibold))
                     if !approval.description.isEmpty {
-                        Text(verbatim: ApprovalDisplayText.revealingHidden(approval.description))
+                        Text(verbatim: ApprovalDisplayText.revealingHidden(HermesApprovalText.description(approval.description)))
                             .scaledFont(.subheadline)
                             .textSelection(.enabled)
                     }
@@ -584,7 +748,7 @@ struct GroupApprovalCard: View {
                     maxHeight: ApprovalCommandBox<EmptyView>.maxLines
                         * UIFont.preferredFont(forTextStyle: .caption1, in: sizeCategory, from: columnText).lineHeight
                 ) {
-                    Text(verbatim: ApprovalDisplayText.revealingHidden(approval.command))
+                    Text(verbatim: ApprovalDisplayText.revealingHidden(HermesApprovalText.command(approval.command)))
                         .scaledFont(.caption.monospaced())
                         .textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -642,54 +806,155 @@ struct GroupApprovalCard: View {
 /// every other (or unknown future) kind is a compact system caption — a room
 /// this client predates still renders, never crashes.
 struct GroupEventRow: View {
+    @Environment(\.groupRoomLooks) private var looks
     let event: GroupEvent
     let members: [GroupMember]
     /// The previous row is the same speaker's: no picture or name again.
     var continuesRun = false
+    /// In a room someone else hosts, who posts its people's messages: they
+    /// aren't yours, unless the copy says one was posted for you.
+    var host: String? = nil
+    /// Whose the people's posted messages are (RoomPosts.swift).
+    var attribution = RoomPostAttribution.none
+    /// The boards the agent showed for this message (RoomBoards).
+    var boards: [RichBoard] = []
+    /// Reads a member's `MEDIA:` files (its own profile's).
+    var mediaResolver: GatewayMediaDataURLResolver? = nil
 
     var body: some View {
-        if event.isUserMessage {
-            GroupUserBubble(text: event.messageText ?? "", members: members, timestamp: event.createdAt, eventID: event.id) {
+        if event.isScheduledPost {
+            // A job's post: on the members' side under its job's name, never
+            // as the user's own bubble. A bot's work update shows its lines.
+            GroupMemberBubble(
+                member: nil,
+                name: scheduledName,
+                text: event.workUpdateText ?? event.messageText ?? "",
+                members: members,
+                timestamp: event.createdAt,
+                roomEventID: event.id,
+                roomThreadID: event.threadID
+            )
+        } else if let name = personName {
+            GroupMemberBubble(
+                member: nil,
+                name: name,
+                text: attribution.text(of: event),
+                members: members,
+                timestamp: event.createdAt,
+                continuesRun: continuesRun,
+                roomEventID: event.id,
+                roomThreadID: event.threadID,
+                files: event.attachments.map { $0.attachment(roomID: event.roomID) },
+                personLook: looks.person(named: name)
+            )
+        } else if event.isUserMessage, attribution.poster(of: event) == nil, let host {
+            GroupMemberBubble(
+                member: nil,
+                name: host,
+                text: event.messageText ?? "",
+                members: members,
+                timestamp: event.createdAt,
+                continuesRun: continuesRun,
+                roomEventID: event.id,
+                roomThreadID: event.threadID,
+                files: event.attachments.map { $0.attachment(roomID: event.roomID) },
+                personLook: looks.home
+            )
+        } else if event.isUserMessage {
+            GroupUserBubble(
+                text: attribution.text(of: event), members: members, timestamp: event.createdAt, eventID: event.id,
+                files: event.attachments.map { $0.attachment(roomID: event.roomID) }
+            ) {
                 EmptyView()
             }
         } else if event.isMemberMessage {
             GroupMemberBubble(
-                member: GroupRoomTurns.member(for: event, members: members),
+                member: GroupRoomTurns.speaker(of: event, members: members),
                 name: speakerLabel,
                 text: event.messageText ?? "",
                 members: members,
                 timestamp: event.createdAt,
                 continuesRun: continuesRun,
-                roomEventID: event.id
+                roomEventID: event.id,
+                roomThreadID: event.threadID,
+                boards: boards,
+                mediaResolver: mediaResolver
             )
         } else {
             GroupSystemEventCaption(event: event, members: members)
         }
     }
 
+    /// The person a room's home posted this message for, when it isn't you.
+    private var personName: String? {
+        if case .person(let name) = attribution.poster(of: event) { return name }
+        return nil
+    }
+
+    private var scheduledName: String {
+        let name = (event.actor.displayName ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        if !name.isEmpty { return name }
+        // Unnamed jobs stay told apart by their job id (the actor after "cron:").
+        let job = event.actor.id.split(separator: ":", maxSplits: 1).last.map(String.init) ?? ""
+        let label = AppLocalization.string("Scheduled job")
+        // Its end, where jobs that share a prefix differ.
+        let shown: String = job.count > 12 ? "…" + String(job.suffix(12)) : job
+        return job.isEmpty ? label : "\(label) · \(shown)"
+    }
+
+    /// The member's name; another person's agent shows its owner in a
+    /// chip beside it (GroupMemberOwnerChip).
     private var speakerLabel: String {
         let label = event.actor.displayLabel(members: members)
         return label.isEmpty ? AppLocalization.string("Member") : label
     }
 
-    /// Two rows in a row from one member (or both from the user).
-    nonisolated static func sameSpeaker(_ previous: GroupEvent, _ next: GroupEvent) -> Bool {
-        if previous.isUserMessage && next.isUserMessage { return true }
+    /// Two rows in a row from one member (or both from the user, or both
+    /// from one of the room's people, or one scheduled job's).
+    nonisolated static func sameSpeaker(
+        _ previous: GroupEvent, _ next: GroupEvent, attribution: RoomPostAttribution = .none
+    ) -> Bool {
+        if previous.isScheduledPost || next.isScheduledPost {
+            return previous.isScheduledPost && next.isScheduledPost && previous.actor.id == next.actor.id
+        }
+        if previous.isUserMessage && next.isUserMessage {
+            return attribution.poster(of: previous) == attribution.poster(of: next)
+        }
         guard previous.isMemberMessage, next.isMemberMessage else { return false }
         let key = previous.actor.id.trimmingCharacters(in: .whitespacesAndNewlines)
         return !key.isEmpty && key == next.actor.id.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
 
-/// The pictures in a room's messages, in order. Rooms draw web pictures
-/// only: their Markdown has no gateway resolver.
+/// The pictures in a room's messages, in order: pictures sent into the
+/// room where `files` reads them, web pictures, and a member's `MEDIA:`
+/// pictures where `resolver` gives its message one. The user's own messages
+/// draw their `MEDIA:` lines as text, as in a chat.
 enum GroupRoomImageGallery {
     @MainActor
-    static func items(in events: [GroupEvent]) -> [ImageGalleryItem] {
+    static func items(
+        in events: [GroupEvent],
+        files: GatewayMediaDataURLResolver? = nil,
+        resolver: (GroupEvent) -> GatewayMediaDataURLResolver? = { _ in nil }
+    ) -> [ImageGalleryItem] {
         let items = events.filter(\.isChatMessage).flatMap { event -> [ImageGalleryItem] in
-            let text = GroupMessageParts(event.messageText ?? "").text
-            let shown = event.isUserMessage ? (GroupRoomReplyQuote.parse(text)?.message ?? text) : text
-            return ChatImageGallery.markdownItems(shown, resolver: nil, recognizesGatewayMedia: false)
+            let parts = GroupMessageParts(event.messageText ?? "")
+            // A scheduled post's pictures are the ones its bubble shows.
+            let shownParts = event.isScheduledPost
+                ? GroupMessageParts(event.workUpdateText ?? event.messageText ?? "") : parts
+            let shown = event.isScheduledPost
+                ? shownParts.text
+                : event.isUserMessage ? (GroupRoomReplyQuote.parse(parts.text)?.message ?? parts.text) : parts.text
+            // Its files come first, as its bubble draws them.
+            let sent = files.map { files in
+                // A scheduled post's bubble draws no Hermes attachments.
+                ((event.isScheduledPost ? [] : event.attachments.map { $0.attachment(roomID: event.roomID) })
+                    + shownParts.files)
+                    .filter { $0.kind == .image && files.roomFileReads.reads($0) }
+                    .compactMap { ImageGalleryItem.attachment($0, resolver: files) }
+            } ?? []
+            let media = event.isMemberMessage ? resolver(event) : nil
+            return sent + ChatImageGallery.markdownItems(shown, resolver: media, recognizesGatewayMedia: media != nil)
         }
         return ImageGallery.deduplicated(items)
     }
@@ -708,28 +973,51 @@ struct GroupMessageParts {
     }
 }
 
+/// A message's files: its pictures as pictures where the room's files can
+/// be read (one whole, more as tiles, as in a chat), and its other files as
+/// a chat's chips that open and play, else by name.
 private struct GroupMessageFiles: View {
     let files: [Attachment]
     var onAccent = false
+    @Environment(\.roomFilePictures) private var pictureFiles
+    @Environment(\.roomFileReads) private var readFiles
 
     var body: some View {
-        ForEach(files) { file in
-            HStack(spacing: 8) {
-                Image(systemName: AttachmentTypePolicy.symbolName(for: file))
-                    .scaledFont(.callout)
-                    .frame(width: 30, height: 30)
-                    .background(
-                        (onAccent ? Color.white.opacity(0.18) : Color.primary.opacity(0.07)),
-                        in: RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    )
-                Text(AttachmentTypePolicy.displayName(for: file))
-                    .scaledFont(.caption.weight(.medium))
-                    .lineLimit(1)
-                    .truncationMode(.middle)
+        // Only what the room can read: a file on an older plugin stays a name.
+        let pictures = pictureFiles.map { resolver in files.filter { $0.kind == .image && resolver.roomFileReads.reads($0) } } ?? []
+        if pictures.count > 1 {
+            let shown = PictureGrid.shownCount(pictures.count)
+            let more = PictureGrid.moreCount(total: pictures.count)
+            PictureGridLayout {
+                ForEach(Array(pictures.prefix(shown).enumerated()), id: \.element.id) { index, picture in
+                    UserImageAttachmentPreview(attachment: picture, gatewayResolver: pictureFiles, isTile: true, onAccent: onAccent)
+                        .modifier(PictureGridMoreBadge(more: index == shown - 1 ? more : nil))
+                }
             }
-            .foregroundStyle(onAccent ? Color.white : Color.primary)
-            .accessibilityElement(children: .combine)
-            .accessibilityLabel(Text(AppLocalization.string("Attached: \(AttachmentTypePolicy.displayName(for: file))")))
+        } else if let picture = pictures.first {
+            UserImageAttachmentPreview(attachment: picture, gatewayResolver: pictureFiles, onAccent: onAccent, namesUnavailable: true)
+        }
+        ForEach(pictures.isEmpty ? files : files.filter { file in !pictures.contains { $0.id == file.id } }) { file in
+            if let readFiles, readFiles.roomFileReads.reads(file) {
+                UserDocumentAttachmentChip(attachment: file, gatewayResolver: readFiles, onAccent: onAccent)
+            } else {
+                HStack(spacing: 8) {
+                    Image(systemName: AttachmentTypePolicy.symbolName(for: file))
+                        .scaledFont(.callout)
+                        .frame(width: 30, height: 30)
+                        .background(
+                            (onAccent ? Color.white.opacity(0.18) : Color.primary.opacity(0.07)),
+                            in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        )
+                    Text(AttachmentTypePolicy.displayName(for: file))
+                        .scaledFont(.caption.weight(.medium))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                .foregroundStyle(onAccent ? Color.white : Color.primary)
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel(Text(AppLocalization.string("Attached: \(AttachmentTypePolicy.displayName(for: file))")))
+            }
         }
     }
 }
@@ -743,6 +1031,8 @@ struct GroupUserBubble<Footer: View>: View {
     /// The room event it is: its "Replying to" card scrolls to the message
     /// it quoted; a send not in the log yet looks through all of it.
     var eventID: String? = nil
+    /// The files Hermes keeps as the message's own attachments.
+    var files: [Attachment] = []
     @ViewBuilder let footer: Footer
 
     var body: some View {
@@ -755,7 +1045,7 @@ struct GroupUserBubble<Footer: View>: View {
             Spacer(minLength: 48)
             VStack(alignment: .trailing, spacing: 2) {
                 VStack(alignment: .leading, spacing: 8) {
-                    GroupMessageFiles(files: parts.files, onAccent: true)
+                    GroupMessageFiles(files: files + parts.files, onAccent: true)
                     if let reply {
                         ReplyReferenceQuoteCard(quote: reply.quote, authorName: reply.author, quotedIn: eventID)
                     }
@@ -802,8 +1092,8 @@ struct GroupUserBubble<Footer: View>: View {
     }
 }
 
-/// A member's message: its picture beside a soft bubble, its name and time
-/// above (once per run), and the Copy button under it.
+/// A member's message: its picture, name and time (once per run) over a
+/// soft bubble, and the Copy button under it.
 struct GroupMemberBubble: View {
     let member: GroupMember?
     let name: String
@@ -814,11 +1104,38 @@ struct GroupMemberBubble: View {
     /// A hosted room's event id: its messages can be quoted and read
     /// aloud. A Desktop group, read-only here, passes none.
     var roomEventID: String? = nil
+    /// The thread it was said in: a reply to it goes there (as Desktop's do).
+    var roomThreadID: String? = nil
+    /// The boards the agent showed with this message, under its bubble.
+    var boards: [RichBoard] = []
+    /// A person's message's Hermes attachments (a room over Links shows
+    /// people's messages on this side), above its `@file:` files.
+    var files: [Attachment] = []
+    /// Reads the files its `MEDIA:` tags attach, from its own profile on
+    /// the connected Hermes, as a Bot Chat's reply does. Nil (a Desktop
+    /// group, another gateway's bot) leaves the tags as text.
+    var mediaResolver: GatewayMediaDataURLResolver? = nil
+    /// A person's look (RoomLooks), for one of the room's people: their
+    /// picture and color, as their own Conduit gave them.
+    var personLook: RoomLook? = nil
+    @Environment(\.groupRoomLooks) private var looks
     @Environment(\.groupMemberTints) private var tints
+    /// The room's resolver, which a Desktop card in a message without one
+    /// of its own still reads (#1522).
+    @Environment(\.gatewayMediaFiles) private var roomFiles
 
-    static let avatarSize: CGFloat = 30
+    /// The picture beside the name, above the bubble.
+    static let avatarSize: CGFloat = 24
+    /// The room left past a bot's bubble. A bot's reply is long, like a
+    /// chat's, so the bubble runs nearly to the edge; the picture and the
+    /// tinted bubble already say who is talking.
+    static let trailingRoom: CGFloat = 8
 
-    private var tint: CustomAccentColor? { member.flatMap { tints[$0.identityKey] } }
+    private var tint: CustomAccentColor? { member.flatMap { tints[$0.identityKey] } ?? personLook?.tint }
+
+    /// Whose agent it is, when it's another person's: their name, beside
+    /// the agent's (Eric, 2026-11-07: "Bot · Owner's" read oddly).
+    private var owner: String? { GroupRoomTurns.shownOwner(of: member) }
 
     /// The member's tag, when the room can be addressed to it.
     private var handle: String? {
@@ -830,27 +1147,22 @@ struct GroupMemberBubble: View {
 
     var body: some View {
         let parts = GroupMessageParts(text)
-        HStack(alignment: .top, spacing: 9) {
-            Group {
-                if continuesRun {
-                    Color.clear
-                } else if let handle {
-                    // Tapping a bot's picture picks it in the "To" row.
-                    GroupMemberMentionButton(handle: handle, name: name) {
-                        GroupMemberAvatar(member: member, name: name, size: Self.avatarSize)
-                    }
-                } else {
-                    GroupMemberAvatar(member: member, name: name, size: Self.avatarSize)
-                }
-            }
-            .frame(width: Self.avatarSize, height: Self.avatarSize)
-            VStack(alignment: .leading, spacing: 3) {
+        // The picture sits by the name, not in a column of its own, so the
+        // bubble starts at the column's edge and runs nearly the chat's
+        // width (Eric, 2026-11-06).
+        HStack(spacing: 0) {
+            VStack(alignment: .leading, spacing: 4) {
                 if !continuesRun {
-                    HStack(spacing: 6) {
+                    HStack(spacing: 7) {
+                        avatar
                         Text(name)
                             .scaledFont(.caption.weight(.semibold))
                             .foregroundStyle(tint.map { Color(uiColor: $0.readableColor) } ?? .secondary)
                             .lineLimit(1)
+                            .layoutPriority(1)
+                        if let owner {
+                            GroupMemberOwnerChip(owner: owner, look: looks.person(named: owner))
+                        }
                         if let timestamp {
                             Text(GroupBubbleTime.text(timestamp))
                                 .scaledFont(.caption2)
@@ -859,30 +1171,205 @@ struct GroupMemberBubble: View {
                     }
                 }
                 VStack(alignment: .leading, spacing: 8) {
-                    GroupMessageFiles(files: parts.files)
+                    GroupMessageFiles(files: files + parts.files)
                     if !parts.text.isEmpty {
                         HugsIdealWidth {
-                            MarkdownText(source: GroupRoomMentions.linkingMarkdown(parts.text, members: members, tints: tints))
+                            MarkdownText(
+                                source: GroupRoomMentions.linkingMarkdown(parts.text, members: members, tints: tints),
+                                gatewayMediaDataURL: mediaResolver.map { resolver in
+                                    { path in await resolver.dataURL(for: path) }
+                                }
+                            )
+                            .environment(\.gatewayMediaFiles, mediaResolver ?? roomFiles)
                         }
                     }
                 }
                 .padding(.horizontal, 14)
                 .padding(.vertical, 10)
                 .groupMemberBubbleSurface(tint: tint)
+                if !boards.isEmpty {
+                    RoomBoardsView(boards: boards)
+                        .frame(maxWidth: 560, alignment: .leading)
+                        .padding(.top, 6)
+                }
                 if !parts.text.isEmpty {
                     HStack(spacing: 2) {
                         GroupMessageCopyButton(text: GroupRoomMentions.refanged(parts.text), label: .response)
                         if let roomEventID {
-                            GroupMessageQuoteButton(text: parts.text, authorName: name, authorHandle: handle)
+                            GroupMessageQuoteButton(
+                                text: parts.text, authorName: name, authorHandle: handle, threadID: roomThreadID
+                            )
                             GroupReadAloudButton(eventID: roomEventID, text: parts.text, memberProfile: member?.profile)
                         }
                     }
                     .padding(.leading, 4)
                 }
             }
-            Spacer(minLength: 32)
+            Spacer(minLength: GroupMemberBubble.trailingRoom)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var avatar: some View {
+        GroupMemberHeaderAvatar(member: member, name: name, handle: handle, look: personLook)
+    }
+}
+
+/// Whose another person's agent is, after its name: their picture and name
+/// in a small capsule, as their own Conduit gives the picture.
+struct GroupMemberOwnerChip: View {
+    let owner: String
+    let look: RoomLook?
+
+    var body: some View {
+        HStack(spacing: 4) {
+            BotAvatarView(name: owner, label: owner, colorString: look?.color, image: look?.image, size: 14)
+            Text(verbatim: owner)
+                .scaledFont(.caption2.weight(.medium))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+        }
+        .padding(.leading, 2)
+        .padding(.trailing, 7)
+        .padding(.vertical, 2)
+        .background(Color.primary.opacity(0.07), in: Capsule())
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(Text(AppLocalization.string("\(owner)'s agent")))
+    }
+}
+
+/// The room's members under its title, each a pill with its picture, its
+/// name in its bot's color and how its turn went ("passed", "replied",
+/// "responding…"), as Desktop's group header shows them. Tapping one picks
+/// the bot in the "To" row, as tapping its picture does.
+struct GroupRoomStatusStrip: View {
+    let members: [GroupMember]
+    let statuses: [String: GroupMemberStatus]
+    /// The room's lead, when its Who answers setting names one.
+    var leadKey: String? = nil
+    @Environment(\.groupMemberTints) private var tints
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        if !members.isEmpty {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 6) {
+                    ForEach(members, id: \.identityKey) { member in
+                        pill(member)
+                    }
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 2)
+            }
+            .scrollBounceBehavior(.basedOnSize, axes: .horizontal)
+            .animation(ConduitMotion.ease(reduceMotion: reduceMotion), value: statuses)
+            .accessibilityElement(children: .contain)
+            .accessibilityLabel(AppLocalization.string("Members"))
+        }
+    }
+
+    @ViewBuilder
+    private func pill(_ member: GroupMember) -> some View {
+        let name = GroupRoomTurns.displayName(of: member)
+        let handle = member.handle?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let status = statuses[member.identityKey]
+        let isLead = member.identityKey == leadKey
+        let label = GroupRoomStatusPill(
+            member: member, name: name, status: status, tint: tints[member.identityKey], isLead: isLead
+        )
+        if handle.isEmpty {
+            label
+        } else {
+            GroupMemberMentionButton(handle: handle, name: name) { label }
+                .accessibilityLabel(Text(GroupRoomStatusPill.spokenName(name, isLead: isLead)))
+                .accessibilityValue(Text(status?.spoken ?? ""))
+                .accessibilityHint(Text(AppLocalization.string("Picks this bot in the To row")))
+        }
+    }
+}
+
+/// One member's pill: picture, name, and the word for its status. The
+/// room's lead carries Group Settings' crown beside its name.
+struct GroupRoomStatusPill: View {
+    let member: GroupMember
+    let name: String
+    let status: GroupMemberStatus?
+    let tint: CustomAccentColor?
+    var isLead = false
+
+    static func spokenName(_ name: String, isLead: Bool) -> String {
+        isLead ? "\(name), \(AppLocalization.string("Lead"))" : name
+    }
+
+    var body: some View {
+        let color = tint.map { Color(uiColor: $0.readableColor) } ?? Color.primary
+        HStack(spacing: 5) {
+            GroupMemberAvatar(member: member, name: name, size: 20)
+            Text(name)
+                .scaledFont(.caption.weight(.semibold))
+                .foregroundStyle(color)
+                .lineLimit(1)
+            if isLead {
+                Image(systemName: "crown.fill")
+                    .scaledFont(.caption2)
+                    .foregroundStyle(.yellow)
+                    .accessibilityHidden(true)
+            }
+            if let status {
+                Text(verbatim: status.label)
+                    .scaledFont(.caption)
+                    .foregroundStyle(statusColor(status))
+                    .lineLimit(1)
+                    .contentTransition(.opacity)
+            }
+        }
+        .padding(.leading, 3)
+        .padding(.trailing, 10)
+        .padding(.vertical, 3)
+        .conduitGlassSurface(cornerRadius: 14, tint: .conduitAccent.opacity(0.06))
+        .frame(minHeight: 44)
+        .contentShape(Rectangle())
+        // The bar doesn't grow past the title's sizes.
+        .dynamicTypeSize(...DynamicTypeSize.xxLarge)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(Text(Self.spokenName(name, isLead: isLead)))
+        .accessibilityValue(Text(status?.spoken ?? ""))
+    }
+
+    private func statusColor(_ status: GroupMemberStatus) -> Color {
+        switch status {
+        case .failed, .unavailable: return .red
+        case .needsApproval: return .orange
+        case .responding: return tint.map { Color(uiColor: $0.readableColor) } ?? .conduitAccent
+        default: return .secondary
+        }
+    }
+}
+
+/// A member's picture beside its name. Where the room can be addressed to
+/// it, tapping it picks the bot in the "To" row, through a 44 pt target
+/// around the drawn 24 pt picture.
+struct GroupMemberHeaderAvatar: View {
+    let member: GroupMember?
+    let name: String
+    let handle: String?
+    var look: RoomLook? = nil
+
+    var body: some View {
+        let size = GroupMemberBubble.avatarSize
+        Group {
+            if let handle {
+                GroupMemberMentionButton(handle: handle, name: name) {
+                    GroupMemberAvatar(member: member, name: name, size: size, look: look)
+                        .frame(width: 44, height: 44)
+                        .contentShape(Rectangle())
+                }
+                .padding(-(44 - size) / 2)
+            } else {
+                GroupMemberAvatar(member: member, name: name, size: size, look: look)
+            }
+        }
+        .frame(width: size, height: size)
     }
 }
 
@@ -892,11 +1379,32 @@ struct GroupSystemEventCaption: View {
     let members: [GroupMember]
 
     var body: some View {
-        Text(caption)
+        VStack(spacing: 4) {
+            VStack(spacing: 1) {
+                Text(caption)
+                // A linked member's failure says why, as its Hermes wrote it.
+                if let detail = GroupRoomTurns.failureDetail(event, members: members) {
+                    Text(verbatim: detail)
+                        .multilineTextAlignment(.center)
+                }
+            }
             .scaledFont(.caption2)
             .foregroundStyle(.conduitTertiary)
-            .frame(maxWidth: .infinity, alignment: .center)
-            .padding(.vertical, 2)
+            .accessibilityElement(children: .combine)
+            if event.kind == "room.activity", GroupRoomTurns.roomActivityOutcome(event) == .bounded {
+                GroupRoomContinueButton(eventID: event.id)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .center)
+        .padding(.vertical, 2)
+    }
+
+    /// "Ada and Linus", in the App Language like the rest of the app.
+    private func names(_ members: [GroupMember]) -> String {
+        let names = members.map(GroupRoomTurns.displayName(of:))
+        let formatter = ListFormatter()
+        formatter.locale = AppLocalization.formattingLocale
+        return formatter.string(from: names) ?? names.joined(separator: ", ")
     }
 
     /// `turn.*` events are one member's turn, never the whole room: they
@@ -908,16 +1416,36 @@ struct GroupSystemEventCaption: View {
         case "room.members_changed": return AppLocalization.string("The room's members changed.")
         case "room.disbanded": return AppLocalization.string("This room was disbanded.")
         case "room.stop_requested": return AppLocalization.string("Stop requested.")
+        case "room.context_set": return AppLocalization.string("The room's settings changed.")
+        case "room.continued": return AppLocalization.string("The conversation continued.")
+        case "room.assignment":
+            // The lead's pick for a message that named nobody.
+            let lead = event.payload["lead_member_id"]?.stringValue
+                .flatMap { GroupRoomTurns.member(withID: $0, in: members) }
+                .map(GroupRoomTurns.displayName(of:)) ?? AppLocalization.string("The lead")
+            let picked = GroupRoomTurns.memberIDs(event.payload["member_ids"], in: members)
+            let leadID = event.payload["lead_member_id"]?.stringValue?.lowercased()
+            let keptIt = picked.count == 1 && (picked[0].memberID?.lowercased() ?? picked[0].identityKey.lowercased()) == leadID
+            if event.payload["fallback"]?.boolValue == true || picked.isEmpty || keptIt {
+                return AppLocalization.string("\(lead) is taking this.")
+            }
+            return AppLocalization.string("\(lead) gave this to \(names(picked)).")
+        case "room.routed":
+            // The router's pick for a message that named nobody.
+            if event.payload["fallback"]?.boolValue == true {
+                return AppLocalization.string("Couldn't choose who answers, so everyone will.")
+            }
+            let picked = GroupRoomTurns.memberIDs(event.payload["member_ids"], in: members)
+            if event.payload["everyone"]?.boolValue == true || picked.isEmpty {
+                return AppLocalization.string("Assigned to everyone.")
+            }
+            return AppLocalization.string("Assigned to \(names(picked)).")
         case "room.activity":
             switch GroupRoomTurns.roomActivityOutcome(event) {
-            case .settled: return AppLocalization.string("The room settled.")
+            // Settled is the title's ("Settled, nobody had more to say").
+            case .settled, .other: return AppLocalization.string("Room updated.")
             case .bounded: return AppLocalization.string("The conversation reached its turn limit.")
-            case .other: return AppLocalization.string("Room updated.")
             }
-        case "turn.settled":
-            return name.isEmpty
-                ? AppLocalization.string("A member passed.")
-                : AppLocalization.string("\(name) passed.")
         case "turn.failed":
             return name.isEmpty
                 ? AppLocalization.string("A member's turn failed.")
@@ -936,39 +1464,107 @@ struct GroupSystemEventCaption: View {
 }
 
 
+/// Continue under a discussion paused at its cap, while the host can still
+/// reopen it (`groups.continue`): another budget of rounds and messages.
+struct GroupRoomContinueButton: View {
+    @EnvironmentObject private var appState: AppState
+    let eventID: String
+
+    var body: some View {
+        if let pause = appState.activeRoomContinuablePauses[eventID] {
+            let continuing = appState.continuingRoomDiscussions.contains(pause.discussionEventID)
+            Button {
+                Haptics.light()
+                Task { await appState.continueActiveRoomDiscussion(pause.discussionEventID) }
+            } label: {
+                Label(AppLocalization.string("Continue"), systemImage: "arrow.forward.circle")
+                    .scaledFont(.caption.weight(.semibold))
+            }
+            .buttonStyle(.bordered)
+            .buttonBorderShape(.capsule)
+            .controlSize(.small)
+            .tint(.conduitAccent)
+            .disabled(continuing || !appState.isConnected)
+            .accessibilityHint(Text(AppLocalization.string("Lets the members keep talking about this message.")))
+        }
+    }
+}
+
 /// The member whose turn is running, as a placeholder bubble where their
 /// reply will land.
 struct GroupRespondingRow: View {
+    @EnvironmentObject private var appState: AppState
     let member: GroupMember
+    /// A member on another Hermes whose route is cut off or unreachable
+    /// says so where its reply would land.
+    var state: GroupResponderState = .responding
     @Environment(\.groupMemberTints) private var tints
 
     var body: some View {
         let name = GroupRoomTurns.displayName(of: member)
         let tint = tints[member.identityKey]
-        HStack(alignment: .top, spacing: 9) {
-            GroupMemberAvatar(member: member, name: name, size: GroupMemberBubble.avatarSize)
-            VStack(alignment: .leading, spacing: 3) {
-                Text(name)
-                    .scaledFont(.caption.weight(.semibold))
-                    .foregroundStyle(tint.map { Color(uiColor: $0.readableColor) } ?? .secondary)
-                    .lineLimit(1)
+        // As on its bubble, the picture picks the bot in the "To" row.
+        let trimmed = member.handle?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let handle: String? = trimmed.isEmpty ? nil : trimmed
+        HStack(spacing: 0) {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 7) {
+                    GroupMemberHeaderAvatar(member: member, name: name, handle: handle)
+                    Text(name)
+                        .scaledFont(.caption.weight(.semibold))
+                        .foregroundStyle(tint.map { Color(uiColor: $0.readableColor) } ?? .secondary)
+                        .lineLimit(1)
+                }
                 HStack(spacing: 6) {
-                    ProgressView()
-                        .controlSize(.mini)
-                    Text(AppLocalization.string("Responding…"))
-                        .scaledFont(.footnote)
-                        .foregroundStyle(.secondary)
+                    switch state {
+                    case .responding:
+                        ProgressView()
+                            .controlSize(.mini)
+                        Text(AppLocalization.string("Responding…"))
+                            .scaledFont(.footnote)
+                            .foregroundStyle(.secondary)
+                    case .cutOff:
+                        Image(systemName: "exclamationmark.triangle")
+                            .scaledFont(.footnote)
+                            .foregroundStyle(.orange)
+                        Text(AppLocalization.string("Cut off: its Hermes no longer accepts this room"))
+                            .scaledFont(.footnote)
+                            .foregroundStyle(.secondary)
+                    case .unreachable:
+                        Image(systemName: "wifi.exclamationmark")
+                            .scaledFont(.footnote)
+                            .foregroundStyle(.orange)
+                        Text(AppLocalization.string("Can't be reached. Hermes keeps trying."))
+                            .scaledFont(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
                 }
                 .padding(.horizontal, 14)
                 .padding(.vertical, 10)
                 .groupMemberBubbleSurface(tint: tint)
             }
-            Spacer(minLength: 32)
+            Spacer(minLength: GroupMemberBubble.trailingRoom)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel(Text(AppLocalization.string("\(name) is responding…")))
+        .accessibilityLabel(Text(spokenLabel(name)))
         .accessibilityAddTraits(.updatesFrequently)
+        // The row reads as one, so its picture's mention is an action.
+        .accessibilityActions {
+            if let handle, appState.canQuoteIntoRoom() {
+                Button(AppLocalization.string("Mention \(name)")) {
+                    appState.mentionInRoomComposer(handle: handle)
+                }
+            }
+        }
+    }
+
+    private func spokenLabel(_ name: String) -> String {
+        switch state {
+        case .responding: return AppLocalization.string("\(name) is responding…")
+        case .cutOff: return AppLocalization.string("\(name) is cut off")
+        case .unreachable: return AppLocalization.string("\(name) can't be reached")
+        }
     }
 }
 
@@ -979,9 +1575,16 @@ struct GroupMemberAvatar: View {
     let member: GroupMember?
     let name: String
     let size: CGFloat
+    /// A person's look, for a bubble that isn't a member's.
+    var look: RoomLook? = nil
+    @Environment(\.groupRoomLooks) private var roomLooks
 
-    /// The roster bot this member is.
-    private var bot: BotProfile? { appState.groupMemberBot(member, name: name) }
+    /// The roster bot this member is. A person's bubble, which comes with
+    /// their look, is never matched to one of your bots by name.
+    private var bot: BotProfile? {
+        if member == nil, look != nil { return nil }
+        return appState.groupMemberBot(member, name: name)
+    }
 
     var body: some View {
         if let bot {
@@ -992,12 +1595,15 @@ struct GroupMemberAvatar: View {
                 image: appState.botAvatarImage(for: bot),
                 size: size
             )
-            .task(id: "\(bot.name)|\(bot.hasAvatar)|\(appState.botAvatarGeneration)") {
+            // Connecting fetches again: a kept bot's fetch fails offline.
+            .task(id: "\(bot.name)|\(bot.hasAvatar)|\(appState.botAvatarGeneration)|\(appState.isConnected)") {
                 await appState.loadBotAvatarRetrying(bot)
             }
             .accessibilityHidden(true)
         } else {
-            BotAvatarView(name: name, label: name, colorString: nil, image: nil, size: size)
+            // Another person's agent, or a person: as their own Conduit draws them.
+            let look = self.look ?? roomLooks.member(member)
+            BotAvatarView(name: name, label: name, colorString: look?.color, image: look?.image, size: size)
                 .accessibilityHidden(true)
         }
     }
@@ -1007,17 +1613,24 @@ struct GroupMemberAvatar: View {
 /// generated by Hermes.
 enum GroupRoomPictureRequest: String, Identifiable {
     case choose, generate
+    /// Apple's Image Playground (ImagePlaygroundPicture).
+    case playground
     var id: String { rawValue }
 }
 
-/// Picks or generates a picture for the open room and saves it. On the
-/// screen, not in its menu: a sheet raised as a menu closes may never show.
+/// Picks or generates a picture for the open room and saves it, or for
+/// `target`, a room's tile on Bots Home. On the screen, not in its menu: a
+/// sheet raised as a menu closes may never show.
 struct GroupRoomPicturePicker: ViewModifier {
     @EnvironmentObject private var appState: AppState
     @Binding var request: GroupRoomPictureRequest?
     var isEnabled = true
+    /// The room the picture is for, when it isn't the open one.
+    var target: GroupRoom?
     @State private var picked: UIImage?
     @State private var room: GroupRoom?
+    /// Image Playground's own sheet, which `.sheet(item:)` can't hold.
+    @State private var showingPlayground = false
 
     @ViewBuilder
     func body(content: Content) -> some View {
@@ -1028,9 +1641,17 @@ struct GroupRoomPicturePicker: ViewModifier {
         }
     }
 
+    /// The requests shown in a sheet of ours; Image Playground has its own.
+    private var sheetRequest: Binding<GroupRoomPictureRequest?> {
+        Binding(
+            get: { request == .playground ? nil : request },
+            set: { request = $0 }
+        )
+    }
+
     private func picker(_ content: Content) -> some View {
         content
-            .sheet(item: $request) { request in
+            .sheet(item: sheetRequest) { request in
                 switch request {
                 case .choose:
                     ImagePicker(image: $picked)
@@ -1038,7 +1659,7 @@ struct GroupRoomPicturePicker: ViewModifier {
                     // One room for the prompt and the save: the open one
                     // (the capture below may still hold the last one while
                     // this sheet is first built).
-                    let target = appState.activeRoomSurface?.room ?? room
+                    let target = self.target ?? appState.activeRoomSurface?.room ?? room
                     GeneratePictureSheet(
                         defaultPrompt: PictureGeneration.groupPrompt(
                             name: target?.name ?? "",
@@ -1050,11 +1671,30 @@ struct GroupRoomPicturePicker: ViewModifier {
                         Task { await appState.setGroupRoomPicture(image, roomID: roomID) }
                     }
                     .environmentObject(appState)
+                case .playground:
+                    EmptyView()
                 }
+            }
+            .imagePlaygroundPicture(
+                isPresented: $showingPlayground,
+                prompt: ImagePlaygroundPicture.Prompt(
+                    name: room?.name ?? "",
+                    details: room?.members.map { GroupRoomTurns.displayName(of: $0) } ?? []
+                ),
+                source: room.flatMap { appState.groupRoomPicture(roomID: $0.roomID) },
+                onImage: { image in
+                    guard let roomID = room?.roomID else { return }
+                    Task { await appState.setGroupRoomPicture(image, roomID: roomID) }
+                },
+                onFailure: { appState.errorMessage = AppLocalization.string("That picture could not be used.") }
+            )
+            .onChange(of: showingPlayground) { _, showing in
+                if !showing, request == .playground { request = nil }
             }
             .onChange(of: request) { _, request in
                 // The room the menu was for, even if another opens meanwhile.
-                if request != nil { room = appState.activeRoomSurface?.room }
+                if request != nil { room = target ?? appState.activeRoomSurface?.room }
+                if request == .playground { showingPlayground = true }
             }
             .onChange(of: picked) { _, image in
                 guard let image else { return }
@@ -1205,10 +1845,22 @@ struct GroupMessageQuoteButton: View {
     let authorName: String
     /// The author's tag: replying also addresses the next message to it.
     var authorHandle: String? = nil
+    /// The message's thread: the reply is sent in it.
+    var threadID: String? = nil
 
     var body: some View {
+        // A room someone else hosts has a composer only while it takes
+        // your posts.
+        if appState.activeRoomSurface?.copy == nil || appState.activeRoomCopyTakesPosts {
+            button
+        }
+    }
+
+    private var button: some View {
         Button {
-            appState.replyInRoomComposer(text: text, authorName: authorName, authorHandle: authorHandle)
+            appState.replyInRoomComposer(
+                text: text, authorName: authorName, authorHandle: authorHandle, threadID: threadID
+            )
         } label: {
             Image(systemName: "quote.bubble")
                 .scaledFont(.footnote.weight(.semibold))
@@ -1236,6 +1888,15 @@ struct GroupMemberMentionButton<Label: View>: View {
     @ViewBuilder let label: Label
 
     var body: some View {
+        if appState.activeRoomSurface?.copy != nil, !appState.activeRoomCopyTakesPosts {
+            // No "To" row in a room someone else hosts that you can't post in.
+            label
+        } else {
+            button
+        }
+    }
+
+    private var button: some View {
         Button {
             Haptics.selection()
             appState.mentionInRoomComposer(handle: handle)
@@ -1342,6 +2003,8 @@ private struct GroupReadAloudControl: View {
 /// is being typed. Tapping a row completes the tag.
 struct MentionSuggestionList: View {
     let candidates: [MentionAutocomplete.Candidate]
+    /// The row a hardware keyboard's arrows highlighted.
+    var highlighted: Int? = nil
     let onSelected: (MentionAutocomplete.Candidate) -> Void
     @ScaledMetric(relativeTo: .subheadline) private var rowHeight: CGFloat = 44
 
@@ -1349,6 +2012,7 @@ struct MentionSuggestionList: View {
     private var dividerAllowance: CGFloat { CGFloat(max(0, min(candidates.count, 5) - 1)) }
 
     var body: some View {
+        ScrollViewReader { reader in
         ScrollView {
             VStack(spacing: 0) {
                 ForEach(Array(candidates.enumerated()), id: \.element.id) { index, candidate in
@@ -1373,12 +2037,19 @@ struct MentionSuggestionList: View {
                         .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
+                    .background(index == highlighted ? Color.conduitAccent.opacity(0.14) : Color.clear)
+                    .accessibilityAddTraits(index == highlighted ? .isSelected : [])
                     .accessibilityHint(Text(AppLocalization.string("Inserts this mention.")))
                     if index < candidates.count - 1 {
                         Divider().opacity(0.3)
                     }
                 }
             }
+        }
+        .onChange(of: highlighted) { _, index in
+            guard let index, candidates.indices.contains(index) else { return }
+            reader.scrollTo(candidates[index].id)
+        }
         }
         // Sized to its rows (a bare max height would stretch two rows to
         // the cap), scrolling past five; the row height follows Dynamic Type.
@@ -1397,12 +2068,17 @@ struct MentionSuggestionList: View {
 
 /// New Group Chat: one name field plus a 2–6 bot picker restricted to the
 /// current gateway's roster (cross-gateway rooms are a later parity slice).
+/// When the host's plugin makes rooms with people you've linked, they can
+/// be picked too: the room then waits for their answers as a draft
+/// (RoomDrafts.swift), and one bot of yours is enough.
 struct GroupCreateSheet: View {
     @EnvironmentObject private var appState: AppState
     @Environment(\.dismiss) private var dismiss
     @ObservedObject private var appLanguage = AppLanguageStore.shared
     @State private var name = ""
     @State private var selected = Set<String>()
+    /// The Links of the people picked.
+    @State private var selectedPeople = Set<String>()
     /// The room id is minted ONCE per logical room (per sheet): a retry of
     /// an ambiguous create reuses the SAME id, so the gateway's create
     /// idempotency deduplicates instead of forking a twin room.
@@ -1412,26 +2088,77 @@ struct GroupCreateSheet: View {
     /// name or roster is a different room, so it gets a fresh id instead of
     /// recovering (or being refused as) the first attempt.
     @State private var attemptedInputs: GroupCreateAttempt.Inputs?
+    /// The picks of a draft that was made while its invites were still
+    /// going out: Create again would invite everyone twice.
+    @State private var sendingDraft: DraftPicks?
     @State private var isCreating = false
 
     /// `preselected`: bots already picked, as from a bot's Groups menu.
+    /// (A room started on Bots Home is named and made from its bar.)
     init(preselected: Set<String> = []) {
         _selected = State(initialValue: preselected)
     }
 
     private var visibleBots: [BotProfile] {
-        appState.botRoster.filter { !$0.isHiddenByMeta }
+        appState.orderedBots(appState.botRoster).filter { !$0.isHiddenByMeta }
+    }
+
+    /// The picked bots still listed: one hidden or deleted while the sheet
+    /// is open can't be unticked, so it never counts.
+    private var pickedNames: Set<String> {
+        selected.intersection(visibleBots.map(\.name))
+    }
+
+    private var pickedBots: [BotProfile] {
+        visibleBots.filter { selected.contains($0.name) }
+    }
+
+    private var people: [RoomLink] {
+        appState.invitableLinkedPeople
+    }
+
+    /// Who's picked of the people still linked.
+    private var pickedPeople: [RoomLink] {
+        people.filter { selectedPeople.contains($0.id) }
+    }
+
+    private struct DraftPicks: Equatable {
+        let name: String
+        let bots: [String]
+        let links: [String]
+    }
+
+    private var draftPicks: DraftPicks {
+        DraftPicks(
+            name: name.trimmingCharacters(in: .whitespacesAndNewlines),
+            bots: pickedBots.map(\.name).sorted(),
+            links: pickedPeople.map(\.id).sorted()
+        )
     }
 
     private var canCreate: Bool {
         !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            && selected.count >= 2 && selected.count <= 6
+            && GroupCreateLimits.canCreate(bots: pickedBots.count, people: pickedPeople.count)
             && !isCreating
+            && (pickedPeople.isEmpty || draftPicks != sendingDraft)
+    }
+
+    /// Settings > Multiplayer, pushed in the sheet: Link with someone, room
+    /// setup and your picture. Back returns here, which reads the people
+    /// again.
+    private func linkSomeoneLink(_ title: String) -> some View {
+        NavigationLink {
+            PeopleSettingsPage()
+        } label: {
+            Label(title, systemImage: "link.badge.plus")
+        }
+        .buttonStyle(.settingsPrimary)
+        .accessibilityIdentifier("newGroup.linkSomeone")
     }
 
     var body: some View {
         NavigationStack {
-            List {
+            SettingsDetailContainer {
                 if let error = appState.errorMessage, !error.isEmpty {
                     // Create failures (handle collision, RPC refusal) must
                     // surface INSIDE the sheet — the room surface's notice
@@ -1439,26 +2166,68 @@ struct GroupCreateSheet: View {
                     Text(error)
                         .scaledFont(.footnote)
                         .foregroundStyle(.red)
-                        .listRowBackground(Color.clear)
                 }
-                Section(AppLocalization.string("Name")) {
+                ConduitSettingsSection(title: AppLocalization.string("Name"), symbol: "textformat", tint: .conduitAccent) {
                     TextField(AppLocalization.string("Group name"), text: $name)
+                        .textFieldStyle(.roundedBorder)
                         .submitLabel(.done)
                 }
-                Section {
+                ConduitSettingsSection(
+                    title: pickedPeople.isEmpty ? AppLocalization.string("Members (2–6)") : AppLocalization.string("Your bots"),
+                    symbol: "person.3", tint: .blue
+                ) {
                     ForEach(visibleBots) { bot in
                         memberToggleRow(bot)
                     }
-                } header: {
-                    Text(AppLocalization.string("Members (2–6)"))
-                } footer: {
                     Text(AppLocalization.string(
                         "Group chats run on this gateway. The gateway drives each member's turn — closing Conduit never stops a room."
                     ))
+                    .settingsCaption()
+                }
+                if !people.isEmpty {
+                    ConduitSettingsSection(title: AppLocalization.string("Multiplayer"), symbol: "person.2", tint: .green) {
+                        ForEach(people) { person in
+                            personToggleRow(person)
+                        }
+                        Text(AppLocalization.string(
+                            "Each person gets an invite on their Hermes. The room starts once they've all answered, or when you start it."
+                        ))
+                        .settingsCaption()
+                        Text(AppLocalization.string("A room holds up to 6 agents: your bots, and at least one for each person."))
+                            .settingsCaption()
+                        // Linking is set up here too, where rooms with people
+                        // are made (Eric, 2026-11-08), not only in Settings.
+                        linkSomeoneLink(AppLocalization.string("Link with someone else"))
+                    }
+                } else if appState.linkedRoomStartsUnavailable {
+                    ConduitSettingsSection(title: AppLocalization.string("Multiplayer"), symbol: "person.2", tint: .green) {
+                        Text(AppLocalization.string(
+                            "Your Hermes can't host rooms with people you've linked yet. Update Hermes to invite them."
+                        ))
+                        .settingsCaption()
+                    }
+                } else if appState.canLinkRooms, !appState.canInviteLinkedPeople {
+                    // Links, but a plugin too old to start rooms with them.
+                    ConduitSettingsSection(title: AppLocalization.string("Multiplayer"), symbol: "person.2", tint: .green) {
+                        Text(AppLocalization.string(
+                            "Your Hermes can't host rooms with people you've linked yet. Update Hermes to invite them."
+                        ))
+                        .settingsCaption()
+                    }
+                } else if appState.canLinkRooms, appState.linkedRoomDraftsRead {
+                    // Nobody linked yet: where to start, so rooms with other
+                    // people are found from here too. Not before the drafts
+                    // are read, which say whether rooms with people can start.
+                    ConduitSettingsSection(title: AppLocalization.string("Multiplayer"), symbol: "person.2", tint: .green) {
+                        linkSomeoneLink(AppLocalization.string("Link with someone"))
+                        Text(AppLocalization.string("Link with someone to make rooms with their agents."))
+                            .settingsCaption()
+                    }
                 }
             }
             .navigationTitle(AppLocalization.string("New Group Chat"))
             .navigationBarTitleDisplayMode(.inline)
+            .task { await appState.refreshLinkedRoomDrafts() }
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button(AppLocalization.string("Cancel")) { dismiss() }
@@ -1469,23 +2238,42 @@ struct GroupCreateSheet: View {
                         // the gateway would host two real rooms.
                         guard !isCreating else { return }
                         isCreating = true
-                        let bots = visibleBots.filter { selected.contains($0.name) }
+                        let bots = pickedBots
                         let roomName = name
+                        let links = pickedPeople.map(\.id)
+                        guard links.isEmpty else {
+                            let picks = draftPicks
+                            Task { @MainActor in
+                                let outcome = await appState.createLinkedRoomDraft(name: roomName, bots: bots, links: links)
+                                isCreating = false
+                                switch outcome {
+                                case .made:
+                                    dismiss()
+                                case .sending:
+                                    sendingDraft = picks
+                                case .refused:
+                                    break
+                                }
+                            }
+                            return
+                        }
                         let inputs = GroupCreateAttempt.Inputs(
                             name: roomName.trimmingCharacters(in: .whitespacesAndNewlines),
-                            members: selected
+                            members: pickedNames
                         )
                         roomID = GroupCreateAttempt.roomID(
                             for: inputs, current: roomID, attempted: attemptedInputs
                         )
                         attemptedInputs = inputs
                         let pendingRoomID = roomID
-                        Task {
+                        Task { @MainActor in
                             let created = await appState.createGroupRoom(
                                 name: roomName, bots: bots, roomID: pendingRoomID
                             )
                             isCreating = false
-                            if created { dismiss() }
+                            if created {
+                                dismiss()
+                            }
                         }
                     }
                     .disabled(!canCreate)
@@ -1496,6 +2284,7 @@ struct GroupCreateSheet: View {
 
     private func memberToggleRow(_ bot: BotProfile) -> some View {
         let isSelected = selected.contains(bot.name)
+        let canPick = isSelected || GroupCreateLimits.canPickBot(bots: pickedBots.count, people: pickedPeople.count)
         return Button {
             toggle(bot.name)
         } label: {
@@ -1512,8 +2301,38 @@ struct GroupCreateSheet: View {
                 Spacer(minLength: 0)
                 selectionGlyph(isSelected: isSelected)
             }
+            .opacity(canPick ? 1 : 0.45)
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .disabled(!canPick)
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
+    }
+
+    private func personToggleRow(_ person: RoomLink) -> some View {
+        let isSelected = selectedPeople.contains(person.id)
+        let canPick = isSelected || GroupCreateLimits.canPickPerson(bots: pickedBots.count, people: pickedPeople.count)
+        return Button {
+            Haptics.light()
+            if isSelected {
+                selectedPeople.remove(person.id)
+            } else {
+                selectedPeople.insert(person.id)
+            }
+        } label: {
+            HStack(spacing: 12) {
+                RoomPersonGlyph()
+                Text(person.name)
+                    .scaledFont(.body)
+                    .foregroundStyle(.primary)
+                Spacer(minLength: 0)
+                selectionGlyph(isSelected: isSelected)
+            }
+            .opacity(canPick ? 1 : 0.45)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(!canPick)
         .accessibilityAddTraits(isSelected ? .isSelected : [])
     }
 
@@ -1535,6 +2354,290 @@ struct GroupCreateSheet: View {
             selected.remove(botName)
         } else {
             selected.insert(botName)
+        }
+    }
+}
+
+// MARK: - Room settings
+
+/// The open room's settings (`groups.context`): its purpose and shared notes,
+/// which every member reads with each message, and who answers a message
+/// that names nobody, where the host routes (Hermes 0.23).
+struct GroupRoomSettingsSheet: View {
+    @EnvironmentObject private var appState: AppState
+    @Environment(\.dismiss) private var dismiss
+    @ObservedObject private var appLanguage = AppLanguageStore.shared
+    @State private var draft = GroupRoomContext()
+    /// The settings the draft was read from. Save compares against these,
+    /// so another client's change while the sheet is open enables nothing.
+    @State private var original = GroupRoomContext()
+    @State private var loaded = false
+    /// The save's retry key, kept while the settings sent with it are: a
+    /// retry after an unclear failure returns the first save, and edited
+    /// settings are another save with a key of their own.
+    @State private var attempt: (eventID: String, context: GroupRoomContext)?
+    @State private var isSaving = false
+    @State private var failure: String?
+    /// The room the draft was read from.
+    @State private var roomID: String?
+
+    private var members: [GroupMember] {
+        GroupRoomTurns.members(appState.activeRoomSurface?.room.members ?? [], namedBy: appState.shownBotRoster)
+    }
+
+    /// The modes to offer: the host's known ones, or just Everyone when the
+    /// room runs on a mode newer than this app and the host lists no other,
+    /// so that mode can still be replaced.
+    private var modes: [GroupRouting] {
+        let known = appState.activeRoomRoutingModes
+        return known.isEmpty && !original.newerRouting.isEmpty ? [.everyone] : known
+    }
+
+    private var purposeTooLong: Bool { draft.purpose.count > GroupRoomContext.maxPurposeCharacters }
+    private var notesTooLong: Bool {
+        draft.notes.trimmingCharacters(in: .whitespacesAndNewlines).utf8.count > GroupRoomContext.maxNotesBytes
+    }
+
+    private var canSave: Bool {
+        loaded && !isSaving && !purposeTooLong && !notesTooLong
+            && (draft.routing != .lead || GroupRoomTurns.member(withID: draft.leadMemberID, in: members) != nil)
+            && normalized(draft) != original
+    }
+
+    var body: some View {
+        NavigationStack {
+            SettingsDetailContainer {
+                if let failure {
+                    // Inside the sheet: the room's notice is behind it.
+                    Text(failure)
+                        .scaledFont(.footnote)
+                        .foregroundStyle(.red)
+                }
+                ConduitSettingsSection(title: AppLocalization.string("Purpose"), symbol: "scope", tint: .conduitAccent) {
+                    TextField(AppLocalization.string("What this room is for, in one line"), text: $draft.purpose)
+                        .textFieldStyle(.roundedBorder)
+                        .submitLabel(.done)
+                    if purposeTooLong {
+                        Text(AppLocalization.string("Keep the purpose under 500 characters."))
+                            .scaledFont(.caption)
+                            .foregroundStyle(.red)
+                    }
+                }
+                ConduitSettingsSection(title: AppLocalization.string("Shared notes"), symbol: "note.text", tint: .orange) {
+                    TextField(
+                        AppLocalization.string("Facts every member should keep in mind"),
+                        text: $draft.notes,
+                        axis: .vertical
+                    )
+                    .lineLimit(3...10)
+                    .textFieldStyle(.roundedBorder)
+                    if notesTooLong {
+                        Text(AppLocalization.string("Shared notes are too long. Keep them under 4 KB."))
+                            .scaledFont(.caption)
+                            .foregroundStyle(.red)
+                    }
+                    Text(AppLocalization.string(
+                        "Every member reads the purpose and notes with each message. A change applies from the next message."
+                    ))
+                    .settingsCaption()
+                }
+                if !modes.isEmpty {
+                    ConduitSettingsSection(
+                        title: AppLocalization.string("Who answers"),
+                        symbol: "arrow.triangle.branch",
+                        tint: .purple
+                    ) {
+                        if !original.newerRouting.isEmpty {
+                            newerModeRow
+                        }
+                        ForEach(modes, id: \.self) { mode in
+                            modeRow(mode)
+                        }
+                        Text(modeCaption)
+                            .settingsCaption()
+                    }
+                    if draft.routing == .lead {
+                        ConduitSettingsSection(title: AppLocalization.string("Lead"), symbol: "crown", tint: .yellow) {
+                            ForEach(members, id: \.identityKey) { member in
+                                leadRow(member)
+                            }
+                        }
+                    }
+                }
+            }
+            .navigationTitle(AppLocalization.string("Group Settings"))
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button(AppLocalization.string("Cancel")) { dismiss() }
+                        .disabled(isSaving)
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    if isSaving {
+                        ProgressView()
+                    } else {
+                        Button(AppLocalization.string("Save")) { save() }
+                            .disabled(!canSave)
+                    }
+                }
+            }
+        }
+        // A save in flight finishes in the sheet, so its failure is seen
+        // and a retry keeps its event id.
+        .interactiveDismissDisabled(isSaving)
+        .onAppear {
+            guard !loaded, let context = appState.activeRoomContext else { return }
+            draft = context
+            original = context
+            roomID = appState.activeRoomSurface?.room.roomID
+            loaded = true
+        }
+        // The room closed, or another opened, under the sheet.
+        .onChange(of: appState.activeRoomSurface?.room.roomID) { _, current in
+            if current != roomID { dismiss() }
+        }
+    }
+
+    private var modeCaption: String {
+        if !draft.newerRouting.isEmpty {
+            return AppLocalization.string(
+                "This room answers in a way set in a newer app. It stays that way unless you pick another."
+            )
+        }
+        switch draft.routing {
+        case .everyone:
+            return AppLocalization.string("Every member gets a turn on a message that names nobody.")
+        case .lead:
+            return AppLocalization.string(
+                "The lead picks who takes a message that names nobody. @mentions and @everyone still go straight to those members."
+            )
+        case .auto:
+            return AppLocalization.string(
+                "A quick model call picks who a message is for. @mentions still go straight to the members you name."
+            )
+        }
+    }
+
+    private func modeTitle(_ mode: GroupRouting) -> String {
+        switch mode {
+        case .everyone: return AppLocalization.string("Everyone answers")
+        case .lead: return AppLocalization.string("A lead picks who answers")
+        case .auto: return AppLocalization.string("Pick who answers automatically")
+        }
+    }
+
+    /// The room's own mode, where it is one this app predates: kept until
+    /// another is picked, and pickable again until the save.
+    private var newerModeRow: some View {
+        let isSelected = !draft.newerRouting.isEmpty
+        return Button {
+            Haptics.light()
+            draft.routing = .everyone
+            draft.leadMemberID = ""
+            draft.newerRouting = original.newerRouting
+        } label: {
+            HStack(spacing: 12) {
+                Text(AppLocalization.string("As set elsewhere (\(original.newerRouting))"))
+                    .scaledFont(.body)
+                    .foregroundStyle(.primary)
+                Spacer(minLength: 0)
+                selectionGlyph(isSelected)
+            }
+            .frame(minHeight: 44)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
+    }
+
+    private func modeRow(_ mode: GroupRouting) -> some View {
+        let isSelected = draft.newerRouting.isEmpty && draft.routing == mode
+        return Button {
+            Haptics.light()
+            draft.newerRouting = ""
+            draft.routing = mode
+            if mode == .lead, GroupRoomTurns.member(withID: draft.leadMemberID, in: members) == nil {
+                // The first member until one is picked, as Desktop starts it.
+                draft.leadMemberID = members.first?.memberID ?? ""
+            }
+        } label: {
+            HStack(spacing: 12) {
+                Text(modeTitle(mode))
+                    .scaledFont(.body)
+                    .foregroundStyle(.primary)
+                Spacer(minLength: 0)
+                selectionGlyph(isSelected)
+            }
+            .frame(minHeight: 44)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
+    }
+
+    private func leadRow(_ member: GroupMember) -> some View {
+        let name = GroupRoomTurns.displayName(of: member)
+        let isSelected = (member.memberID ?? "").caseInsensitiveCompare(draft.leadMemberID) == .orderedSame
+        return Button {
+            Haptics.light()
+            draft.leadMemberID = member.memberID ?? ""
+        } label: {
+            HStack(spacing: 12) {
+                GroupMemberAvatar(member: member, name: name, size: 32)
+                Text(name)
+                    .scaledFont(.body)
+                    .foregroundStyle(.primary)
+                Spacer(minLength: 0)
+                selectionGlyph(isSelected)
+            }
+            .frame(minHeight: 44)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
+    }
+
+    private func selectionGlyph(_ isSelected: Bool) -> some View {
+        Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+            .foregroundStyle(isSelected ? Color.conduitAccent : Color.secondary)
+            .accessibilityHidden(true)
+    }
+
+    /// The settings as the host keeps them: the purpose on one line, the
+    /// notes trimmed, no lead unless the room has one.
+    private func normalized(_ context: GroupRoomContext) -> GroupRoomContext {
+        var normalized = GroupRoomContext(
+            purpose: context.purpose.split(whereSeparator: \.isWhitespace).joined(separator: " "),
+            notes: context.notes.trimmingCharacters(in: .whitespacesAndNewlines),
+            routing: context.routing,
+            leadMemberID: context.leadMemberID
+        )
+        normalized.newerRouting = context.newerRouting
+        return normalized
+    }
+
+    private func save() {
+        guard canSave, let roomID else { return }
+        let context = normalized(draft)
+        let eventID: String
+        if let attempt, attempt.context == context {
+            eventID = attempt.eventID
+        } else {
+            eventID = "context-\(UUID().uuidString.lowercased())"
+        }
+        attempt = (eventID, context)
+        isSaving = true
+        failure = nil
+        Task {
+            let error = await appState.saveActiveRoomSettings(
+                context, eventID: eventID, roomID: roomID, original: original
+            )
+            isSaving = false
+            if let error {
+                failure = AppLocalization.string("Could not save this group chat's settings: \(error)")
+            } else {
+                dismiss()
+            }
         }
     }
 }
@@ -1666,9 +2769,33 @@ struct DesktopGroupChatView: View {
                 Text(AppLocalization.string("Shortened — the full message is in Hermes Desktop."))
                     .scaledFont(.caption2)
                     .foregroundStyle(.secondary)
-                    .padding(.leading, message.isMember ? GroupMemberBubble.avatarSize + 9 : 0)
+                    .padding(.leading, message.isMember ? 4 : 0)
             }
         }
         .frame(maxWidth: .infinity, alignment: message.isMember ? .leading : .trailing)
+    }
+}
+
+private struct RoomFilePicturesKey: EnvironmentKey {
+    static let defaultValue: GatewayMediaDataURLResolver? = nil
+}
+
+private struct RoomFileReadsKey: EnvironmentKey {
+    static let defaultValue: GatewayMediaDataURLResolver? = nil
+}
+
+extension EnvironmentValues {
+    /// Where a room's messages read the other files sent into it; nil
+    /// shows them by name (AppState.roomFileReadsResolver).
+    var roomFileReads: GatewayMediaDataURLResolver? {
+        get { self[RoomFileReadsKey.self] }
+        set { self[RoomFileReadsKey.self] = newValue }
+    }
+
+    /// Where a room's messages read the pictures sent into it; nil draws
+    /// them by name (AppState.roomFilePicturesResolver).
+    var roomFilePictures: GatewayMediaDataURLResolver? {
+        get { self[RoomFilePicturesKey.self] }
+        set { self[RoomFilePicturesKey.self] = newValue }
     }
 }

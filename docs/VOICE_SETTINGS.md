@@ -8,12 +8,33 @@ or Local Live), see [Use your own voice server](OWN_VOICE_SERVER.md).
 
 ## Where TTS requests run
 
-All speech synthesis is relayed through the user's Hermes host: Conduit calls
+Speech from a Hermes voice provider is relayed through the user's Hermes host: Conduit calls
 `/api/audio/speak-stream` (streamed PCM) on the Hermes server and falls back
 to `/api/audio/speak` (whole-file) when streaming is unavailable. Conduit
 never talks to TTS providers directly, and it never uses Hermes'
 `voice.client_direct` credential hand-off — provider API keys remain on the
 Hermes host, where Conduit can only see whether each key is set.
+
+## Speaking on this iPhone
+
+With Assistant speech set to On this iPhone (the default without a working
+Hermes voice), Classic voice and Read Aloud speak with iOS's own voices, on
+the device. Conduit uses the best voice installed for the reply's language:
+Premium, then Enhanced, then iOS's default voice. Screen-reader voices
+(Eddy, Flo and the like) are used only when nothing else is installed, and
+Settings says so then, since they're why a reply sounds robotic;
+novelty voices and Personal Voice never. Under
+Assistant speech you can pick the voice for each language instead; the pick
+is kept on this device for every profile. Cantonese voices are listed under
+Traditional Chinese, marked Cantonese: written Cantonese and Traditional
+Chinese replies look the same, so picking one there speaks those replies in
+Cantonese. Siri's own voices can't be used:
+iOS doesn't offer them to apps. Premium voices are the closest: search iPhone Settings for "Voices" to
+download them (Accessibility > Read & Speak > Voices on iOS 26, Spoken
+Content before it). On an iPad Conduit says iPad Settings, and on a Mac
+System Settings, where searching for "Voices" finds the downloads on every
+macOS version.
+A voice downloaded while Conduit runs is used from the next sentence.
 
 ## Custom OpenAI-compatible endpoints
 
@@ -114,7 +135,7 @@ Gemini Live, Grok Live and GPT-Live end hands-free. One of your goodbye phrases 
 
 Every voice mode lets you cut in by speaking when you wear headphones, AirPods or a wired headset: the microphone stays open while the agent talks, and the agent stops when you start. GPT-Live also allows it on the phone's speaker and in the car, because WebRTC cancels the speaker's echo.
 
-Grok Live sometimes speaks a tool call as text ("<tool_call>…") instead of calling it. Conduit stops the speech at the markup, keeps it out of the transcript, and tells Grok after its turn that nothing ran, so it can call the tool properly. Grok is told to say a job has started only once start_job answers. A call whose arguments aren't valid JSON runs nothing and gets an error saying so. Diagnostics & logs (Last connection) shows the last Grok Live, Qwen Live or Local Live call's steps: the setup, the microphone in use and the turn detection the server applied, when the server heard you start and stop talking with the microphone's loudest and quietest levels in between, which functions xAI took, each call's name and how it was answered (started, error…), and any markup that was cut. If Grok doesn't notice you've stopped talking, copy it from there into your issue. It never shows what was said or a call's arguments.
+Grok Live sometimes speaks a tool call as text ("<tool_call>…") instead of calling it. Conduit stops the speech at the markup, keeps it out of the transcript, and tells Grok after its turn that nothing ran, so it can call the tool properly. Grok is told to say a job has started only once start_job answers. A call whose arguments aren't valid JSON runs nothing and gets an error saying so. Diagnostics & logs (Last connection) shows the last Grok Live, Qwen Live or Local Live call's steps: the setup, the microphone in use and the turn detection the server applied, when the server heard you start and stop talking with the microphone's loudest and quietest levels in between, which functions xAI took, each call's name and how it was answered (started, error…), and any markup that was cut. If Grok doesn't notice you've stopped talking, copy it from there into your issue. It never shows what was said or a call's arguments. GPT-Live calls show there too, with their setup: how long Conduit's briefing was and whether it had a persona and memory, whether it was a call from Hermes, whether Hermes or the plugin built the session and put the briefing and opening into it ("applied" means sent to OpenAI, not that the model followed it; on a ChatGPT plan the briefing goes in as the call's first message and, when it's long, the plugin shortens what Hermes remembers, then the persona, to fit what the plan allows, shown as "cut to fit"), session.started, a briefing or opening Conduit had to send after the start, which side spoke first, and connection drops and error codes. Diagnostics & logs keeps only the last call, until the app restarts, so copy it right after the call. The same steps also go to the iPhone's system log, which keeps them longer; they hold no text there either.
 
 Classic Voice, Gemini Live and Grok Live close the microphone while the agent talks on the speaker, in the car or over AirPlay (plus a short echo tail), because their microphone would hear the agent and it would keep interrupting itself. Use the Interrupt button there instead; on the CarPlay screen it's Stop, which stops the reply and listens in one tap. In Local Live, Interrupt (CarPlay's Stop and the Watch's orb included) also tells your speech server to stop the reply, so a server that shuts its own microphone while it speaks listens again.
 
@@ -122,17 +143,28 @@ In Classic Voice, when Hermes says it's on something ("Checking your calendar no
 
 In the car, a phone call, Siri or another app that takes the audio ends a Classic Voice conversation; once the audio comes back, CarPlay listens again on its own.
 
-"Talk over it on the speaker" (in the Gemini Live and Grok Live sections, shared by both, off by default) is the experimental way out: the call runs its microphone and speaker on one iOS voice-processing engine, so the agent's own voice is cancelled out of the microphone, and the microphone stays open on every route. If the agent keeps cutting itself off, turn it off. It applies from the next call. Classic Voice is unchanged.
+"Talk over it on the speaker" (in the Gemini Live, Grok Live and Classic Voice sections, one setting shared by all of them and Qwen Live, off by default) is the experimental way out: the call runs its microphone and speaker on one iOS voice-processing engine, so the agent's own voice is cancelled out of the microphone, and the microphone stays open on every route. If the agent keeps cutting itself off, turn it off. It applies from the next call. Calls from Hermes don't use it: under the phone call iOS kept restarting that engine, which held up the call's voice, so those calls use the default audio and close the microphone while the agent talks on the speaker or in the car.
 
 ## Live call style
 
-"Live call style" in Voice settings (shown once a live mode is on, shared by Gemini Live, Grok Live and GPT-Live) sets how calls sound, per profile, from the next call:
+"Live call style" in Voice settings (shown once a live mode is on, shared by Gemini Live, Qwen Live, Grok Live, GPT-Live and Local Live's agent mode) sets how calls sound, per profile, from the next call:
 
-- **Greet me when a call connects**: the model greets you as soon as the call is live, in one short sentence, then waits. Leave the greeting text empty for one in its own words, or type your own (one line, up to 200 characters). Off by default: the call stays silent until you speak. GPT-Live needs the up-to-date Hermes notifier plugin, which swaps its "wait for the user" opening for a greeting; with an older plugin Conduit asks for the greeting once the call is ready instead. Gemini and Grok get it as the first turn of the call, never again on a reconnect.
+- **Greet me when a call connects**: the model greets you as soon as the call is live, in one short sentence, then waits. Leave the greeting text empty for one in its own words, or type your own (one line, up to 200 characters). Off by default: the call stays silent until you speak. Every live mode gets it as the first turn of the call, never again on a reconnect, on the iPhone and the Apple Watch alike. GPT-Live needs it: it doesn't speak first from its instructions, so the notifier plugin (0.130.4 and later) leaves the opening to that turn.
 - **Tone**: Model default, Relaxed, Neutral or Professional. Model default leaves the model's tone and your Hermes server's voice persona alone; the others add a short style block after the persona that replaces its tone and pace guidance.
 - **Backchannels**: on by default. Off tells the model not to say "mm-hmm", "right" and the like while you talk.
+- **Your instructions**: your own text for the voice model (its personality, how it words things, what it should know about you), up to 2,000 characters. It is added after Conduit's own instructions in every live mode. Conduit's instructions can't be shortened or replaced, because jobs, approvals and the call's tools depend on them, so where yours disagree, Conduit's come first.
 - **What Conduit sends** shows the text Conduit adds to the current live mode's instructions, with the style applied. Memory and personality are shown as placeholders, since they are read when a call starts.
+
+Live calls talk as one assistant with Hermes: Gemini, Qwen, Grok and Local Live say "I'm checking on that" rather than "I'll ask Hermes", and name Hermes only when you ask who's doing the work. GPT-Live still mentions Hermes at most once a call. Each live mode's "Use Hermes personality" makes it talk with this profile's SOUL.md; for Local Live it's under Local > 3. Your fast model, and SOUL.md goes to your fast model's server.
+
+Live calls speak your language: the App Language you picked in Settings, or else your iPhone's first language. Every live mode (Gemini, Qwen, Grok, GPT-Live and Local Live's agent mode, on the iPhone, CarPlay, the Apple Watch and calls from Hermes) is told to use it from its first words, a call from Hermes' opening and job results included. Speak another language to it, or ask it to switch, and it keeps to that one for the rest of the call.
+
+## Read replies aloud
+
+The speaker button under a reply reads it aloud. To hear every reply without tapping, turn on Read replies aloud in Settings > Voice > Read Aloud: each reply in the open chat is read as it arrives, whether you typed the message or dictated it, the way a Classic voice turn's reply is spoken, and in the group room you have open each new message from its bots is read in turn, in that bot's voice. Stop it from the player or the speaker button; the next reply is read again. A reading starts only while Conduit is on screen, then carries on with the phone locked. It never plays during a call or while the microphone is in use. Hermes is told the answer is heard, so it doesn't send a sound file of its own. The speed is Read Aloud's.
+
+If a reading skips part of a reply, Diagnostics & logs (Last connection) shows the last reading's steps under the calls': which voice read it (the iPhone voice with its quality, Hermes speech or a speech server), how many sentences it was split into and how long each was, why each sentence ended (its end of speech, finished without one, or quiet for 8 seconds), route changes, speed changes, interruptions and how playback ended. Copy it right after the reading and paste it into your issue. It never holds the reply's words, and only the last reading is kept, until the app restarts.
 
 ## Dictate into the composer
 
-The composer has two buttons on the right of its bottom row. The plain mic dictates: tap it and the words appear in the draft as you speak, after anything already typed. Nothing is sent until you send it: while you dictate, a wide Stop takes Send's place (and the mic's); tap it to stop. Send comes back once the words are in the draft, so you can read them over or fix them first. With Return sends on, Return stops the dictation too. To talk and send in one go, use Voice message or Voice instead. The waveform button (in the same spot Send takes) opens Voice. On a Mac, and on an iPad whose chat has the room, the composer stays expanded and the chat's big voice button stays beside it instead: it does what you chose for it, and the row leaves out the waveform button, and the mic too when the big button dictates. Recognition uses Apple's speech recognizer, on the device when the language supports it. Dictation is unavailable while a voice conversation has the microphone. A phone call, Siri, an audio route change or a voice conversation taking the microphone ends dictation, keeping the words so far. With Hermes as the dictation engine, the recording stays on the iPhone until its words are in the draft: an upload that fails on a dropped connection is tried again a few times over about two minutes, and one that still can't go is offered above the composer (in chats and group rooms) with Retry and Delete, after Conduit restarts too. Retry puts the words in the draft of the chat or room you tapped it in. Kept recordings are deleted once two weeks old (the next time Conduit opens or a recording is delivered or deleted), and never backed up.
+The composer has two buttons on the right of its bottom row. The plain mic dictates: tap it and the words appear in the draft as you speak, after anything already typed. Nothing is sent until you send it: while you dictate, a wide Stop takes Send's place (and the mic's); tap it to stop. Send comes back once the words are in the draft, so you can read them over or fix them first. With Return sends on, Return stops the dictation too. To talk and send in one go, use Voice message or Voice instead. The waveform button (in the same spot Send takes) opens Voice. On a Mac, and on an iPad whose chat has the room, the composer stays expanded and the chat's big voice button stays beside it instead: it does what you chose for it, and the row leaves out the waveform button, and the mic too when the big button dictates. Recognition uses Apple's speech recognizer, on the device when the language supports it. Settings > Voice > Dictation picks the engine (Apple, Apple's new model, or Hermes). Voice messages use the same one unless you pick another on the Voice message row there, so dictation can stay on the iPhone while the transcript Hermes reads with each voice message comes from Hermes, or the other way round. Dictation is unavailable while a voice conversation has the microphone. A phone call, Siri, an audio route change or a voice conversation taking the microphone ends dictation, keeping the words so far. With Hermes as the dictation engine, the recording stays on the iPhone until its words are in the draft: an upload that fails on a dropped connection is tried again a few times over about two minutes, and one that still can't go is offered above the composer (in chats and group rooms) with Retry and Delete, after Conduit restarts too. Retry puts the words in the draft of the chat or room you tapped it in. Kept recordings are deleted once two weeks old (the next time Conduit opens or a recording is delivered or deleted), and never backed up.

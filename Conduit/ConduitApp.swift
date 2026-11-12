@@ -8,6 +8,7 @@
 
 import Combine
 import SwiftUI
+import TipKit
 import UIKit
 import UserNotifications
 import os
@@ -15,11 +16,25 @@ import os
 private let backgroundPushLogger = Logger(subsystem: "com.milim.relay", category: "BackgroundPush")
 
 final class ConduitAppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDelegate {
+    // Portrait on an iPhone, but for a bot's screen in full screen.
+    func application(_ application: UIApplication,
+                     supportedInterfaceOrientationsFor window: UIWindow?) -> UIInterfaceOrientationMask {
+        MainActor.assumeIsolated { InterfaceOrientationGate.supported }
+    }
+
     func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
+        // A freeze saves what the chat did just before (#1533).
+        MainThreadHangWatchdog.shared.start()
         UNUserNotificationCenter.current().delegate = self
         // A "Hermes wants to talk" notification's Talk button (#449), and a
         // Pulse push's Quiet for today.
         NotificationCategories.register()
+        // Bots Home's tip (BotsHomeGesturesTip), hidden in UI tests and
+        // the App Store screenshots.
+        if BotsHomeGesturesTip.hiddenForTesting {
+            Tips.hideAllTipsForTesting()
+        }
+        try? Tips.configure()
         // Set up before launch returns: a call the Apple Watch starts can
         // launch Conduit in the background, and its message waits on this.
         MainActor.assumeIsolated {
@@ -58,7 +73,7 @@ final class ConduitAppDelegate: NSObject, UIApplicationDelegate, UNUserNotificat
             }
             // Lock Screen progress of a turn sent before a relaunch (#605):
             // the chat's stream can still update and end it.
-            LiveTurnActivities.shared.adoptExisting()
+            LiveTurnActivities.shared?.adoptExisting()
             #if targetEnvironment(macCatalyst)
             // No pushes on a Mac: Conduit posts its own while it runs.
             MacAttention.shared.start(appState: AppStateRuntimeRegistry.shared.appState)
@@ -135,6 +150,16 @@ final class ConduitAppDelegate: NSObject, UIApplicationDelegate, UNUserNotificat
         withCompletionHandler completionHandler: @escaping () -> Void
     ) {
         let request = response.notification.request
+        // Ask Which Dashboard at Launch (#1908): whatever a tapped
+        // notification or its button does next needs Hermes, so a launch
+        // waiting for a dashboard pick signs in for it. Not for a dismissal,
+        // or directions that only open Maps.
+        if response.actionIdentifier != UNNotificationDismissActionIdentifier,
+           request.identifier != MapsNavigator.notificationIdentifier {
+            Task { @MainActor in
+                AppStateRuntimeRegistry.shared.appState.releaseLaunchDashboardChoice(for: "a notification")
+            }
+        }
         // Quiet for today on a Pulse push: done in the background, on the
         // dashboard the push came from. One that couldn't be done there (no
         // connection in time, or the push is from another dashboard) says
@@ -176,6 +201,7 @@ final class ConduitAppDelegate: NSObject, UIApplicationDelegate, UNUserNotificat
                 if quiet || app.pulseQuietOwnership(target) == .route {
                     app.openPulse(card: nil)
                 }
+                await PulseNotifications.sayNotQuiet(quiet, target: target)
             }
             return
         }
@@ -279,7 +305,40 @@ final class ConduitAppDelegate: NSObject, UIApplicationDelegate, UNUserNotificat
             return
         }
         #endif
-        completionHandler([])
+        // An invite to a room waits on the user, so it shows here too, and
+        // Group Chats reads the invites again.
+        if PushNotificationService.isRoomInvitePush(notification.request.content.userInfo) {
+            Task { @MainActor in
+                await AppStateRuntimeRegistry.shared.appState.refreshLinkedRoomInvites()
+            }
+            completionHandler([.banner, .list, .sound])
+            return
+        }
+        // A push while Conduit is open may be a wait in another chat: the
+        // Needs you list reads now, and its banner shows instead (#1705).
+        if notification.request.trigger is UNPushNotificationTrigger {
+            Task { @MainActor in AppStateRuntimeRegistry.shared.appState.noteNeedsYouPush() }
+        }
+        // An approval one of your agents waits for in a room someone else
+        // hosts has no chat to show in, so it shows here too, once the
+        // approvals say it's one of theirs (read then, up to 2 s, since
+        // the banner waits on it).
+        let userInfo = notification.request.content.userInfo
+        Task { @MainActor in
+            let appState = AppStateRuntimeRegistry.shared.appState
+            if appState.canAnswerRoomApprovals,
+               let target = PushNotificationService.parseNotificationTarget(from: userInfo),
+               target.dashboardID == nil || target.dashboardID == appState.activeDashboardID,
+               case .approval(let sessionKey, _, _) = target.decision,
+               await appState.roomApproval(
+                   matching: [sessionKey, target.durableSessionID, target.sessionId].compactMap { $0 },
+                   timeoutMilliseconds: RoomApprovalsClient.presentationReadTimeoutMilliseconds
+               ) != nil {
+                completionHandler([.banner, .list, .sound])
+            } else {
+                completionHandler([])
+            }
+        }
     }
 }
 
@@ -323,6 +382,9 @@ struct ConduitApp: App {
             rootContent
 #endif
         }
+        // The menu bar and ⌘-held shortcuts on an iPad and a Mac: ⌘N is
+        // New Chat here, not a second window (issue 2219).
+        .commands { ConduitKeyboardCommands() }
     }
 
     private var rootContent: some View {
@@ -389,6 +451,8 @@ struct ConduitApp: App {
                 if appState.routeWidgetLaunchURL(url) { return .handled }
                 // A sign-in code Hermes sent in a chat asks before it signs in.
                 if appState.routeConnectLink(url) { return .handled }
+                // So does a Link invite, before linking.
+                if appState.routeRoomLink(url) { return .handled }
                 guard let link = ConduitAppLink(url: url) else {
                     // The scheme is registered, so the system would hand a
                     // conduit link Conduit can't read straight back to it.
@@ -406,15 +470,25 @@ struct ConduitApp: App {
             // Another app opening a chat: only session links, opened through
             // the same route as an in-app link once Hermes is connected.
             .onOpenURL { url in
+                // The Shortcuts app back from a run Hermes asked for.
+                if PhoneShortcutRunner.shared.handle(url) { return }
                 if appState.routeWidgetLaunchURL(url) { return }
                 // A sign-in code tapped in another app (a Telegram chat with
                 // Hermes): Conduit asks before it signs in.
                 if appState.routeConnectLink(url) { return }
+                // A Link invite someone sent, or its QR code read by the
+                // Camera: Conduit asks before linking.
+                if appState.routeRoomLink(url) { return }
                 guard let link = ConduitAppLink(externalURL: url) else { return }
                 pendingExternalLink = link
             }
             .task(id: externalLinkRouteKey) {
-                guard appState.isConnected, let link = pendingExternalLink else { return }
+                guard let link = pendingExternalLink else { return }
+                guard appState.isConnected else {
+                    // A launch waiting for a dashboard pick signs in for it.
+                    appState.releaseLaunchDashboardChoice(for: "a link")
+                    return
+                }
                 pendingExternalLink = nil
                 appState.openAppLink(link)
             }
@@ -426,8 +500,10 @@ struct ConduitApp: App {
             // (#1238). ChatView asks too; a read under way is joined.
             .task { await TranscriptPictureMemory.loadKeptSizes() }
             .task { await PushNotificationService.shared.refresh() }
-            // Siri learns the cached profile names for its profile phrases.
-            .task { SiriProfileShortcuts.refresh() }
+            // Siri learns the cached profile names for its profile phrases,
+            // and Spotlight and Siri the chats, as the app last saw them (a
+            // snapshot write only refreshes them when it changed something).
+            .task { ConduitChatSpotlight.refresh(from: WidgetSnapshotStore.production) }
             .task(id: notificationRouteKey) {
                 guard let target = notifications.pendingTarget else { return }
                 if notifications.pendingRouteAwaitsCall {
@@ -445,6 +521,8 @@ struct ConduitApp: App {
                 // tap replaced the one it was about.
                 appState.clearCallRefusal()
                 guard appState.isConnected else {
+                    // A launch waiting for a dashboard pick signs in for it.
+                    appState.releaseLaunchDashboardChoice(for: "a notification")
                     notifications.notificationRouteAwaitsConnection(target)
                     return
                 }
@@ -495,6 +573,40 @@ struct ConduitApp: App {
                     notifications.notificationRouteAwaitsCall(target)
                 }
             }
+            // A tapped invite to a room opens its join card (Linked Rooms)
+            // once Hermes is connected and the plugin has said what it
+            // keeps; one tapped during a call opens when the call has ended.
+            .task(id: roomInviteRouteKey) {
+                guard let invite = notifications.pendingRoomInvite else { return }
+                var retries = 0
+                while true {
+                    // A refusal the call left on the drawer shell's error
+                    // line is done with.
+                    appState.clearCallRefusal()
+                    let outcome = await appState.openRoomInvite(invite)
+                    guard !Task.isCancelled, notifications.pendingRoomInvite == invite else { return }
+                    switch outcome {
+                    case .waiting:
+                        return
+                    case .afterCall:
+                        guard await PushNotificationService.waitForCallToEnd(
+                            interval: Self.callEndRecheckInterval,
+                            isReady: { appState.callWaitCanEnd }
+                        ), !Task.isCancelled, notifications.pendingRoomInvite == invite else { return }
+                    case .retry:
+                        // The dashboard changed while the invites were
+                        // read: the one in use now decides, a few times.
+                        retries += 1
+                        guard retries < 3 else {
+                            notifications.clearPendingRoomInvite(invite)
+                            return
+                        }
+                    case .opened, .failed:
+                        notifications.clearPendingRoomInvite(invite)
+                        return
+                    }
+                }
+            }
             // Quiet for today's retry waiting for a call (or, after a
             // relaunch, the one Conduit closing ended), as a notification
             // waits above: it goes through once there's no call and Conduit
@@ -512,8 +624,15 @@ struct ConduitApp: App {
                 if quiet || appState.pulseQuietOwnership(target) == .route {
                     appState.openPulse(card: nil)
                 }
+                // The quiet promised when the call ends didn't come: it
+                // says so, and its tap tries again (issue 1975).
+                await PulseNotifications.sayNotQuiet(quiet, target: target)
             }
             .task(id: voiceIntentRouteKey) {
+                // A launch waiting for a dashboard pick signs in for Siri.
+                if pendingVoiceIntents.hasPendingIntent {
+                    appState.releaseLaunchDashboardChoice(for: "Siri")
+                }
                 // Siri's call shows its screen while it waits for Hermes.
                 appState.presentWaitingCallIfNeeded()
                 // A screenshot waits for Conduit to settle after connecting.
@@ -547,6 +666,10 @@ struct ConduitApp: App {
 
     private var notificationRouteKey: String {
         "\(notifications.pendingTarget?.id ?? "none"):\(appState.isConnected):\(notifications.navigationAttempt)"
+    }
+
+    private var roomInviteRouteKey: String {
+        "\(notifications.pendingRoomInvite?.id ?? "none"):\(appState.isConnected):\(appState.notifierPlugin.state != .unknown)"
     }
 
     private var externalLinkRouteKey: String {

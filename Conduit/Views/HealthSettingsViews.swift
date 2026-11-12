@@ -47,7 +47,7 @@ struct HealthSettingsPage: View {
                 } else if preferences.isOn {
                     statusRows
                 } else if !pluginServesHealth {
-                    Text("Update the Conduit plugin on your Hermes host to share health data.")
+                    Text(PluginUpdateAsk.text(AppLocalization.string("Update the Conduit plugin on your Hermes host to share health data.")))
                         .scaledFont(.caption)
                         .foregroundStyle(.orange)
                 }
@@ -122,7 +122,7 @@ struct HealthSettingsPage: View {
                 .scaledFont(.caption)
                 .foregroundStyle(.secondary)
         } else if let pause = engine.state.pause {
-            Text(pause.message)
+            Text(pause.message(managedBy: appState.pluginManagedBy(forDashboard: preferences.destination?.dashboardID)))
                 .scaledFont(.caption)
                 .foregroundStyle(.orange)
         } else if let last = engine.state.lastSync {
@@ -384,7 +384,11 @@ struct HealthSettingsPage: View {
         Task {
             let done = await appState.turnOffHealthSync(deleteFromHost: delete)
             if !done {
-                errorMessage = AppLocalization.string("Sharing is off. The host couldn't be reached, so Conduit deletes the data there the next time it connects.")
+                // A profile that turned the plugin off was reached and refused:
+                // say how to turn it on (issue 1671).
+                errorMessage = appState.healthSync.deleteRefusedPluginOff.map {
+                    AppLocalization.string("Sharing is off. \($0) Conduit deletes the data there once it's on.")
+                } ?? AppLocalization.string("Sharing is off. The host couldn't be reached, so Conduit deletes the data there the next time it connects.")
             }
             isWorking = false
         }

@@ -24,6 +24,10 @@ enum MessageRole: String, Codable, Equatable {
     /// password, skill/setup secret, password-manager unlock, a website's
     /// login or its one-time code.
     case inputPrompt
+    /// Hermes connecting something for the model and waiting on the user:
+    /// an app sign-in, an MCP server's setup, a catalog install or the
+    /// apps directory (`connection.request`, ConnectionActivity).
+    case connection
 }
 
 enum SessionSource: String, Codable, CaseIterable {
@@ -35,6 +39,34 @@ enum SessionSource: String, Codable, CaseIterable {
     case voiceJob = "voice_job"
     case discord
     case telegram
+    /// Hermes' other gateway platforms (`gateway.config.Platform` and the
+    /// bundled platform plugins), each under its own name and filter
+    /// (#1561). Two-backend platforms share one: WhatsApp and WhatsApp
+    /// Cloud, iMessage over BlueBubbles or Photon, WeCom and its callback
+    /// app. A plugin platform Conduit doesn't know yet stays Other.
+    case slack
+    case whatsapp
+    case signal
+    case imessage
+    case matrix
+    case mattermost
+    case teams
+    case googleChat = "google_chat"
+    case email
+    case sms
+    case irc
+    case line
+    case simplex
+    case wechat = "weixin"
+    case wecom
+    case feishu
+    case dingtalk
+    case qq = "qqbot"
+    case yuanbao
+    case buzz
+    case raft
+    case ntfy
+    case a2a
     case api
     case webhook
     case cron
@@ -47,6 +79,29 @@ enum SessionSource: String, Codable, CaseIterable {
         case .voiceJob: return AppLocalization.string("Voice Jobs")
         case .discord: return "Discord"
         case .telegram: return "Telegram"
+        case .slack: return "Slack"
+        case .whatsapp: return "WhatsApp"
+        case .signal: return "Signal"
+        case .imessage: return "iMessage"
+        case .matrix: return "Matrix"
+        case .mattermost: return "Mattermost"
+        case .teams: return "Microsoft Teams"
+        case .googleChat: return "Google Chat"
+        case .email: return AppLocalization.string("Email")
+        case .sms: return "SMS"
+        case .irc: return "IRC"
+        case .line: return "LINE"
+        case .simplex: return "SimpleX"
+        case .wechat: return "WeChat"
+        case .wecom: return "WeCom"
+        case .feishu: return "Feishu"
+        case .dingtalk: return "DingTalk"
+        case .qq: return "QQ"
+        case .yuanbao: return "Yuanbao"
+        case .buzz: return "Buzz"
+        case .raft: return "Raft"
+        case .ntfy: return "ntfy"
+        case .a2a: return "A2A"
         case .api: return "API"
         case .webhook: return AppLocalization.string("Webhook")
         case .cron: return AppLocalization.string("Cron")
@@ -61,6 +116,29 @@ enum SessionSource: String, Codable, CaseIterable {
         case .voiceJob: return "bolt.horizontal.circle.fill"
         case .discord: return "person.2.fill"
         case .telegram: return "paperplane.fill"
+        case .slack: return "number"
+        case .whatsapp: return "phone.bubble.left.fill"
+        case .signal: return "lock.shield.fill"
+        case .imessage: return "message.fill"
+        case .matrix: return "square.grid.3x3.fill"
+        case .mattermost: return "bubble.left.and.bubble.right.fill"
+        case .teams: return "person.3.fill"
+        case .googleChat: return "text.bubble.fill"
+        case .email: return "envelope.fill"
+        case .sms: return "iphone.gen3"
+        case .irc: return "number.square.fill"
+        case .line: return "bubble.right.fill"
+        case .simplex: return "lock.fill"
+        case .wechat: return "bubble.left.and.bubble.right"
+        case .wecom: return "building.2.fill"
+        case .feishu: return "bird.fill"
+        case .dingtalk: return "bell.fill"
+        case .qq: return "person.crop.circle.fill"
+        case .yuanbao: return "sparkles"
+        case .buzz: return "dot.radiowaves.left.and.right"
+        case .raft: return "rectangle.3.group.fill"
+        case .ntfy: return "bell.badge.fill"
+        case .a2a: return "arrow.left.arrow.right"
         case .api: return "globe"
         case .webhook: return "link"
         case .cron: return "clock.fill"
@@ -75,6 +153,29 @@ enum SessionSource: String, Codable, CaseIterable {
         case .voiceJob: return .indigo
         case .discord: return .purple
         case .telegram: return .cyan
+        case .slack: return .purple
+        case .whatsapp: return .green
+        case .signal: return .blue
+        case .imessage: return .green
+        case .matrix: return .mint
+        case .mattermost: return .blue
+        case .teams: return .indigo
+        case .googleChat: return .green
+        case .email: return .orange
+        case .sms: return .green
+        case .irc: return .gray
+        case .line: return .green
+        case .simplex: return .indigo
+        case .wechat: return .green
+        case .wecom: return .blue
+        case .feishu: return .blue
+        case .dingtalk: return .blue
+        case .qq: return .cyan
+        case .yuanbao: return .teal
+        case .buzz: return .orange
+        case .raft: return .brown
+        case .ntfy: return .teal
+        case .a2a: return .gray
         case .api: return .green
         case .webhook: return .orange
         case .cron: return .pink
@@ -84,6 +185,14 @@ enum SessionSource: String, Codable, CaseIterable {
 }
 
 extension SessionSource {
+    /// Hermes' gateway platforms after Discord and Telegram, in the Chats
+    /// filter's default order (#1561).
+    static let gatewayPlatforms: [SessionSource] = [
+        .slack, .whatsapp, .signal, .imessage, .matrix, .mattermost, .teams, .googleChat,
+        .email, .sms, .irc, .line, .simplex, .wechat, .wecom, .feishu, .dingtalk, .qq,
+        .yuanbao, .buzz, .raft, .ntfy, .a2a
+    ]
+
     /// Hermes' source for a Kanban worker's transcript. Hermes refuses to
     /// reopen one as a chat (`session.resume` 4132): the board runs it, and
     /// the task's Worker Log shows it.
@@ -713,6 +822,8 @@ struct ChatMessage: Identifiable, Equatable {
     var clarify: ClarifyActivity?
     var approval: ApprovalActivity?
     var inputPrompt: InputPromptActivity?
+    /// The connect card on a `.connection` row. Live-only, like inputPrompt.
+    var connection: ConnectionActivity?
     var attachments: [Attachment]?
     var code: String?
     /// Canonical Hermes `display_kind` when the persisted row arrived with
@@ -771,6 +882,32 @@ struct ChatMessage: Identifiable, Equatable {
         self.displayKind = displayKind
         self.rowId = rowId
         self.reactions = reactions
+    }
+
+    /// The same message under another id.
+    func withID(_ id: String) -> ChatMessage {
+        var copy = ChatMessage(
+            id: id,
+            role: role,
+            content: content,
+            rawContent: rawContent,
+            timestamp: timestamp,
+            author: author,
+            reasoning: reasoning,
+            tool: tool,
+            review: review,
+            clarify: clarify,
+            approval: approval,
+            inputPrompt: inputPrompt,
+            attachments: attachments,
+            code: code,
+            displayKind: displayKind,
+            rowId: rowId,
+            reactions: reactions
+        )
+        copy.stepDuration = stepDuration
+        copy.connection = connection
+        return copy
     }
 
     /// Hermes' `display_kind` for a mid-turn steer row, also used for the
@@ -920,6 +1057,37 @@ struct DelegateAgentActivity: Identifiable, Equatable {
         return merged
     }
 
+    /// The cards with a roster's agents among them: one the chat has no
+    /// card for gets one (it was started before this chat was opened, or
+    /// while the socket was down), and a card it has is left as its own
+    /// events made it, except that it moves to the session the roster was
+    /// read for: a card kept from before a resume would otherwise ask
+    /// about, steer or stop its agent under a runtime Hermes has moved on
+    /// from (issue 2206).
+    /// A roster of a runtime that's no longer the chat's own (`moving`
+    /// false) adds cards but moves none.
+    static func adopting(
+        _ agents: [DelegateAgentActivity],
+        roster: [DelegateAgentActivity],
+        moving: Bool = true
+    ) -> [DelegateAgentActivity] {
+        let listedIn = moving
+            ? Dictionary(roster.map { ($0.id, $0.sessionId) }, uniquingKeysWith: { first, _ in first }) : [:]
+        let moved = agents.map { agent -> DelegateAgentActivity in
+            guard let session = listedIn[agent.id], !session.isEmpty, session != agent.sessionId else { return agent }
+            var moved = agent
+            moved.sessionId = session
+            return moved
+        }
+        let have = Set(agents.map(\.id))
+        return moved + roster.filter { !have.contains($0.id) }
+    }
+
+    /// How many of a chat's delegate agents are still queued or running.
+    static func activeCount(_ agents: [DelegateAgentActivity]) -> Int {
+        agents.reduce(0) { $1.status.isActive ? $0 + 1 : $0 }
+    }
+
     /// Agents a gateway roster no longer lists have ended; their
     /// `subagent.complete` was missed (app suspended, socket reconnect).
     /// Only running cards from `sessionId` with a gateway id and no event
@@ -942,6 +1110,33 @@ struct DelegateAgentActivity: Identifiable, Equatable {
             ended.currentTool = nil
             return ended
         }
+    }
+}
+
+extension DelegateAgentActivity {
+    /// One `subagent.list` row as a card; nil for a row without an id. The
+    /// roster lists the agents Hermes still has, so a status it doesn't
+    /// name reads as running.
+    init?(rosterRow row: [String: AnyCodable]?, sessionId: String) {
+        guard let row, let id = row["subagent_id"]?.stringValue, !id.isEmpty else { return nil }
+        let named = row["status"]?.stringValue?.lowercased() ?? ""
+        let status: Status = named == "pending" ? .queued
+            : ["error", "timeout"].contains(named) ? .failed
+            : ["cancelled", "canceled", "stopped"].contains(named) ? .interrupted
+            : Status(rawValue: named) ?? .running
+        self.init(
+            id: id,
+            goal: row["goal"]?.stringValue ?? "",
+            model: row["model"]?.stringValue.flatMap { $0.isEmpty ? nil : $0 },
+            status: status,
+            taskCount: 1,
+            taskIndex: 0,
+            currentTool: row["last_tool"]?.stringValue.flatMap { $0.isEmpty ? nil : $0 },
+            summary: nil,
+            stream: [],
+            hasGatewayID: true,
+            sessionId: sessionId
+        )
     }
 }
 
@@ -1038,9 +1233,19 @@ struct CronJob: Codable, Identifiable {
     var scheduleDisplay: String?
     var script: String?
     var state: String?
+    /// The job's own model and provider; empty, it runs on the profile's.
+    var model: String?
+    var provider: String?
+    /// An endpoint of the job's own, which Hermes keeps beside its provider.
+    var baseURL: String?
+    /// The job's own reasoning level (`none` … `ultra`); empty, it follows
+    /// the profile's.
+    var reasoningEffort: String?
 
     enum CodingKeys: String, CodingKey {
-        case deliver, enabled, id, name, prompt, script, state
+        case deliver, enabled, id, name, prompt, script, state, model, provider
+        case baseURL = "base_url"
+        case reasoningEffort = "reasoning_effort"
         case lastError = "last_error"
         case lastRunAt = "last_run_at"
         case nextRunAt = "next_run_at"
@@ -1117,12 +1322,67 @@ struct CronRun: Codable, Identifiable {
     var profile: String?
     var startedAt: Int?
     var title: String?
+    /// The job the gateway says ran it (`job_id` or `cron_job_id`), when it says.
+    var jobID: String?
 
     enum CodingKeys: String, CodingKey {
         case id, model, preview, profile
         case lastActive = "last_active"
         case startedAt = "started_at"
         case title
+        case jobID = "job_id"
+        case cronJobID = "cron_job_id"
+    }
+
+    init(id: String, lastActive: Int?, model: String?, preview: String?, profile: String?, startedAt: Int?, title: String?, jobID: String? = nil) {
+        self.id = id
+        self.lastActive = lastActive
+        self.model = model
+        self.preview = preview
+        self.profile = profile
+        self.startedAt = startedAt
+        self.title = title
+        self.jobID = jobID
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        lastActive = try container.decodeIfPresent(Int.self, forKey: .lastActive)
+        model = try container.decodeIfPresent(String.self, forKey: .model)
+        preview = try container.decodeIfPresent(String.self, forKey: .preview)
+        profile = try container.decodeIfPresent(String.self, forKey: .profile)
+        startedAt = try container.decodeIfPresent(Int.self, forKey: .startedAt)
+        title = try container.decodeIfPresent(String.self, forKey: .title)
+        // The first that names a job: an empty or non-string one doesn't.
+        jobID = [CodingKeys.jobID, .cronJobID].lazy
+            .compactMap { try? container.decodeIfPresent(String.self, forKey: $0) }
+            .first { !$0.isEmpty }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encodeIfPresent(lastActive, forKey: .lastActive)
+        try container.encodeIfPresent(model, forKey: .model)
+        try container.encodeIfPresent(preview, forKey: .preview)
+        try container.encodeIfPresent(profile, forKey: .profile)
+        try container.encodeIfPresent(startedAt, forKey: .startedAt)
+        try container.encodeIfPresent(title, forKey: .title)
+        try container.encodeIfPresent(jobID, forKey: .jobID)
+    }
+
+    /// Whether this is a run of the job (#1707): the job the gateway names,
+    /// else Hermes' run session id, `cron_<job id>_<YYYYMMDD>_<HHMMSS>` (the
+    /// only form Hermes writes, cron/scheduler.py). A run
+    /// that says neither is no job's, so a list of every job's runs never
+    /// lends one to a job that didn't make it.
+    func isRun(ofJob job: String) -> Bool {
+        if let jobID, !jobID.isEmpty { return jobID == job }
+        let prefix = "cron_\(job)_"
+        guard !job.isEmpty, id.hasPrefix(prefix) else { return false }
+        let stamp = id.dropFirst(prefix.count).split(separator: "_", omittingEmptySubsequences: false)
+        return stamp.map(\.count) == [8, 6] && stamp.allSatisfy { part in part.allSatisfy { $0.isASCII && $0.isNumber } }
     }
 }
 
@@ -1151,6 +1411,12 @@ enum TurnState: Equatable {
 
     var isRunning: Bool {
         self == .running
+    }
+
+    /// Running, or still being read back (a sync, a reconnect), so a reply
+    /// may be running: a chat call's seed leaves the running turn off.
+    var mayBeRunning: Bool {
+        self == .running || self == .synchronizing || self == .reconnecting
     }
 
     static func fromGatewayRunning(_ running: Bool?) -> TurnState {
@@ -1461,6 +1727,25 @@ struct ProfileConfigSchema: Equatable {
     subscript(key: String) -> Field? { fields[key] }
 }
 
+/// A fallback list that may follow another one: the subagents'
+/// (`delegation.fallback_providers`) follow the chat's while unset (null);
+/// an empty list of their own turns fallback off.
+struct ProfileFallbackChain: Equatable {
+    var inherits = false
+    var entries: [ProfileFallbackModel] = []
+
+    init(inherits: Bool = false, entries: [ProfileFallbackModel] = []) {
+        self.inherits = inherits
+        self.entries = entries
+    }
+
+    /// The subagents' chain in a profile's config.
+    init(delegationIn config: [String: Any]) {
+        let value = (config["delegation"] as? [String: Any])?["fallback_providers"]
+        self.init(inherits: value == nil || value is NSNull, entries: ProfileFallbackModel.list(from: value))
+    }
+}
+
 /// One `fallback_providers` entry: the model Hermes tries when the default
 /// fails. Entries can carry hand-written routing (`base_url`, `key_env`,
 /// `api_mode`…); `extras` keeps it so a save never drops it.
@@ -1620,7 +1905,9 @@ struct RuntimeState: Equatable {
 // MARK: - Capabilities
 
 struct CapabilitySkill: Identifiable, Equatable {
-    let id = UUID()
+    /// By name, as Hermes keys them: a list read again (or the kept one
+    /// Hermes' answer replaces) draws only the rows that changed.
+    var id: String { name }
     let name: String
     var description: String?
     var category: String?
@@ -1630,7 +1917,7 @@ struct CapabilitySkill: Identifiable, Equatable {
 }
 
 struct CapabilityToolset: Identifiable, Equatable {
-    let id = UUID()
+    var id: String { name }
     let name: String
     var description: String?
     var enabled: Bool

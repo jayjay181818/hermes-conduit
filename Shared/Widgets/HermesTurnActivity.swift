@@ -1,5 +1,7 @@
-import ActivityKit
 import Foundation
+#if !targetEnvironment(macCatalyst)
+import ActivityKit
+#endif
 
 /// A running Hermes turn on the Lock Screen and in the Dynamic Island
 /// (#605). Conduit starts one when it sends a turn and updates it from the

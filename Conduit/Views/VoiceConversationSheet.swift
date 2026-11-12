@@ -36,6 +36,8 @@ struct VoiceConversationSheet: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @State private var showsTranscript = false
+    /// Speaker, during a call from Hermes.
+    @ObservedObject private var callSpeaker = VoiceAudioSessionCoordinator.shared.nativeCallSpeaker
     /// When the sheet opened, for V2's call clock.
     @State private var openedAt = Date()
     /// The job whose result V2 shows over the conversation.
@@ -121,7 +123,10 @@ struct VoiceConversationSheet: View {
                 Text("Mic input")
                     .scaledFont(.caption)
                     .foregroundStyle(.secondary)
-                VoiceInputLevelMeter(level: inputMeterLevel, isActive: isInputMeterActive)
+                let meterActive = isInputMeterActive
+                VoiceMicrophoneLevelReader(meter: controller.microphoneMeter) { level in
+                    VoiceInputLevelMeter(level: meterActive ? level : 0, isActive: meterActive)
+                }
                     .frame(height: 20)
                     .accessibilityHint(Text(isInputMeterActive
                         ? AppLocalization.string("Shows audio reaching Conduit while the microphone is live.")
@@ -246,12 +251,36 @@ struct VoiceConversationSheet: View {
                 }
 
                 Button { controller.setOutputMuted(!controller.isOutputMuted) } label: {
-                    Label(controller.isOutputMuted ? AppLocalization.string("Unmute") : AppLocalization.string("Mute"), systemImage: controller.isOutputMuted ? "speaker.slash.fill" : "speaker.wave.2.fill")
+                    Label(controller.isOutputMuted ? AppLocalization.string("Unmute") : AppLocalization.string("Mute"), systemImage: controller.isOutputMuted ? LiveVoiceCallButton.silencedSymbol : LiveVoiceCallButton.silenceSymbol)
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 6).frame(minHeight: 48)
                 }
                 .conduitGlassControl(cornerRadius: 17, tint: controller.isOutputMuted ? .orange.opacity(0.18) : .conduitAura.opacity(0.14))
                 .accessibilityHint("Mutes assistant audio without changing chat messages")
+
+                if let appState, showsPhoto {
+                    VoicePhotoButton(appState: appState) { open in
+                        Button(action: open) {
+                            Label(AppLocalization.string("Camera"), systemImage: "camera.fill")
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 6).frame(minHeight: 48)
+                        }
+                        .conduitGlassControl(cornerRadius: 17, tint: .conduitAura.opacity(0.14))
+                        .accessibilityLabel(AppLocalization.string("Take a photo"))
+                        .accessibilityHint(AppLocalization.string("Adds a photo to the chat for your next question"))
+                    }
+                }
+
+                if callSpeaker.isShown {
+                    Button { VoiceAudioSessionCoordinator.shared.setNativeCallSpeaker(!callSpeaker.isOn) } label: {
+                        Label(AppLocalization.string("Speaker"), systemImage: "speaker.wave.3.fill")
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 6).frame(minHeight: 48)
+                    }
+                    .conduitGlassControl(cornerRadius: 17, tint: callSpeaker.isOn ? .conduitAccent.opacity(0.4) : .conduitAura.opacity(0.14))
+                    .accessibilityValue(callSpeaker.isOn ? Text("On") : Text("Off"))
+                    .accessibilityHint(Text("Plays the call on the loudspeaker"))
+                }
             }
             Text(controller.isPushToTalkActive
                 ? AppLocalization.string("Hold to talk, let go to send. Close ends the voice session.")
@@ -260,6 +289,10 @@ struct VoiceConversationSheet: View {
                 .foregroundStyle(.secondary)
         }
     }
+
+    /// The Camera, on a device that has one: the photo waits on the chat
+    /// for the next turn (`AppState.addVoicePhoto`).
+    private var showsPhoto: Bool { appState != nil && CameraCapture.isAvailable }
 
     private var profileDisplayName: String {
         if let appState { return appState.profileDisplayName(profile) }
@@ -289,10 +322,6 @@ struct VoiceConversationSheet: View {
         case .listening, .thinking, .speaking, .muted: return true
         case .idle, .transcribing, .failed: return false
         }
-    }
-
-    private var inputMeterLevel: Float {
-        isInputMeterActive ? controller.microphoneLevel : 0
     }
 
     private var microphoneLabel: String {
@@ -589,10 +618,13 @@ extension VoiceConversationSheet {
             .padding(.horizontal, 24)
             .padding(.top, 20)
             Spacer(minLength: 16)
-            V2CallLevelBars(
-                phase: callPhase,
-                inputFraction: isInputMeterActive ? VoiceLevelMeterMath.displayFraction(forLevel: controller.microphoneLevel) : nil
-            )
+            let meterActive = isInputMeterActive
+            VoiceMicrophoneLevelReader(meter: controller.microphoneMeter) { level in
+                V2CallLevelBars(
+                    phase: callPhase,
+                    inputFraction: meterActive ? VoiceLevelMeterMath.displayFraction(forLevel: level) : nil
+                )
+            }
             .frame(height: 96)
             .padding(.horizontal, 28)
             .accessibilityHidden(true)
@@ -695,8 +727,11 @@ extension VoiceConversationSheet {
                 )
                 .disabled(controller.state == .transcribing)
             }
+            if callSpeaker.isShown {
+                NativeCallSpeakerButton(speaker: callSpeaker)
+            }
             LiveVoiceCallButton(
-                symbol: controller.isOutputMuted ? "speaker.slash.fill" : "speaker.wave.2.fill",
+                symbol: controller.isOutputMuted ? LiveVoiceCallButton.silencedSymbol : LiveVoiceCallButton.silenceSymbol,
                 title: controller.isOutputMuted ? AppLocalization.string("Sound on") : AppLocalization.string("Silence"),
                 style: controller.isOutputMuted ? .selected : .normal,
                 voiceOverLabel: controller.isOutputMuted
@@ -704,6 +739,9 @@ extension VoiceConversationSheet {
                     : AppLocalization.string("Silence the assistant"),
                 action: { controller.setOutputMuted(!controller.isOutputMuted) }
             )
+            if let appState, showsPhoto {
+                LiveVoiceCallPhotoButton(appState: appState)
+            }
             LiveVoiceCallButton(
                 symbol: "text.bubble.fill",
                 title: AppLocalization.string("Transcript"),
@@ -721,6 +759,8 @@ extension VoiceConversationSheet {
             )
         }
         .frame(maxWidth: .infinity)
+        // Microphone, Silence, Transcript, End, the Camera, and Speaker in a call.
+        .modifier(LiveVoiceCallButtonRowFit(slots: 4 + (callSpeaker.isShown ? 1 : 0) + (showsPhoto ? 1 : 0)))
         .padding(.horizontal, 12)
         .padding(.top, 14)
         .padding(.bottom, 12)
@@ -899,6 +939,8 @@ struct VoiceApprovalPanel: View {
                         ClarifyCard(message: message)
                     } else if message.inputPrompt != nil {
                         InputPromptCard(message: message)
+                    } else if message.connection != nil {
+                        ConnectionCard(message: message)
                     } else {
                         ApprovalCard(message: message)
                     }
@@ -910,4 +952,13 @@ struct VoiceApprovalPanel: View {
         }
         .animation(ConduitMotion.ease(reduceMotion: reduceMotion), value: approvals.first?.id)
     }
+}
+
+/// Draws `content` with the classic voice meter's level, so a tick
+/// re-renders only it, not the sheet around it (issue 1970).
+struct VoiceMicrophoneLevelReader<Content: View>: View {
+    @ObservedObject var meter: VoiceMicrophoneMeter
+    @ViewBuilder let content: (Float) -> Content
+
+    var body: some View { content(meter.level) }
 }
