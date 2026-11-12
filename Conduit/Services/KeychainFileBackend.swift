@@ -191,12 +191,15 @@ extension KeychainHelper {
             let directory = url.deletingLastPathComponent()
             if !manager.fileExists(atPath: directory.path) {
                 try manager.createDirectory(at: directory, withIntermediateDirectories: true)
-                var values = URLResourceValues()
-                values.isExcludedFromBackup = true
-                var excluded = directory
-                try? excluded.setResourceValues(values)
             }
             try manager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+            // An existing directory may come from an older build or a
+            // restore. Reapply the privacy flag on every write, and refuse
+            // to save credentials if setting it fails.
+            var excluded = URL(fileURLWithPath: directory.path, isDirectory: true)
+            var values = URLResourceValues()
+            values.isExcludedFromBackup = true
+            try excluded.setResourceValues(values)
             let encoder = PropertyListEncoder()
             encoder.outputFormat = .binary
             // Made owner-only before any record is in it, then swapped in whole.

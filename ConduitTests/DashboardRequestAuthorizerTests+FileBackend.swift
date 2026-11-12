@@ -90,7 +90,28 @@ extension DashboardRequestAuthorizerTests {
         let folder = url.deletingLastPathComponent()
         let folderMode = try XCTUnwrap(FileManager.default.attributesOfItem(atPath: folder.path)[.posixPermissions] as? NSNumber)
         XCTAssertEqual(folderMode.intValue & 0o777, 0o700)
-        XCTAssertEqual(try folder.resourceValues(forKeys: [.isExcludedFromBackupKey]).isExcludedFromBackup, true)
+        // Resource values are cached per URL; read the actual folder
+        // through a fresh URL, as the backup-exclusion tests elsewhere do.
+        let fresh = URL(fileURLWithPath: folder.path, isDirectory: true)
+        XCTAssertEqual(try fresh.resourceValues(forKeys: [.isExcludedFromBackupKey]).isExcludedFromBackup, true)
+    }
+
+    func testFileBackendReappliesBackupExclusionToAnExistingFolder() throws {
+        let url = credentialsURL()
+        let folder = url.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        try (folder as NSURL).setResourceValue(false, forKey: .isExcludedFromBackupKey)
+        let backend = KeychainHelper.FileBackend(url: url)
+        XCTAssertEqual(backend.add(adding(Data("one".utf8), to: scoped("a"))), errSecSuccess)
+        var fresh = URL(fileURLWithPath: folder.path, isDirectory: true)
+        XCTAssertEqual(try fresh.resourceValues(forKeys: [.isExcludedFromBackupKey]).isExcludedFromBackup, true)
+
+        // A restore or another writer may remove the flag between saves.
+        try (fresh as NSURL).setResourceValue(false, forKey: .isExcludedFromBackupKey)
+        XCTAssertEqual(backend.update(Data("two".utf8), for: scoped("a")), errSecSuccess)
+        fresh = URL(fileURLWithPath: folder.path, isDirectory: true)
+        XCTAssertEqual(try fresh.resourceValues(forKeys: [.isExcludedFromBackupKey]).isExcludedFromBackup, true)
+        XCTAssertEqual(backend.data(for: scoped("a")), Data("two".utf8))
     }
 
     func testFileBackendUnreadableFileReadsAsEmptyAndIsReplacedOnSave() throws {
