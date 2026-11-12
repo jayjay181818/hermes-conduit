@@ -4,12 +4,12 @@
 
 ## Integration plan
 
-1. Start with a clean working tree and retain the existing Mac branch. Fetch upstream and record the exact commit being integrated.
-2. Merge upstream into a new update branch. Resolve each overlap by retaining both upstream fixes and the desktop behavior; never replace the Mac branch with upstream's iOS tree.
+1. Start with a clean working tree and retain the existing Mac branch. Fetch upstream and read the previously integrated commit from `docs/UPSTREAM_REVISION`; record the new target commit.
+2. Apply the upstream delta from the recorded revision to the new target on an update branch, using a three-way application where needed. Resolve each overlap by retaining both upstream fixes and the desktop behavior; never replace the Mac branch with upstream's iOS tree. A full merge may be used in an isolated preparation branch, while publication remains a clean snapshot commit if the email guard rejects inherited author metadata.
 3. Review new Mac checks and framework APIs even when Git merges them automatically. `ProcessInfo.runsOnMac` includes Catalyst; `isiOSAppOnMac` alone does not.
 4. Preserve single-window behavior, Return and focus rules, pointer handling, System Settings links, sandboxed credential storage, local notifications, Dock badges, and the optimized Release settings. Avoid reconnecting or uploading again on each app switch.
 5. Run source/tooling checks, the selected Catalyst regression suites, and a Release build. Inspect the isolated Debug app for desktop layout, keyboard/focus, app switching, and permission links. Test any account-dependent behavior separately without publishing personal data.
-6. Audit the final diff and new commit metadata for personal identifiers, local paths, credentials and generated artifacts. Push only the update branch and open a PR into `macos-port`.
+6. Update `docs/UPSTREAM_REVISION`, then audit the final diff and new commit metadata for personal identifiers, local paths, credentials and generated artifacts. Push only the update branch and open a PR into `macos-port`.
 
 ## Local verification
 
@@ -34,3 +34,7 @@ A PR is ready only when its reported checks match the final source state. Label 
 ## Fork checks
 
 The fork adds its own Catalyst and Linux source checks. The upstream maintainer's provider-backed review chain is restricted to the upstream repository, so opening a fork PR does not start additional model reviewers or require their secrets.
+
+## Current verified update
+
+Fork PR #1 integrates upstream `20abe51`. Debug and optimized Release builds and signatures passed. Across 11 focused Catalyst suites, 462 tests passed and 2 mobile-only tests were intentionally skipped; the corrected permission suite passed its focused rerun. Debug and Release binary import checks passed. GUI evidence covers an isolated fresh launch and the File menu (New Chat, no New Window); further Computer Use capture was unavailable, so authenticated flows and full desktop interaction are not claimed as verified.
