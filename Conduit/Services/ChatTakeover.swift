@@ -19,7 +19,9 @@ struct ChatTakeoverState: Equatable {
         case offered
         /// The other app is running a turn; Conduit asks again shortly.
         case waiting
-        /// The chat is Conduit's now; the composer sends its draft again.
+        /// The chat is Conduit's now. A typed message an automatic takeover
+        /// kept was sent by Conduit; otherwise the composer sends its draft
+        /// again.
         case ready
         /// Taking over failed; the message says why. Tapping again retries.
         case failed(String)
@@ -40,7 +42,8 @@ struct ChatTakeoverState: Equatable {
     var surface: String?
     /// The text whose send was refused. The composer only resends after a
     /// takeover when its draft is this message, so a refused voice or other
-    /// non-composer turn never sends an unrelated draft.
+    /// non-composer turn never sends an unrelated draft. An automatic
+    /// takeover keeps the composer's words for it and sends this itself.
     var refusedText = ""
     var phase: Phase
     /// Changes every time a takeover finishes, so the composer resends once.
@@ -149,6 +152,8 @@ enum ChatTakeoverPreference {
 enum ChatTakeoverError: Error, Equatable {
     /// The plugin predates the takeover route (or isn't installed).
     case pluginMissing
+    /// The profile turned the plugin off: how to turn it on (issue 1671).
+    case pluginOff(String)
     /// The Hermes host has no ownership registry to change.
     case unsupported
     case malformed
@@ -188,16 +193,18 @@ final class ChatTakeoverClient {
 
     func takeOver(sessionIDs: [String], profile: String) async throws -> ChatTakeoverOutcome {
         let body: [String: Any] = ["session_ids": Array(sessionIDs.prefix(Self.maxSessionIDs))]
+        let path = DashboardPath.withProfile(Self.path, profile: profile, parameter: profileParameter())
         do {
-            let response = try await request(DashboardPath.withProfile(Self.path, profile: profile, parameter: profileParameter()), "POST", body)
+            let response = try await request(path, "POST", body)
             return try Self.outcome(from: response)
         } catch let error as DashboardTicketBridgeError {
-            throw Self.mapped(error) ?? error
+            throw Self.mapped(error, path: path) ?? error
         }
     }
 
-    static func mapped(_ error: DashboardTicketBridgeError) -> ChatTakeoverError? {
+    static func mapped(_ error: DashboardTicketBridgeError, path: String? = nil) -> ChatTakeoverError? {
         guard case .http(let status, _) = error else { return nil }
+        if let remedy = DashboardTicketBridgeError.pluginOffDetail(of: error, path: path) { return .pluginOff(remedy) }
         switch status {
         case 404, 405: return .pluginMissing
         case 501: return .unsupported
@@ -218,6 +225,22 @@ final class ChatTakeoverClient {
         default: throw ChatTakeoverError.malformed
         }
     }
+}
+
+/// A typed message refused while another app held its chat, kept by an
+/// automatic takeover and sent by Conduit once the chat is its own (issue
+/// 2140). If the takeover doesn't happen, its words go back to the
+/// composer.
+struct ChatTakeoverHeldMessage: Equatable {
+    /// The takeover it waits for.
+    let sessionID: String
+    /// Every id the chat goes by: it's sent only while that chat is open.
+    let sessionIDs: [String]
+    /// Exactly what Hermes refused, sent again as it was.
+    let text: String
+    /// Its words, attachments and quoted reply as they go back into the
+    /// composer, and the draft they belong to.
+    let restore: ComposerRestoreRequest
 }
 
 extension ChatTakeoverState {

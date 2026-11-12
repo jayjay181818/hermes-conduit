@@ -100,6 +100,9 @@ struct ComposerPasteTextView: UIViewRepresentable {
     /// press consumed; a declined action keeps the default text behavior.
     /// ComposerBar stays the owner of the actual send/steer/interrupt action.
     var onSubmitFromReturn: (() -> Bool)? = nil
+    /// The slash or mention suggestions over the field, while they show:
+    /// arrows, Tab, Escape and a highlighted Return are theirs.
+    var suggestionKeys: ComposerSuggestionKeys? = nil
     /// Invoked synchronously from `textViewDidChange` — the earliest
     /// authoritative point a text mutation is known to be genuine user input
     /// (typing, deletion, paste), after the active/programmatic guards and
@@ -145,6 +148,7 @@ struct ComposerPasteTextView: UIViewRepresentable {
         view.returnKeySends = returnKeySends
         view.canSubmitFromReturn = canSubmitFromReturn
         view.onSubmitFromReturn = onSubmitFromReturn
+        view.suggestionKeys = suggestionKeys
         return view
     }
 
@@ -179,10 +183,9 @@ struct ComposerPasteTextView: UIViewRepresentable {
         )
         // Layout is requested on text change and editability flip only;
         // bounds changes re-layout automatically through layoutSubviews.
-        if uiView.isEditable != enabled {
-            uiView.isEditable = enabled
-            uiView.setNeedsLayout()
-        }
+        // Off under focus, the field keeps the composer's wish for it and
+        // takes focus back once on again (issue 2208).
+        uiView.setTyping(enabled)
         uiView.editorIdentity = editorIdentity
         uiView.onContentHeightChange = { height in
             context.coordinator.updateMeasuredHeight(height)
@@ -191,12 +194,17 @@ struct ComposerPasteTextView: UIViewRepresentable {
         uiView.onPastedImageError = onPastedImageError
         uiView.onDroppedFiles = onDroppedFiles
         uiView.onLongTextPaste = onLongTextPaste
+        uiView.onFocusTakenWhileOff = { [weak coordinator = context.coordinator] in
+            guard let coordinator, coordinator.isActive, coordinator.parent.isFocused else { return }
+            coordinator.parent.isFocused = false
+        }
         uiView.returnKeySends = returnKeySends
         uiView.canSubmitFromReturn = canSubmitFromReturn
         uiView.onSubmitFromReturn = onSubmitFromReturn
-        // A field rebuilt with focus (a send on a Mac keeps it) is first
-        // updated before it's in the window, where it can't take focus: it
-        // takes it once it is (didMoveToWindow).
+        uiView.suggestionKeys = suggestionKeys
+        // Applied after this update, never inside it (issue 1781); a field
+        // rebuilt with focus (a send on a Mac keeps it) takes it once it's
+        // in the window.
         uiView.setFocusIntent(isFocused)
     }
 
@@ -246,7 +254,12 @@ struct ComposerPasteTextView: UIViewRepresentable {
         }
         func textViewDidEndEditing(_ textView: UITextView) {
             guard isActive, !isApplyingProgrammaticState else { return }
-            parent.isFocused = false
+            // Typing turned off under focus (a sync after the reply) keeps
+            // the wish, so a Mac's field is focused again once it's on
+            // (issue 2208).
+            if (textView as? ReturnKeyTextView)?.endedEditingLeavesField ?? true {
+                parent.isFocused = false
+            }
             flushPendingProgrammaticIfCompositionEnded(textView)
         }
 
@@ -349,14 +362,15 @@ struct ComposerPasteTextView: UIViewRepresentable {
                 textView.onPastedImageError = nil
                 textView.onDroppedFiles = nil
                 textView.onLongTextPaste = nil
-                textView.focusesInWindow = false
+                textView.onFocusTakenWhileOff = nil
                 textView.returnKeySends = false
                 textView.canSubmitFromReturn = false
                 textView.onSubmitFromReturn = nil
+                textView.suggestionKeys = nil
             }
-            if textView.isFirstResponder {
-                textView.resignFirstResponder()
-            }
+            // Dismantling is part of a SwiftUI update: focus is let go
+            // after it, as every focus change is (issue 1781).
+            (textView as? ReturnKeyTextView)?.setFocusIntent(false)
         }
 
         /// A deferred intentional replacement lands at the first
@@ -433,24 +447,7 @@ final class ImagePasteTextView: ReturnKeyTextView {
     var boundsContentSizeCategory: UIContentSizeCategory?
     var boundsColumnText: ColumnText?
     var maximumReportedHeight: CGFloat = 160
-    /// The composer wants focus: taken when the view reaches a window.
-    var focusesInWindow = false
     private var lastReportedHeight: CGFloat = 0
-
-    override func didMoveToWindow() {
-        super.didMoveToWindow()
-        if focusesInWindow, window != nil, !isFirstResponder { becomeFirstResponder() }
-    }
-
-    /// Takes or gives up focus as the composer asks; out of a window, the
-    /// wish waits for `didMoveToWindow`. Synchronous inside `updateUIView`,
-    /// as these calls were before #1527: a change UIKit refuses there is
-    /// asked again on the next update, since the binding still says so.
-    func setFocusIntent(_ wantsFocus: Bool) {
-        focusesInWindow = wantsFocus
-        if wantsFocus, !isFirstResponder, window != nil { becomeFirstResponder() }
-        if !wantsFocus, isFirstResponder { _ = resignFirstResponder() }
-    }
 
     override init(frame: CGRect, textContainer: NSTextContainer?) {
         super.init(frame: frame, textContainer: textContainer)
@@ -557,6 +554,21 @@ final class ImagePasteTextView: ReturnKeyTextView {
         }
     }
 
+    /// The chat composer stages files dropped on its field itself, so a
+    /// lone picture keeps the picture paste; with no composer to take
+    /// them, the chat around the field does.
+    override var takesDroppedFiles: Bool { onDroppedFiles != nil }
+
+    override func takeDroppedFiles(_ providers: [NSItemProvider]) {
+        let files = AttachmentDrop.files(in: providers)
+        if AttachmentDrop.stagesAsFiles(providers) {
+            onDroppedFiles?(files)
+        } else {
+            // A lone picture: the picture paste below.
+            paste(itemProviders: files)
+        }
+    }
+
     override func paste(itemProviders: [NSItemProvider]) {
         // Dropped files (Finder, Files) attach as picked files do; words
         // and links among them go into the text, and a lone image keeps
@@ -614,7 +626,7 @@ final class ImagePasteTextView: ReturnKeyTextView {
         // during compilation even though UIImage supports this API.
         provider.loadObject(ofClass: UIImage.self) { [weak self] (object: NSItemProviderReading?, error: Error?) in
             guard let image = object as? UIImage,
-                  let data = image.pngData(),
+                  let data = ProviderPicture.pngData(image),
                   !data.isEmpty else {
                 self?.reportImageLoadFailure(
                     error ?? fallbackError,
@@ -639,7 +651,7 @@ final class ImagePasteTextView: ReturnKeyTextView {
         let pastedImage: PastedImage
         if typeIdentifier == UTType.image.identifier {
             guard let image = UIImage(data: data),
-                  let normalizedData = image.pngData(),
+                  let normalizedData = ProviderPicture.pngData(image),
                   !normalizedData.isEmpty else {
                 reportImageNormalizationFailure(editorIdentity: pasteEditorIdentity)
                 return

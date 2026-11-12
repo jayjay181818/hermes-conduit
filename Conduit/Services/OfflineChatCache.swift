@@ -399,6 +399,23 @@ struct OfflineChatPresentation: Equatable {
     var displayedSessionID: String? { displayedTranscript?.sessionID }
 }
 
+/// Where a page that reads Hermes through its own service (Voice
+/// settings, Capabilities, the Tasks board) keeps the answers on the
+/// phone, so it opens on what it showed last time while it asks again
+/// (#1533). AppState's `voiceSettingsAnswers` and `screenAnswers` keep
+/// them with the other settings pages', per dashboard and profile.
+struct KeptAnswers {
+    /// The answer kept for a route, or nil.
+    let kept: @MainActor (_ route: String) -> [String: Any]?
+    /// Runs a read, or a save answering with what it wrote (`writes`), and
+    /// keeps its answer for the route, unless an answer newer than it is
+    /// kept by then.
+    let keep: @MainActor (_ route: String, _ writes: Bool, _ read: () async throws -> [String: Any]) async throws -> [String: Any]
+    /// Counts a write that left nothing to keep for the route, so the
+    /// answer to a read asked before it isn't kept after it.
+    var noteWrite: @MainActor (_ route: String) -> Void = { _ in }
+}
+
 /// File-backed store. Per (dashboard, profile): an index, a file for each
 /// saved conversation's rows and one for the Chats list, all JSON written
 /// atomically with complete-until-first-user-authentication protection and
@@ -592,6 +609,34 @@ final class OfflineChatCacheStore {
         }
     }
 
+    /// `loadTranscript` off the main thread (issue 1826): a copy kept in
+    /// memory, or a store that works on its caller (tests), answers at once;
+    /// any other is read and decoded on the store's queue and handed to
+    /// `completion` on the main queue, or nil when a removal (a deleted
+    /// chat, a wipe) ran meanwhile.
+    @MainActor
+    func readTranscript(
+        _ sessionID: String,
+        dashboardID: UUID,
+        profile: String,
+        completion: @escaping @MainActor (OfflineCachedTranscript?) -> Void
+    ) {
+        let url = transcriptFileURL(sessionID, dashboardID: dashboardID, profile: profile)
+        guard let ioQueue, memoryLock.withLock({ keptTranscripts[url] == nil }) else {
+            completion(loadTranscript(sessionID, dashboardID: dashboardID, profile: profile))
+            return
+        }
+        let removalsBefore = removals
+        ioQueue.async { [self] in
+            let transcript = loadTranscript(sessionID, dashboardID: dashboardID, profile: profile)
+            // Weighed on the main queue, after any removal the main thread
+            // made while the file was read.
+            DispatchQueue.main.async { [self] in
+                completion(removals == removalsBefore ? transcript : nil)
+            }
+        }
+    }
+
     /// Keeps a copy as the most recently used, then lets the least recently
     /// used go past `maxKeptTranscripts` or `maxKeptTranscriptBytes` (the
     /// newest always stays). Under `memoryLock`.
@@ -677,6 +722,21 @@ final class OfflineChatCacheStore {
         return snapshot
     }
 
+    /// The rows a copy keeps: the last `maxMessagesPerTranscript` that are
+    /// saved at all, mapped from the end, so a long transcript maps only
+    /// what is kept (issue 1725).
+    static func keptRows(of messages: [ChatMessage]) -> [OfflineCachedMessage] {
+        var rows: [OfflineCachedMessage] = []
+        rows.reserveCapacity(min(messages.count, maxMessagesPerTranscript))
+        for message in messages.reversed() {
+            guard let row = OfflineCachedMessage(message) else { continue }
+            rows.append(row)
+            if rows.count == maxMessagesPerTranscript { break }
+        }
+        rows.reverse()
+        return rows
+    }
+
     /// Records the newest page of `messages` (moved to the front of the
     /// recent list) together with the current session list.
     ///
@@ -700,16 +760,16 @@ final class OfflineChatCacheStore {
         sessions: [SessionSummary],
         now: Date = Date()
     ) {
-        let rows = Array(messages.compactMap(OfflineCachedMessage.init)
-            .suffix(Self.maxMessagesPerTranscript))
+        let rows = Self.keptRows(of: messages)
         guard !rows.isEmpty else { return }
-        let catalogRows = sessions
-            .filter { $0.source != .cron && !$0.isArchived }
-            .map(OfflineCachedSession.init)
         perform { [self] in
             let signposter = ResponsivenessSignposts.signposter
             let saving = signposter.beginInterval("Save chat copy", id: signposter.makeSignpostID())
             defer { signposter.endInterval("Save chat copy", saving) }
+            // On the store's queue: the caller is the main thread.
+            let catalogRows = sessions
+                .filter { $0.source != .cron && !$0.isArchived }
+                .map(OfflineCachedSession.init)
             recordRows(
                 rows,
                 dashboardID: dashboardID,
@@ -833,8 +893,10 @@ final class OfflineChatCacheStore {
             // Its rows go even if the index couldn't be rewritten: a listed
             // copy with no file just doesn't show.
             removeTranscriptFiles(allIdentities, dashboardID: dashboardID, profile: profile)
+            removeLastOpenedAnswers(about: allIdentities, dashboardID: dashboardID, profile: profile)
         } else {
             removeTranscriptFiles(ids, dashboardID: dashboardID, profile: profile)
+            removeLastOpenedAnswers(about: ids, dashboardID: dashboardID, profile: profile)
         }
         if var list = loadChatList(dashboardID: dashboardID, profile: profile) {
             let isDeleted: (SessionSummary) -> Bool = { !ids.isDisjoint(with: $0.nestingIDs) }
@@ -850,6 +912,37 @@ final class OfflineChatCacheStore {
             keepInMemory(list, in: \.keptChatLists, at: url)
             writeChatList(list, to: url)
         }
+    }
+
+    /// The scope's answers about the chats deleted (a chat's own Artifacts
+    /// list), so their titles and file names don't stay on the phone until
+    /// newer answers push them out. On the store's queue after the removal,
+    /// as each file is read for its route; a read asked before the removal
+    /// keeps nothing after it (`removals`).
+    private func removeLastOpenedAnswers(about sessionIDs: Set<String>, dashboardID: UUID, profile: String) {
+        let prefix = Self.scopeFileStem(dashboardID: dashboardID, profile: profile) + Self.lastOpenedAnswerInfix
+        perform { [self] in
+            guard let files = try? fileManager.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil) else {
+                return
+            }
+            let gone = Set(files.filter { file in
+                guard file.lastPathComponent.hasPrefix(prefix), let read = Self.readKeptAnswer(at: file) else { return false }
+                return !Self.sessionIDs(namedIn: read.route).isDisjoint(with: sessionIDs)
+            })
+            guard !gone.isEmpty else { return }
+            forgetMemory { gone.contains($0) }
+            for file in gone { try? fileManager.removeItem(at: file) }
+        }
+    }
+
+    /// The chats a kept route is about: its query's `session_id=` values.
+    static func sessionIDs(namedIn route: String) -> Set<String> {
+        guard let query = route.split(separator: "?", maxSplits: 1).dropFirst().first else { return [] }
+        return Set(query.split(separator: "&").compactMap { pair -> String? in
+            let parts = pair.split(separator: "=", maxSplits: 1)
+            guard parts.count == 2, parts[0] == "session_id" else { return nil }
+            return String(parts[1]).removingPercentEncoding
+        })
     }
 
     private func removeTranscriptFiles(_ sessionIDs: Set<String>, dashboardID: UUID, profile: String) {
@@ -1044,6 +1137,17 @@ final class OfflineChatCacheStore {
     static let maxKeptAnswersInMemory = 32
     static let maxKeptAnswerMemoryBytes = 8 * 1024 * 1024
     static let keptAnswerInfix = ".answer-"
+    /// A route under this prefix is about one chat or folder of many (a
+    /// chat's own Artifacts list, a folder's listing): the scope keeps the
+    /// `maxLastOpenedAnswers` such answers written last, within
+    /// `maxLastOpenedAnswerBytes`, as it keeps the saved copies, and never
+    /// reads them ahead, so they don't take the room a settings page's
+    /// answer would. One about a chat names it by `session_id=` in its
+    /// query, so deleting the chat takes it.
+    static let lastOpenedRoutePrefix = "last-opened:"
+    static let lastOpenedAnswerInfix = ".opened-answer-"
+    static let maxLastOpenedAnswers = 100
+    static let maxLastOpenedAnswerBytes = 16 * 1024 * 1024
 
     /// The answer last kept for the route in the scope, or nil: memory's
     /// when it has it (the open profile's are read ahead), else its file's.
@@ -1065,11 +1169,14 @@ final class OfflineChatCacheStore {
     /// Keeps a screen's answer for the route: memory has it at once, and
     /// the file is written on the store's queue, so a removal after this
     /// takes it too. Memory and the file both leave out credentials
-    /// (`withoutCredentials`), and one too big to keep leaves memory again
-    /// once the queue has measured it.
-    func recordAnswer(_ answer: [String: Any], route: String, dashboardID: UUID, profile: String) {
+    /// (`withoutCredentials`, keeping the keys of the objects under
+    /// `namesUnder`), and one too big to keep leaves memory again once the
+    /// queue has measured it.
+    func recordAnswer(
+        _ answer: [String: Any], route: String, dashboardID: UUID, profile: String, namesUnder names: Set<String> = []
+    ) {
         let url = keptAnswerFileURL(route, dashboardID: dashboardID, profile: profile)
-        let kept = Self.withoutCredentials(answer)
+        let kept = Self.withoutCredentials(answer, namesUnder: names)
         let generation = memoryLock.withLock { () -> UInt64 in
             keepAnswerLocked(kept, at: url, bytes: nil)
             keptAnswerGeneration &+= 1
@@ -1093,32 +1200,62 @@ final class OfflineChatCacheStore {
     /// An answer without its credential-shaped keys, at any depth: any key
     /// (`api_key`, `ssh_key`, `api_keys`), a token, a password, passphrase or
     /// secret, credentials, an Authorization header, auth or a cookie (a
-    /// config can hold them, as a custom endpoint's `api_key`), and without
-    /// the user and password a URL can carry. A key shaped like one whose
-    /// value is true or false stays: it's a setting about them
-    /// (`redact_secrets`). No screen shows a credential, and a key to an
-    /// account mustn't sit in a file; a name that only looks like one
-    /// (`sort_key`) comes back with Hermes' answer.
-    static func withoutCredentials(_ answer: [String: Any]) -> [String: Any] {
-        answer.reduce(into: [String: Any]()) { kept, entry in
-            guard !isCredentialKey(entry.key) || isFlag(entry.value) else { return }
-            kept[entry.key] = withoutCredentials(inValue: entry.value)
+    /// config can hold them, as a custom endpoint's `api_key`), a pair's
+    /// value when its name is one of those (`{"name": "Authorization",
+    /// "value": …}`), and without the user and password a URL can carry or
+    /// a credential in its query (`?api_key=…`). A key shaped like one
+    /// whose value is true or false stays: it's a setting about them
+    /// (`redact_secrets`); so does a count under a name ending in tokens
+    /// (`max_tokens`), or in a pair so named, a `key` naming that count
+    /// (`{"key": "max_tokens", "value": 4096}`), and a `key` beside
+    /// `is_set`, which names the variable whose presence that reports
+    /// (Hermes' rows of keys). No screen shows a credential, and a key to an account
+    /// mustn't sit in a file; a name that only looks like one (`sort_key`)
+    /// comes back with Hermes' answer. The objects under `namesUnder` are
+    /// keyed by names, not values (a schema's `fields`, by config path), so
+    /// their keys stay and what's under each is filtered.
+    static func withoutCredentials(_ answer: [String: Any], namesUnder names: Set<String> = []) -> [String: Any] {
+        let credentialName = ["name", "key"].lazy.compactMap { answer[$0] as? String }.first(where: isCredentialKey)
+        // Its `key` names what it reports: a variable's presence (`is_set`),
+        // or the count it holds.
+        let keyNamesNoCredential = (answer["is_set"].map(isFlag) ?? false)
+            || (credentialName.flatMap { name in answer["value"].map { isCount($0, named: name) } } ?? false)
+        return answer.reduce(into: [String: Any]()) { kept, entry in
+            if names.contains(entry.key), let named = entry.value as? [String: Any] {
+                kept[entry.key] = named.mapValues { withoutCredentials(inValue: $0) }
+            } else if !holdsCredential(entry.key, entry.value, credentialName: credentialName, keyNamesNoCredential: keyNamesNoCredential) {
+                kept[entry.key] = withoutCredentials(inValue: entry.value)
+            }
         }
+    }
+
+    /// Whether an object's entry is a credential, in an object whose `name`
+    /// or `key` is a credential's (`credentialName`), or whose `key` names
+    /// a variable's presence (`is_set`) or a count it holds.
+    private static func holdsCredential(_ key: String, _ value: Any, credentialName: String?, keyNamesNoCredential: Bool) -> Bool {
+        if isFlag(value) { return false }
+        if key == "value" { return credentialName.map { !isCount(value, named: $0) } ?? false }
+        guard isCredentialKey(key) else { return false }
+        return !isCount(value, named: key) && !(key == "key" && keyNamesNoCredential)
+    }
+
+    /// A number under a name ending in tokens (`max_tokens`): a count.
+    private static func isCount(_ value: Any, named name: String) -> Bool {
+        value is NSNumber && name.lowercased().hasSuffix("tokens")
     }
 
     private static func withoutCredentials(inValue value: Any) -> Any {
         if let object = value as? [String: Any] { return withoutCredentials(object) }
         if let list = value as? [Any] { return list.map { withoutCredentials(inValue: $0) } }
-        if let text = value as? String { return withoutURLUser(text) }
+        if let text = value as? String { return withoutURLCredentials(text) }
         return value
     }
 
     /// Names that end like a credential's, with or without the underscore:
-    /// `signing_key`, `apikeys`, `GITHUB_TOKEN`, `clientSecret`,
-    /// `session_cookie`, `proxy_authorization`, `basic_auth`. Not `tokens`:
-    /// `max_tokens` is a number.
+    /// `signing_key`, `apikeys`, `GITHUB_TOKEN`, `access_tokens`,
+    /// `clientSecret`, `session_cookie`, `proxy_authorization`, `basic_auth`.
     private static let credentialKeySuffixes = [
-        "key", "keys", "token", "secret", "secrets", "cookie", "cookies", "auth", "authorization",
+        "key", "keys", "token", "tokens", "secret", "secrets", "cookie", "cookies", "auth", "authorization",
     ]
     /// Words that make any name a credential's.
     private static let credentialKeyWords = ["password", "passwd", "passphrase", "credential"]
@@ -1137,15 +1274,58 @@ final class OfflineChatCacheStore {
         return CFGetTypeID(number) == CFBooleanGetTypeID()
     }
 
-    /// The URL without its user and password (`https://user:key@host`), or
-    /// the text as it was.
-    private static func withoutURLUser(_ text: String) -> String {
-        guard text.contains("@"), text.contains("://"),
-              var components = URLComponents(string: text),
-              components.user != nil || components.password != nil else { return text }
+    /// The URL without its user and password (`https://user:key@host`) and
+    /// a credential in its query (`?api_key=…`), or the text as it was.
+    /// Text with a space or a line break in it is prose, or a URL typed
+    /// with one, never for the parser: since iOS 17 it takes such text by
+    /// escaping the space, and an address in the prose after a URL becomes
+    /// the host, everything before it the user and password.
+    private static func withoutURLCredentials(_ text: String) -> String {
+        guard text.contains("://"), text.contains("@") || text.contains("?") else { return text }
+        guard !text.contains(where: \.isWhitespace), var components = URLComponents(string: text) else {
+            return withoutUnparsedURLCredentials(text)
+        }
+        let query = components.queryItems ?? []
+        let keptQuery = query.filter { !isCredentialKey($0.name) }
+        guard components.user != nil || components.password != nil || keptQuery.count < query.count else { return text }
         components.user = nil
         components.password = nil
+        if keptQuery.count < query.count { components.queryItems = keptQuery.isEmpty ? nil : keptQuery }
         return components.string ?? ""
+    }
+
+    /// A user and password after a `://`, up to the `@` before the host. A
+    /// password may hold a space, as a URL typed with one does, and an `@`
+    /// with no space after it before the next `@`: a host never holds a
+    /// space, so prose after a URL (an address in it included) stays. A
+    /// password never runs past the line's end, nor starts with a space
+    /// (`example.com: mail me@…`) or a port, a number the host's colon
+    /// leads to that ends before a word does (`localhost:8080 and mail
+    /// me@…`). So a password with a space in it that starts with a number
+    /// reads as a port and prose and stays: the two can't be told apart,
+    /// and a port is the likelier.
+    private static let unparsedUserInfo = try! NSRegularExpression(
+        pattern: #"(?<=://)(?:[^/?#\s@:]*:(?!\d+(?:[^\w@]|$))(?:[^/?#@\s][^/?#@\r\n]*)?|[^/?#\s@]*)(?:@[^/?#@\s]*)*@"#
+    )
+    /// A query's name, with its `=`.
+    private static let unparsedQueryName = try! NSRegularExpression(pattern: #"(?<=[?&])([^=&#\s]+)="#)
+
+    /// Text with a space in it, or that the URL parser rejects, loses the
+    /// same by pattern: any user and password, and a credential's value in
+    /// a query, its name left. That value runs to the next `&` or `#`, or
+    /// the end of the line, a space in it included.
+    private static func withoutUnparsedURLCredentials(_ text: String) -> String {
+        var kept = unparsedUserInfo.stringByReplacingMatches(
+            in: text, range: NSRange(text.startIndex..., in: text), withTemplate: ""
+        )
+        let names = unparsedQueryName.matches(in: kept, range: NSRange(kept.startIndex..., in: kept))
+        for match in names.reversed() {
+            guard let name = Range(match.range(at: 1), in: kept), isCredentialKey(String(kept[name])),
+                  let item = Range(match.range, in: kept) else { continue }
+            let end = kept[item.upperBound...].firstIndex { $0 == "&" || $0 == "#" || $0.isNewline } ?? kept.endIndex
+            kept.removeSubrange(item.upperBound..<end)
+        }
+        return kept
     }
 
     /// Deletes a profile's kept answers on one dashboard, as its profile is
@@ -1153,12 +1333,14 @@ final class OfflineChatCacheStore {
     func removeKeptAnswers(dashboardID: UUID, profile: String) {
         performAndWait {
             noteRemoval()
-            let prefix = Self.scopeFileStem(dashboardID: dashboardID, profile: profile) + Self.keptAnswerInfix
-            forgetMemory { $0.lastPathComponent.hasPrefix(prefix) }
+            let stem = Self.scopeFileStem(dashboardID: dashboardID, profile: profile)
+            let prefixes = [Self.keptAnswerInfix, Self.lastOpenedAnswerInfix].map { stem + $0 }
+            let isKept = { (file: URL) in prefixes.contains { file.lastPathComponent.hasPrefix($0) } }
+            forgetMemory(where: isKept)
             guard let files = try? fileManager.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil) else {
                 return
             }
-            for file in files where file.lastPathComponent.hasPrefix(prefix) {
+            for file in files where isKept(file) {
                 try? fileManager.removeItem(at: file)
             }
         }
@@ -1176,6 +1358,12 @@ final class OfflineChatCacheStore {
             // Not kept: an older answer mustn't open the screen next time.
             try? fileManager.removeItem(at: url)
             return nil
+        }
+        if let infix = url.lastPathComponent.range(of: Self.lastOpenedAnswerInfix) {
+            Self.removeOldestFiles(
+                prefix: String(url.lastPathComponent[..<infix.upperBound]), in: directory,
+                beyond: Self.maxLastOpenedAnswers, bytes: Self.maxLastOpenedAnswerBytes, fileManager: fileManager
+            )
         }
         return data.count
     }
@@ -1260,7 +1448,8 @@ final class OfflineChatCacheStore {
     /// any text.
     func keptAnswerFileURL(_ route: String, dashboardID: UUID, profile: String) -> URL {
         let name = SHA256.hash(data: Data(route.utf8)).prefix(16).map { String(format: "%02x", $0) }.joined()
-        return directory.appendingPathComponent("\(Self.scopeFileStem(dashboardID: dashboardID, profile: profile))\(Self.keptAnswerInfix)\(name).json")
+        let infix = route.hasPrefix(Self.lastOpenedRoutePrefix) ? Self.lastOpenedAnswerInfix : Self.keptAnswerInfix
+        return directory.appendingPathComponent("\(Self.scopeFileStem(dashboardID: dashboardID, profile: profile))\(infix)\(name).json")
     }
 
     // MARK: Reading ahead
@@ -1298,6 +1487,30 @@ final class OfflineChatCacheStore {
                     prefetchTranscript(entry, dashboardID: dashboardID, profile: profile)
                 }
             }
+        }
+    }
+
+    /// Reads one chat's saved copy into memory off the main thread, as the
+    /// list shows its row, so opening the chat takes the copy from memory
+    /// instead of reading and decoding its file on the main thread
+    /// (issue 1725). Like the read-ahead, only while there is room, and the
+    /// first copy to go.
+    /// `sessionIDs` are the ids the chat's row answers to, the one its copy
+    /// is most likely saved under first; the first one the index lists is
+    /// read.
+    func warmTranscript(_ sessionIDs: [String], dashboardID: UUID, profile: String) {
+        guard let ioQueue, !sessionIDs.isEmpty else { return }
+        // Already in memory under one of its ids, or no room: nothing to do,
+        // without a hop to the store's queue for every row that shows.
+        let urls = sessionIDs.map { transcriptFileURL($0, dashboardID: dashboardID, profile: profile) }
+        guard memoryLock.withLock({ urls.allSatisfy { fitsAheadLocked($0, bytes: 0) } }) else { return }
+        ioQueue.async { [self] in
+            guard memoryLock.withLock({ waitingRemovals == 0 }),
+                  // Only a chat the scope's index lists has a copy to read.
+                  let transcripts = load(dashboardID: dashboardID, profile: profile)?.transcripts,
+                  let entry = sessionIDs.lazy.compactMap({ id in transcripts.first(where: { $0.sessionID == id }) }).first,
+                  (entry.bytes ?? 0) <= Self.maxPrefetchedTranscriptBytes else { return }
+            prefetchTranscript(entry, dashboardID: dashboardID, profile: profile)
         }
     }
 
@@ -1473,22 +1686,33 @@ final class OfflineChatCacheStore {
             return
         }
         guard let infix = url.lastPathComponent.range(of: heldRowsInfix) else { return }
-        let prefix = String(url.lastPathComponent[..<infix.upperBound])
+        removeOldestFiles(
+            prefix: String(url.lastPathComponent[..<infix.upperBound]), in: directory,
+            beyond: maxTranscripts, bytes: maxHeldRowsBytes, fileManager: fileManager
+        )
+    }
+
+    /// Lets go of the oldest files named with `prefix` beyond `count` of
+    /// them or `bytes` in all, by when they were written; the newest
+    /// always stays.
+    private static func removeOldestFiles(
+        prefix: String, in directory: URL, beyond count: Int, bytes limit: Int, fileManager: FileManager
+    ) {
         guard let files = try? fileManager.contentsOfDirectory(
             at: directory,
             includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey]
         ) else { return }
-        let held = files
+        let named = files
             .filter { $0.lastPathComponent.hasPrefix(prefix) }
             .map { file in
                 (file, (try? file.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast)
             }
             .sorted { $0.1 > $1.1 }
         var total = 0
-        for (index, (file, _)) in held.enumerated() {
+        for (index, (file, _)) in named.enumerated() {
             let bytes = (try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
             total += bytes
-            if index >= maxTranscripts || (index > 0 && total > maxHeldRowsBytes) {
+            if index >= count || (index > 0 && total > limit) {
                 try? fileManager.removeItem(at: file)
             }
         }

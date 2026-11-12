@@ -3,10 +3,15 @@
 //  Conduit
 //
 //  Holds the open chat as on screen on the host while its reply runs, so
-//  that reply sends no push (ChatOnScreen.swift).
+//  that reply sends no push (ChatOnScreen.swift), and clears the chat's
+//  notifications from this device once it's on screen (#1579).
 //
 
 import Foundation
+import UserNotifications
+#if canImport(UIKit) && !os(watchOS)
+import UIKit
+#endif
 
 @MainActor
 extension AppState {
@@ -15,10 +20,88 @@ extension AppState {
     /// doesn't take reports.
     var chatOnScreenClaim: ChatOnScreen.Claim? {
         guard chatOnScreenSender != nil || ChatOnScreen.isTaken(by: notifierPlugin),
-              isSceneActive, !showSidebar, activeRoomSurface == nil,
+              let sessionID = chatShownOnScreen else { return nil }
+        return ChatOnScreen.Claim(profile: activeProfile, sessionIDs: chatOwnSessionIDs(for: sessionID))
+    }
+
+    /// The open chat's id while it's on screen: Conduit active, the chat
+    /// live, and neither the list, a group room nor another bot's chat on
+    /// its way (`botChatCoversOpenChat`) covering it.
+    var chatShownOnScreen: String? {
+        guard isSceneActive, !showSidebar, activeRoomSurface == nil, !botChatCoversOpenChat,
               let sessionID = activeSessionId, !sessionID.isEmpty,
               composerChatOnScreen == .live(sessionID) else { return nil }
-        return ChatOnScreen.Claim(profile: activeProfile, sessionIDs: chatOwnSessionIDs(for: sessionID))
+        return sessionID
+    }
+
+    /// The open group room's id while it's on screen: Conduit active, the
+    /// list (or a Bot Chat on its way) not covering it, a screen of it showing (not a hidden tab or a
+    /// page pushed over it), and its messages read from Hermes since it
+    /// opened (a failed read leaves an old or empty transcript). Its bots'
+    /// replies and failed turns name the room (issue 2064), so reading it
+    /// clears them.
+    var roomShownOnScreen: String? {
+        guard isSceneActive, !showSidebar, roomSurfaceShows, !botChatCoversOpenChat, let roomID = activeRoomSurface?.room.roomID,
+              activeRoomSurface?.copy == nil, activeRoomLogRead == roomID else { return nil }
+        return roomID
+    }
+
+    /// A chat or a group room on screen has been read: its notifications
+    /// leave this device's Notification Center, and the Watch's with the
+    /// iPhone's (#1579; a room's, issue 2064). Other devices keep theirs.
+    func clearShownChatNotifications() {
+        // A sheet over the chat (Settings, a voice sheet, the chat's own
+        // Artifacts or Rename, the bot's screen) hides it: what arrives meanwhile hasn't been
+        // read. Closing it clears (V2Shell, V2ConversationScreen, RootView).
+        let sessionID = chatShownOnScreen
+        let roomID = roomShownOnScreen
+        guard !isModalSheetPresented, !chatCoveredBySheet, botScreenSheetsOpen == 0,
+              sessionID != nil || roomID != nil else { return }
+        // A launch in the background counts the scene active until its
+        // first phase change: nobody has read anything then.
+        #if canImport(UIKit) && !os(watchOS)
+        guard UIApplication.shared.applicationState == .active else {
+            // The scene can report active before UIKit does: try once more
+            // when it does. One observer at a time, registered before this
+            // returns so the notice can't slip past it.
+            guard ReadChatClearRetry.observer == nil else { return }
+            ReadChatClearRetry.observer = NotificationCenter.default.addObserver(
+                forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main
+            ) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    if let observer = ReadChatClearRetry.observer {
+                        NotificationCenter.default.removeObserver(observer)
+                        ReadChatClearRetry.observer = nil
+                    }
+                    self?.clearShownChatNotifications()
+                }
+            }
+            return
+        }
+        #endif
+        let sessionIDs = sessionID.map { chatOwnSessionIDs(for: $0) } ?? []
+        let activeDashboardID = activeDashboardID
+        let savedDashboardIDs = savedDashboardRegistry.dashboards.map(\.id)
+        let gatewayIDs = activeDashboardRelayGatewayIDs
+        let center = UNUserNotificationCenter.current()
+        Task { @MainActor in
+            let delivered = await center.deliveredNotifications()
+            guard !delivered.isEmpty else { return }
+            // The keys are read once for every notification on the list.
+            let records = PushNotificationService.e2eKeyStore.records()
+            let read = ReadChatNotifications.identifiers(
+                of: delivered.map {
+                    (identifier: $0.request.identifier,
+                     target: PushNotificationService.readChatTarget(from: $0.request.content.userInfo, records: records))
+                },
+                sessionIDs: sessionIDs,
+                roomID: roomID,
+                activeDashboardID: activeDashboardID,
+                savedDashboardIDs: savedDashboardIDs,
+                activeDashboardGatewayIDs: gatewayIDs
+            )
+            if !read.isEmpty { center.removeDeliveredNotifications(withIdentifiers: read) }
+        }
     }
 
     /// Brings the host's hold in line with what is on screen. Called on each
@@ -27,6 +110,8 @@ extension AppState {
     func updateChatOnScreen() {
         // The suggestion row follows the same edges (AppState+Predictive.swift).
         updatePredictiveScreen()
+        // So does clearing what the chat on screen already shows.
+        clearShownChatNotifications()
         for action in chatOnScreenTracker.update(wanted: chatOnScreenClaim, turnRunning: turnState.isRunning) {
             switch action {
             case .startRenewing(let claim):
@@ -107,3 +192,12 @@ extension AppState {
         }
     }
 }
+
+#if canImport(UIKit) && !os(watchOS)
+/// The one pending "clear once UIKit says active" observer
+/// (`clearShownChatNotifications`).
+@MainActor
+private enum ReadChatClearRetry {
+    static var observer: NSObjectProtocol?
+}
+#endif

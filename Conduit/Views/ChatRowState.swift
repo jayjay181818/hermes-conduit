@@ -36,6 +36,15 @@ struct ChatRowState: Equatable {
     /// Each live card's last row: earlier rows with that live name show
     /// that it was updated below.
     var latestLiveRows: [String: String] = [:]
+    /// The board whose follow-ups show: the newest one, while nothing has
+    /// been sent after it.
+    var followUpBoardRowID: String?
+    /// A card's send and tap buttons can go: Hermes is free and connected
+    /// and the composer is on, as for a board's follow-ups.
+    var cardsCanSend = false
+    /// The plugin takes card taps (/boards/taps): a report that lands
+    /// after a card is drawn redraws its row, showing or hiding tap buttons.
+    var cardTaps = false
     /// The open chat's messages that have a Pulse card, by Hermes' message
     /// id (PulseFeed.swift): they show a Pulse mark that opens it.
     var pulseCards: [Int: Int] = [:]
@@ -57,11 +66,19 @@ struct ChatRowState: Equatable {
     var canExplainStepRuns = false
     /// Replies Hermes wrote on its own, with why (Predictive follow-ups).
     var followUpReasons: [String: String] = [:]
+    /// Each reply's ::conduit-board lines no conduit_show row drew, and the
+    /// boards read for them (LineBoards).
+    var lineBoardIDs: [String: [String]] = [:]
+    var lineBoards: [String: RichBoard] = [:]
+    /// Those the plugin no longer has, or that can't be drawn.
+    var lineBoardsGone: Set<String> = []
 
     init() {}
 
+    /// `facts`: the transcript's own (ChatView's TranscriptModel), worked out
+    /// once per change of its rows; else from AppState's rows on screen.
     @MainActor
-    init(_ appState: AppState) {
+    init(_ appState: AppState, facts: ChatRowFacts? = nil) {
         let profile = appState.activeProfile
         activeProfile = profile
         agentIdentity = appState.conversationAgentIdentity
@@ -71,29 +88,36 @@ struct ChatRowState: Equatable {
         isOffline = appState.offlineChatPresentation != nil
         canQuoteIntoComposer = appState.canQuoteIntoComposer()
         reactionsAvailable = appState.reactionsAvailable
-        // From the rows drawn, the saved copy's while it stands in, so they
-        // fold and hide as Hermes' will and nothing moves when those land.
-        let rows = appState.chatRowsOnScreen
-        latestAssistantMessageID = rows.last(where: { $0.role == .assistant })?.id
-        retryableReplyID = AppState.retryableReplyID(in: rows)
+        let facts = facts ?? ChatRowFacts(rows: appState.chatRowsOnScreen, isBusy: isBusy)
+        latestAssistantMessageID = facts.latestAssistantMessageID
+        retryableReplyID = facts.retryableReplyID
         readAloudUnavailable = appState.readAloudUnavailableReason != nil
         displayPreferences = appState.displayPreferences
         voiceCallLinksRevision = appState.voiceCallChatLinksRevision
-        latestLiveRows = RichCard.latestLiveRows(rows)
+        latestLiveRows = facts.latestLiveRows
+        // A tap sends, so the chips show only while a send can go.
+        cardsCanSend = !(isOffline || isBusy || !appState.isConnected || !appState.composerIsEnabled)
+        followUpBoardRowID = cardsCanSend ? facts.followUpBoardRowID : nil
+        cardTaps = appState.notifierPlugin.reports(RichCardActionContext.capability)
         pulseCards = appState.pulseCards(forChat: appState.activeSessionId)
         canPinReplies = appState.canPinReplies
         pinnedMessageIDs = appState.openChatPinnedMessageIDs
-        teammateReplies = BotTeammateMessages.teammateReplies(
-            in: rows,
-            streamingMessageID: isBusy ? BotTeammateMessages.runningReplyID(in: rows) : nil
-        )
-        botLabels = appState.botRoster.map { "\($0.name)=\($0.displayLabel)" }
+        teammateReplies = facts.teammateReplies
+        botLabels = appState.shownBotRoster.map { "\($0.name)=\($0.displayLabel)" }
         toolCatalog = appState.toolCatalog
         let scope = appState.toolCatalogKey
         stepSummaries = appState.stepSummaries[scope] ?? [:]
         stepSummariesAsked = Set(appState.stepSummaryRequested.keys.lazy.filter { $0.scope == scope }.map(\.toolID))
         canExplainStepRuns = appState.client != nil && !(appState.activeSessionId ?? "").isEmpty && !isOffline
         followUpReasons = appState.predictive.followUpReasons
+        lineBoardIDs = facts.lineBoardIDs
+        lineBoards = lineBoardIDs.isEmpty ? [:] : appState.lineBoards
+        lineBoardsGone = lineBoardIDs.isEmpty ? [] : appState.lineBoardsGone
+        if !lineBoards.isEmpty {
+            // A board read for a reply can bring a live card up to date too.
+            latestLiveRows = LineBoards.latestLiveRows(latestLiveRows, order: facts.rowOrder, waiting: lineBoardIDs,
+                                                       boards: lineBoards)
+        }
     }
 
     /// `AppState.canReact(to:)`, from these values alone.
@@ -105,6 +129,45 @@ struct ChatRowState: Equatable {
                 isBusy: isBusy,
                 latestAssistantMessageID: latestAssistantMessageID
             ) != nil
+    }
+}
+
+/// What the rows show that comes from the whole transcript: which reply is
+/// the latest, offers Retry or folds under a teammate's delivery, and each
+/// live card's last row. Worked out from the rows drawn, the saved copy's
+/// while they stand in, so those fold and hide as Hermes' will and nothing
+/// moves when Hermes' land.
+struct ChatRowFacts: Equatable {
+    var latestAssistantMessageID: String?
+    var retryableReplyID: String?
+    var latestLiveRows: [String: String] = [:]
+    var followUpBoardRowID: String?
+    var teammateReplies: [String: String] = [:]
+    /// Each reply's ::conduit-board lines no conduit_show row drew (LineBoards).
+    var lineBoardIDs: [String: [String]] = [:]
+    /// Where those replies and each live card's last row are in the chat,
+    /// to tell which of them brought a live card up to date last.
+    var rowOrder: [String: Int] = [:]
+
+    init() {}
+
+    /// `isBusy`: a turn runs in the chat drawn, so its reply still streaming
+    /// stays open.
+    @MainActor
+    init(rows: [ChatMessage], isBusy: Bool) {
+        latestAssistantMessageID = rows.last(where: { $0.role == .assistant })?.id
+        retryableReplyID = AppState.retryableReplyID(in: rows)
+        latestLiveRows = RichCard.latestLiveRows(rows)
+        followUpBoardRowID = RichBoard.followUpRow(in: rows)
+        teammateReplies = BotTeammateMessages.teammateReplies(
+            in: rows,
+            streamingMessageID: isBusy ? BotTeammateMessages.runningReplyID(in: rows) : nil
+        )
+        lineBoardIDs = LineBoards.waiting(in: rows)
+        if !lineBoardIDs.isEmpty {
+            let placed = Set(lineBoardIDs.keys).union(latestLiveRows.values)
+            for (index, row) in rows.enumerated() where placed.contains(row.id) { rowOrder[row.id] = index }
+        }
     }
 }
 
@@ -151,18 +214,26 @@ extension Optional where Wrapped == ChatRowActions {
 extension View {
     /// Hands the transcript's rows their state and actions. On every view
     /// that draws chat rows (the chat, an offline copy, a group room).
-    func chatRows() -> some View {
-        modifier(ChatRowsEnvironment())
+    /// `facts`: the transcript's, from the chat's TranscriptModel; nil works
+    /// them out from AppState's rows on screen on each publish (a card on
+    /// its own, as on the Classic voice screen).
+    func chatRows(facts: ChatRowFacts? = nil) -> some View {
+        modifier(ChatRowsEnvironment(facts: facts))
     }
 }
 
 private struct ChatRowsEnvironment: ViewModifier {
     @EnvironmentObject private var appState: AppState
     @State private var last = LastChatRowState()
+    let facts: ChatRowFacts?
+
+    init(facts: ChatRowFacts?) {
+        self.facts = facts
+    }
 
     func body(content: Content) -> some View {
         content
-            .environment(\.chatRowState, last.keeping(ChatRowState(appState)))
+            .environment(\.chatRowState, last.keeping(ChatRowState(appState, facts: facts)))
             .environment(\.chatRowActions, ChatRowActions(appState: appState))
     }
 }

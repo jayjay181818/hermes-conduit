@@ -7,6 +7,26 @@
 
 import SwiftUI
 
+/// A live voice mode's status line on Voice settings: whether a call can
+/// start, as its check last said, kept on the phone so the line opens on it
+/// (#1533). A check that fails says why, as before, and isn't kept.
+struct LiveVoiceStatusLine: Equatable {
+    var text: String
+    var isAvailable: Bool
+
+    init(text: String, isAvailable: Bool) {
+        self.text = text
+        self.isAvailable = isAvailable
+    }
+
+    init?(answer: [String: Any]) {
+        guard let text = answer["line"] as? String, let isAvailable = answer["available"] as? Bool else { return nil }
+        self.init(text: text, isAvailable: isAvailable)
+    }
+
+    var answer: [String: Any] { ["line": text, "available": isAvailable] }
+}
+
 /// What Voice settings needs to show the Gemini Live option.
 struct GeminiLiveSettingsModel {
     var enabled: Bool
@@ -29,6 +49,9 @@ struct GeminiLiveSettingsModel {
     var speakerBargeIn: Bool = false
     var setSpeakerBargeIn: (Bool) -> Void = { _ in }
     var provider: LiveVoiceModeName = .geminiLive
+    /// The status line as its last check said, kept on the phone (#1533).
+    var keptStatus: LiveVoiceStatusLine? = nil
+    var keepStatus: (LiveVoiceStatusLine) -> Void = { _ in }
 }
 
 struct GeminiLiveSettingsSection: View {
@@ -60,6 +83,8 @@ struct GeminiLiveSettingsSection: View {
         _personality = State(initialValue: model.personality)
         _saveCalls = State(initialValue: model.saveCalls)
         _speakerBargeIn = State(initialValue: model.speakerBargeIn)
+        _status = State(initialValue: model.keptStatus?.text)
+        _isAvailable = State(initialValue: model.keptStatus?.isAvailable)
     }
 
     private var voiceChoices: [(id: String, title: String)] {
@@ -174,7 +199,7 @@ struct GeminiLiveSettingsSection: View {
                         model.setSpeakerBargeIn(requested)
                     }
                 ))
-                Text(model.provider == .qwenLive ? AppLocalization.string("Experimental. Keeps the microphone open while Qwen talks on the phone's speaker or in the car, with iOS echo cancellation, so you can cut in by speaking. Headphones and AirPods always allow this. Turn it off if Qwen keeps cutting itself off. Shared by Qwen Live, Gemini Live, Grok Live and Classic voice. Applies to the next conversation.") : AppLocalization.string("Experimental. Keeps the microphone open while Gemini talks on the phone's speaker or in the car, with iOS echo cancellation, so you can cut in by speaking. Headphones and AirPods always allow this. Turn it off if Gemini keeps cutting itself off. Shared by Qwen Live, Gemini Live, Grok Live and Classic voice. Applies to the next conversation."))
+                Text((model.provider == .qwenLive ? AppLocalization.string("Experimental. Keeps the microphone open while Qwen talks on the phone's speaker or in the car, with iOS echo cancellation, so you can cut in by speaking. Headphones and AirPods always allow this. Turn it off if Qwen keeps cutting itself off. Shared by Qwen Live, Gemini Live, Grok Live and Classic voice. Applies to the next conversation.") : AppLocalization.string("Experimental. Keeps the microphone open while Gemini talks on the phone's speaker or in the car, with iOS echo cancellation, so you can cut in by speaking. Headphones and AirPods always allow this. Turn it off if Gemini keeps cutting itself off. Shared by Qwen Live, Gemini Live, Grok Live and Classic voice. Applies to the next conversation.")) + " " + AppLocalization.string("Calls from Hermes don't use it, so their voice starts right away."))
                     .scaledFont(.caption)
                     .foregroundStyle(.secondary)
                 Toggle("Save calls to Sessions", isOn: Binding(
@@ -201,16 +226,20 @@ struct GeminiLiveSettingsSection: View {
     }
 
     private func check() async {
+        guard !isChecking else { return }
         isChecking = true
         defer { isChecking = false }
         switch await model.checkAvailability() {
         case .success(let availability):
-            isAvailable = availability.isAvailable
+            let line: String?
             if case .available(let modelName) = availability {
-                status = AppLocalization.string("Available (\(modelName))")
+                line = AppLocalization.string("Available (\(modelName))")
             } else {
-                status = availability.userFacingReason(for: model.provider == .qwenLive ? .qwen : .gemini)
+                line = PluginUpdateAsk.reason(availability.userFacingReason(for: model.provider == .qwenLive ? .qwen : .gemini))
             }
+            status = line
+            isAvailable = availability.isAvailable
+            if let line { model.keepStatus(LiveVoiceStatusLine(text: line, isAvailable: availability.isAvailable)) }
         case .failure(let error):
             isAvailable = false
             status = UserFacingError.message(for: error)
@@ -278,6 +307,8 @@ struct GeminiLiveVoiceSheet: View {
             onToggleMute: { controller.setMicrophoneMuted(!controller.isMicrophoneMuted) },
             onToggleSpeaker: { controller.setSpeakerMuted(!controller.isSpeakerMuted) },
             onInterrupt: { controller.interruptSpeaking() },
+            // A call still waiting on Hermes has no chat to add a photo to.
+            showsCamera: !isWaiting,
             onEnd: onClose,
             onRetry: onRetry,
             // A call still waiting on Hermes has no mode to move yet.
@@ -380,7 +411,8 @@ struct LiveVoiceQuickHint: View {
     private var threadID: String? { jobs.liveThread.map { $0.storedSessionID ?? $0.runtimeSessionID } }
 
     var body: some View {
-        Group {
+        // Held, so the checks below run while it's hidden: they show it.
+        ModifierHost {
             if isShown, let thread {
                 Text(AppLocalization.string("Working in \(thread). Say “quick…” for a fast side job."))
                     .scaledFont(.footnote)
@@ -416,7 +448,11 @@ struct VoiceJobModelSettingsModel {
     var provider: String?
     var model: String?
     var reasoningEffort: String?
-    var loadProviders: () async -> [ProviderInfo]
+    /// The models as last read, kept on the phone, for the menu to open on
+    /// (#1533).
+    var keptProviders: () -> [ProviderInfo] = { [] }
+    /// Nil when Hermes didn't answer: the menu keeps the models it lists.
+    var loadProviders: () async -> [ProviderInfo]?
     var save: (_ provider: String?, _ model: String?, _ reasoningEffort: String?) -> Void
 }
 
@@ -428,6 +464,12 @@ struct VoiceJobModelSettingsSection: View {
     @State private var selection: String
     @State private var reasoning: String
     @State private var providers: [ProviderInfo] = []
+    @State private var providersFailed = false
+    /// Hermes answered the models read: only then is a model picked, as a
+    /// list that didn't load is never picked from.
+    @State private var modelsAnswered = false
+    /// Counts the models reads, so only the last one asked lands.
+    @State private var providersRead = 0
 
     private static let profileDefault = ""
 
@@ -439,32 +481,53 @@ struct VoiceJobModelSettingsSection: View {
 
     var body: some View {
         ConduitSettingsSection(title: AppLocalization.string("Voice jobs"), symbol: "bolt.horizontal.circle", tint: .conduitAccent) {
-            ConduitMenuPicker(
-                value: selection,
-                choices: VoiceJobModelSettingsSection.modelChoices(
-                    defaultTitle: AppLocalization.string("Profile default"),
-                    defaultTag: Self.profileDefault,
-                    selection: selection,
-                    providers: providers
+            TaggedModelChooserLink(
+                pageTitle: AppLocalization.string("Voice jobs"),
+                defaultTitle: AppLocalization.string("Profile default"),
+                choice: TaggedModelChoice(defaultTag: Self.profileDefault, selection: selection),
+                catalog: ModelChooserCatalog(providers: providers, loaded: !providers.isEmpty || modelsAnswered, answered: modelsAnswered, failed: providersFailed),
+                disabled: !modelsAnswered,
+                retry: { Task { await loadProviders() } },
+                onSelect: { selection = $0 },
+                reasoning: ModelChooserReasoning(
+                    effort: reasoning,
+                    inheritTitle: AppLocalization.string("Profile default"),
+                    levels: Self.chooserLevels,
+                    set: { reasoning = $0 }
                 ),
-                onSelect: { selection = $0 }
-            ) {
-                Text("Model").foregroundStyle(.secondary)
-            }
-            ConduitMenuPicker(
-                value: reasoning,
-                choices: reasoningChoices,
-                onSelect: { reasoning = $0 }
-            ) {
-                Text("Reasoning").foregroundStyle(.secondary)
+                reasoningTitle: reasoning == Self.profileDefault ? nil : ReasoningEffortLevel.displayTitle(for: reasoning),
+                identifier: "settings.voiceJobs.model"
+            )
+            if providersFailed {
+                // The models listed stay up; Hermes didn't answer.
+                ModelCatalogPlaceholder(state: .failed) { Task { await loadProviders() } }
             }
             Text("The model Hermes uses for background jobs started by voice. A fast model with low reasoning keeps spoken requests quick; your chats keep the profile's model.")
                 .scaledFont(.caption)
                 .foregroundStyle(.secondary)
         }
-        .task { providers = await settings.loadProviders() }
+        .onAppear { if providers.isEmpty { providers = settings.keptProviders() } }
+        .task {
+            await loadProviders()
+            // Hermes fetches a stale provider list in the background
+            // meanwhile (issue 1807).
+            await ModelCatalogSettle.readAgain { await loadProviders() }
+        }
         .onChange(of: selection) { _, _ in save() }
         .onChange(of: reasoning) { _, _ in save() }
+    }
+
+    private func loadProviders() async {
+        providersRead += 1
+        let asked = providersRead
+        let loaded = await settings.loadProviders()
+        // A read asked since (the read again, Try Again) has the newer answer.
+        guard asked == providersRead else { return }
+        if let loaded {
+            providers = loaded
+            modelsAnswered = true
+        }
+        providersFailed = loaded == nil
     }
 
     private func save() {
@@ -472,45 +535,13 @@ struct VoiceJobModelSettingsSection: View {
         settings.save(chosen?.provider, chosen?.model, reasoning == Self.profileDefault ? nil : reasoning)
     }
 
-    private var reasoningChoices: [(id: String, title: String)] {
-        let levels = Self.reasoningLevels(offTitle: AppLocalization.string("None"))
-        return [(id: Self.profileDefault, title: AppLocalization.string("Profile default"))] + levels
-    }
+    /// The reasoning levels Hermes takes for a voice job and a helper
+    /// model: every level the Model sheet offers but Ultra.
+    static let chooserLevels: [ReasoningEffortLevel] = [.off, .minimal, .low, .medium, .high, .xhigh, .max]
 
-    /// Model menu: the default choice, a saved model the list doesn't carry
-    /// (kept visible even before the list loads), then every provider's
-    /// models.
-    static func modelChoices(
-        defaultTitle: String,
-        defaultTag: String,
-        selection: String,
-        providers: [ProviderInfo]
-    ) -> [(id: String, title: String)] {
-        var choices = [(id: defaultTag, title: defaultTitle)]
-        if selection != defaultTag, !providers.contains(where: { provider in
-            provider.models.contains { tag(provider: provider.name, model: $0.id) == selection }
-        }) {
-            choices.append((id: selection, title: parse(selection).model))
-        }
-        for provider in providers {
-            for model in provider.models {
-                choices.append((id: tag(provider: provider.name, model: model.id), title: "\(model.label ?? model.id) · \(provider.name)"))
-            }
-        }
-        return choices
-    }
-
-    /// Reasoning levels, the same as the model picker's reasoning control.
-    static func reasoningLevels(offTitle: String) -> [(id: String, title: String)] {
-        [
-            (id: "none", title: offTitle),
-            (id: "minimal", title: AppLocalization.string("Minimal")),
-            (id: "low", title: AppLocalization.string("Low")),
-            (id: "medium", title: AppLocalization.string("Medium")),
-            (id: "high", title: AppLocalization.string("High")),
-            (id: "xhigh", title: AppLocalization.string("Extra High")),
-            (id: "max", title: AppLocalization.string("Max")),
-        ]
+    /// A provider pinned without a model: Hermes runs its default model.
+    static func providerDefaultTitle(_ provider: String) -> String {
+        AppLocalization.string("Default") + " · " + provider
     }
 
     /// Picker tag for a provider/model pair (provider may be empty).
@@ -525,132 +556,585 @@ struct VoiceJobModelSettingsSection: View {
     }
 }
 
-/// Hermes' model slot for spoken classic-voice turns
-/// (`auxiliary.voice_chat`), read from `/api/model/auxiliary`.
+/// A model setting saved as a picker tag (`provider\u{1F}model`, see
+/// VoiceJobModelSettingsSection.tag), with a default choice of its own: the
+/// voice job and voice reply models, the Helper models and Pulse's model.
+struct TaggedModelChoice {
+    let defaultTag: String
+    let selection: String
+
+    var isDefault: Bool { selection == defaultTag }
+
+    /// The setting's pick, nil on its default.
+    var pick: ModelChooserPick? {
+        guard !isDefault else { return nil }
+        let held = VoiceJobModelSettingsSection.parse(selection)
+        return ModelChooserPick(provider: held.provider ?? "", model: held.model)
+    }
+
+    /// The listed provider holding the pick. A pick saved under another of
+    /// its provider's spellings (an alias, `custom:<key>`) is that
+    /// provider's row; one row only: the provider named exactly, else the
+    /// first whose other spellings match, among those listing the model.
+    func heldProvider(in providers: [ProviderInfo]) -> String? {
+        let held = VoiceJobModelSettingsSection.parse(selection)
+        guard !isDefault, !held.model.isEmpty, let wanted = held.provider else { return nil }
+        let listing = providers.filter { $0.models.contains { $0.id == held.model } }
+        return (listing.first { $0.name == wanted } ?? listing.first { $0.matches(wanted) })?.name
+    }
+
+    func isPicked(_ provider: ProviderInfo, _ model: ModelInfo, in providers: [ProviderInfo]) -> Bool {
+        heldProvider(in: providers) == provider.name && model.id == VoiceJobModelSettingsSection.parse(selection).model
+    }
+
+    /// The tag a listed row saves: the pick's own spelling for its row, so
+    /// re-picking it writes nothing.
+    func tag(for provider: ProviderInfo, _ model: ModelInfo, in providers: [ProviderInfo]) -> String {
+        isPicked(provider, model, in: providers) ? selection : VoiceJobModelSettingsSection.tag(provider: provider.name, model: model.id)
+    }
+
+    /// The Settings row's lines: the default's title, the listed row, or a
+    /// held pick as saved ("model · provider", or "Default · provider" for
+    /// a provider pinned without a model).
+    func lines(in providers: [ProviderInfo], defaultTitle: String, reasoning: String? = nil) -> (value: String, detail: String?) {
+        guard let pick else { return (defaultTitle, reasoning) }
+        if pick.model.isEmpty {
+            // Named as its row names it, as the Model page's top card does.
+            let title = providers.row(named: pick.provider)?.title ?? pick.provider
+            return (VoiceJobModelSettingsSection.providerDefaultTitle(title), reasoning)
+        }
+        let provider = heldProvider(in: providers).flatMap { name in providers.first { $0.name == name } }
+        let model = provider?.models.first { $0.id == pick.model }
+        let providerTitle = provider?.title ?? (pick.provider.isEmpty ? nil : pick.provider)
+        let detail = [providerTitle, reasoning].compactMap { $0 }.joined(separator: " · ")
+        return (model?.label ?? pick.model, detail.isEmpty ? nil : detail)
+    }
+}
+
+/// A tagged model setting's row, opening its Model page.
+struct TaggedModelChooserLink: View {
+    var rowTitle = AppLocalization.string("Model")
+    var pageTitle = AppLocalization.string("Model")
+    let defaultTitle: String
+    var defaultDetail: String? = nil
+    let choice: TaggedModelChoice
+    let catalog: ModelChooserCatalog
+    var disabled = false
+    let retry: () -> Void
+    let onSelect: (String) -> Void
+    var reasoning: ModelChooserReasoning? = nil
+    /// The reasoning's name on the row, where the setting has one.
+    var reasoningTitle: String? = nil
+    var footer: AnyView? = nil
+    var identifier: String? = nil
+
+    var body: some View {
+        NavigationLink {
+            ModelChooserPage(
+                title: pageTitle,
+                catalog: catalog,
+                retry: retry,
+                defaultChoice: ModelChooserDefault(title: defaultTitle, detail: defaultDetail),
+                pick: choice.pick,
+                isPicked: { choice.isPicked($0, $1, in: catalog.providers) },
+                reasoning: reasoning,
+                disabled: disabled,
+                onDefault: { onSelect(choice.defaultTag) },
+                onPick: { onSelect(choice.tag(for: $0, $1, in: catalog.providers)) },
+                footer: footer
+            )
+        } label: {
+            let lines = choice.lines(in: catalog.providers, defaultTitle: defaultTitle, reasoning: reasoningTitle)
+            ModelChooserLinkRow(title: rowTitle, value: lines.value, detail: lines.detail)
+        }
+        .buttonStyle(.plain)
+        .accessibilityIdentifier(identifier ?? "modelChooser.link")
+    }
+}
+
+/// One of Hermes' helper model slots (`auxiliary.<task>`), read from
+/// `/api/model/auxiliary`: spoken classic-voice turns (`voice_chat`) and
+/// the helper models on Models & providers.
 struct VoiceReplyModelSetting: Equatable {
     static let task = "voice_chat"
 
+    /// The slot: `voice_chat` for voice replies.
+    var task: String = Self.task
     /// `auto` with an empty model follows the chat's model.
     var provider: String
     var model: String
     /// Nil follows the chat's reasoning; `none` (Hermes' default) is off.
     var reasoningEffort: String?
+    /// An endpoint of the slot's own (`auxiliary.<task>.base_url`), such as
+    /// a local server. Hermes keeps it while the provider stays, so a save
+    /// never sends it.
+    var baseURL: String?
 
-    /// Nil when this Hermes has no voice reply slot.
-    init?(auxiliaryResponse response: [String: Any]) {
+    /// Nil when this Hermes has no such slot.
+    init?(auxiliaryResponse response: [String: Any], task: String = Self.task) {
         let tasks = response["tasks"] as? [[String: Any]] ?? []
-        guard let row = tasks.first(where: { $0["task"] as? String == Self.task }) else { return nil }
+        guard let row = tasks.first(where: { $0["task"] as? String == task }) else { return nil }
+        self.init(row: row)
+    }
+
+    /// A row of `/api/model/auxiliary`'s tasks; nil without a task name.
+    init?(row: [String: Any]) {
+        let task = (row["task"] as? String ?? "").trimmingCharacters(in: .whitespaces)
+        guard !task.isEmpty else { return nil }
+        self.task = task
         let provider = (row["provider"] as? String ?? "").trimmingCharacters(in: .whitespaces)
         self.provider = provider.isEmpty ? "auto" : provider
         model = (row["model"] as? String ?? "").trimmingCharacters(in: .whitespaces)
         let effort = (row["reasoning_effort"] as? String ?? "").trimmingCharacters(in: .whitespaces)
         reasoningEffort = effort.isEmpty ? nil : effort
+        let url = (row["base_url"] as? String ?? "").trimmingCharacters(in: .whitespaces)
+        baseURL = url.isEmpty ? nil : url
     }
 
-    init(provider: String, model: String, reasoningEffort: String?) {
+    init(task: String = Self.task, provider: String, model: String, reasoningEffort: String?, baseURL: String? = nil) {
+        self.task = task
         self.provider = provider
         self.model = model
         self.reasoningEffort = reasoningEffort
+        self.baseURL = baseURL
+    }
+
+    /// Follows the chat's model.
+    var followsChats: Bool { model.isEmpty && !providerOnly }
+
+    /// A provider pinned without a model: Hermes runs that provider's
+    /// default model, not the chat's.
+    var providerOnly: Bool {
+        model.isEmpty && !provider.isEmpty && provider != "auto"
+    }
+
+    /// The slot's own endpoint by host (and port), never its path or any
+    /// credentials in it.
+    var endpointHost: String? {
+        guard let baseURL else { return nil }
+        guard let components = URLComponents(string: baseURL), let host = components.host, !host.isEmpty else {
+            return nil
+        }
+        return components.port.map { "\(host):\($0)" } ?? host
     }
 
     /// `POST /api/model/set` body. An explicit null reasoning means "same as
     /// chats"; Hermes keeps it from falling back to its off default.
-    func assignmentBody(profile: String) -> [String: Any] {
-        [
+    /// `confirmed` answers Hermes' price check for a model the user chose
+    /// anyway.
+    func assignmentBody(profile: String, confirmed: Bool = false) -> [String: Any] {
+        var body: [String: Any] = [
             "scope": "auxiliary",
-            "task": Self.task,
+            "task": task,
             "provider": provider.isEmpty ? "auto" : provider,
             "model": model,
             "reasoning_effort": reasoningEffort ?? NSNull(),
             "profile": profile
         ]
+        if confirmed { body["confirm_expensive_model"] = true }
+        return body
     }
+}
+
+/// How a helper model save ended.
+enum HelperModelSaveResult: Equatable {
+    case saved
+    /// Hermes didn't take it, saying why.
+    case refused(String)
+    /// Hermes' price check asks before it takes the model: its warning,
+    /// for the user to choose it anyway.
+    case needsConfirmation(String)
 }
 
 /// What Voice settings needs for the voice reply model choice.
 struct VoiceReplyModelSettingsModel {
-    var load: () async -> VoiceReplyModelSetting?
-    var loadProviders: () async -> [ProviderInfo]
-    var save: (VoiceReplyModelSetting) async -> Bool
+    /// The setting and models as Hermes gave them last, kept on the phone:
+    /// the section opens on them (#1533).
+    var kept: () -> VoiceReplyModelSetting? = { nil }
+    var keptProviders: () -> [ProviderInfo] = { [] }
+    /// Nil when this Hermes has no voice reply slot; throws when Hermes
+    /// didn't answer.
+    var load: () async throws -> VoiceReplyModelSetting?
+    var loadProviders: () async -> [ProviderInfo]?
+    /// Writes the setting; `confirmed` answers Hermes' price check.
+    var save: (VoiceReplyModelSetting, _ confirmed: Bool) async -> HelperModelSaveResult
 }
 
-/// The model and reasoning Hermes answers classic-voice turns with. Hidden
-/// on a Hermes without the slot.
-struct VoiceReplyModelSettingsSection: View {
-    let settings: VoiceReplyModelSettingsModel
-    @State private var saved: VoiceReplyModelSetting?
-    @State private var selection = Self.sameAsChats
-    @State private var reasoning = "none"
-    @State private var providers: [ProviderInfo] = []
+/// The Voice replies section's setting and picks, apart from its view so
+/// the order of Hermes' answers and the writes can be tested (#1533).
+struct VoiceReplyModelPicks {
+    static let sameAsChats = ""
+    static let inheritReasoning = "inherit"
 
-    private static let sameAsChats = ""
-    private static let inheritReasoning = "inherit"
+    /// What Hermes holds, as it last answered or took a write. Nil hides
+    /// the section, for a Hermes without the slot.
+    private(set) var saved: VoiceReplyModelSetting?
+    var selection = Self.sameAsChats
+    var reasoning = "none"
+    /// Hermes answered. Until then the section shows the setting kept on
+    /// the phone, and its pickers wait: a save writes the whole setting,
+    /// which may be stale.
+    private(set) var answered = false
+    private(set) var readFailed = false
+    /// A pick is being written: the pickers wait for it.
+    private(set) var writing = false
+    /// Why Hermes didn't take the last pick, shown under the pickers.
+    private(set) var refusal: String?
+    /// The pick Hermes' price check asked about, for Use It Anyway.
+    private(set) var confirmable: VoiceReplyModelSetting?
+    /// Counts the writes: an answer to a read asked before one, or while
+    /// one was out, may predate it.
+    private var writes = 0
+    /// Counts the reads, and names the newest one Hermes answered: an
+    /// answer to a read asked before it is older than what's shown.
+    private var reads = 0
+    private var newestAnsweredRead = 0
 
-    var body: some View {
-        Group {
-            if saved != nil {
-                ConduitSettingsSection(title: AppLocalization.string("Voice replies"), symbol: "waveform.circle", tint: .conduitAura) {
-                    ConduitMenuPicker(
-                        value: selection,
-                        choices: VoiceJobModelSettingsSection.modelChoices(
-                            defaultTitle: AppLocalization.string("Same as chats"),
-                            defaultTag: Self.sameAsChats,
-                            selection: selection,
-                            providers: providers
-                        ),
-                        onSelect: { selection = $0 }
-                    ) {
-                        Text("Model").foregroundStyle(.secondary)
-                    }
-                    ConduitMenuPicker(
-                        value: reasoning,
-                        choices: reasoningChoices,
-                        onSelect: { reasoning = $0 }
-                    ) {
-                        Text("Reasoning").foregroundStyle(.secondary)
-                    }
-                    Text("The model Hermes answers you with in a voice conversation. Reasoning is off by default so replies start sooner; typed messages keep the chat's model. Hermes Desktop uses this setting too.")
-                        .scaledFont(.caption)
-                        .foregroundStyle(.secondary)
-                }
-            }
-        }
-        .task {
-            guard let setting = await settings.load() else { return }
-            providers = await settings.loadProviders()
-            selection = setting.model.isEmpty
-                ? Self.sameAsChats
-                : VoiceJobModelSettingsSection.tag(provider: setting.provider, model: setting.model)
-            reasoning = setting.reasoningEffort ?? Self.inheritReasoning
-            saved = setting
-        }
-        .onChange(of: selection) { _, _ in save() }
-        .onChange(of: reasoning) { _, _ in save() }
+    /// A read, as it was asked.
+    struct Read {
+        fileprivate let number: Int
+        fileprivate let writes: Int
+        fileprivate let duringWrite: Bool
     }
 
-    private var reasoningChoices: [(id: String, title: String)] {
-        let levels = VoiceJobModelSettingsSection.reasoningLevels(offTitle: AppLocalization.string("Off"))
-        return levels + [(id: Self.inheritReasoning, title: AppLocalization.string("Same as chats"))]
+    mutating func readAsked() -> Read {
+        reads += 1
+        return Read(number: reads, writes: writes, duringWrite: writing)
+    }
+
+    /// Nothing from Hermes is shown yet: the kept setting can be.
+    var opensOnKept: Bool { saved == nil && !answered }
+
+    /// What the section shows.
+    enum Shown: Equatable {
+        case hidden, loading, failed, noSlot, setting
+    }
+
+    /// Voice settings shows the section only with a setting: hidden
+    /// meanwhile, and on a Hermes without the slot. A helper's page is
+    /// nothing else, so it says it's waiting, that the read failed, or
+    /// that Hermes no longer has the slot.
+    func shown(onHelperPage: Bool) -> Shown {
+        if saved != nil { return .setting }
+        guard onHelperPage else { return .hidden }
+        if answered { return .noSlot }
+        return readFailed ? .failed : .loading
+    }
+
+    /// The setting Hermes gave last, kept on the phone, drawn before the
+    /// first frame while Hermes is asked again.
+    mutating func showKept(_ setting: VoiceReplyModelSetting?) {
+        guard opensOnKept else { return }
+        show(setting)
+    }
+
+    /// Hermes' answer to `read`, shown unless a pick's write was out when
+    /// it was asked or went out since, as the pick stays then, or a read
+    /// asked after it answered first. False for the last: the models read
+    /// with it are older than the ones shown too.
+    @discardableResult
+    mutating func hermesAnswered(_ setting: VoiceReplyModelSetting?, to read: Read) -> Bool {
+        guard read.number > newestAnsweredRead else { return false }
+        newestAnsweredRead = read.number
+        readFailed = false
+        if !read.duringWrite, read.writes == writes { show(setting) }
+        answered = true
+        return true
+    }
+
+    /// A read that fails keeps what's shown. One asked before the newest
+    /// answer is older than what's shown, and says nothing.
+    mutating func readDidFail(_ read: Read) {
+        guard read.number > newestAnsweredRead else { return }
+        readFailed = true
+    }
+
+    /// The setting the picks ask Hermes for, nil when they change nothing:
+    /// showing Hermes' setting changes the pickers too. One write is out at
+    /// a time, and only once Hermes answered.
+    mutating func writeAsked() -> VoiceReplyModelSetting? {
+        guard answered, !writing, let saved, chosen != saved else { return nil }
+        writing = true
+        writes += 1
+        refusal = nil
+        confirmable = nil
+        return chosen
+    }
+
+    /// The pick Hermes' price check asked about, written again with the
+    /// user's yes; nil when there's none or a write is out.
+    mutating func confirmAsked() -> VoiceReplyModelSetting? {
+        guard !writing, let confirmable else { return nil }
+        writing = true
+        writes += 1
+        refusal = nil
+        self.confirmable = nil
+        // Shown while it's written; a refusal puts back what Hermes holds.
+        selection = Self.selection(for: confirmable)
+        reasoning = confirmable.reasoningEffort ?? Self.inheritReasoning
+        return confirmable
+    }
+
+    private static func selection(for setting: VoiceReplyModelSetting) -> String {
+        setting.followsChats ? sameAsChats : VoiceJobModelSettingsSection.tag(provider: setting.provider, model: setting.model)
+    }
+
+    /// The model Hermes runs the slot on, its endpoint's host beside it.
+    var endpointCaption: String? {
+        saved?.endpointHost.map { AppLocalization.string("Runs on your endpoint at \($0). A model from another provider moves it off.") }
+    }
+
+    /// How a write ended: Hermes took it, refused it, or asks first.
+    mutating func writeEnded(_ setting: VoiceReplyModelSetting, result: HelperModelSaveResult) {
+        switch result {
+        case .saved:
+            writeEnded(setting, refusal: nil)
+        case .refused(let reason):
+            writeEnded(setting, refusal: reason)
+        case .needsConfirmation(let warning):
+            writeEnded(setting, refusal: warning)
+            confirmable = setting
+        }
+    }
+
+    /// Hermes took `setting`, or refused it, saying why: the pickers then
+    /// show what Hermes holds again.
+    mutating func writeEnded(_ setting: VoiceReplyModelSetting, refusal: String?) {
+        writing = false
+        guard let refusal else {
+            saved = setting
+            return
+        }
+        self.refusal = refusal
+        show(saved)
     }
 
     private var chosen: VoiceReplyModelSetting {
         let pick = selection == Self.sameAsChats ? nil : VoiceJobModelSettingsSection.parse(selection)
-        // "Same as chats" keeps a provider pinned without a model as is.
-        let unpinnedProvider = saved.map { $0.model.isEmpty ? $0.provider : "auto" } ?? "auto"
+        // "Same as chats" unpins the provider too; a provider pinned
+        // without a model is a choice of its own.
+        let provider = pick.map { $0.provider ?? "auto" } ?? "auto"
         return VoiceReplyModelSetting(
-            provider: pick.map { $0.provider ?? "auto" } ?? unpinnedProvider,
+            task: saved?.task ?? VoiceReplyModelSetting.task,
+            provider: provider,
             model: pick?.model ?? "",
-            reasoningEffort: reasoning == Self.inheritReasoning ? nil : reasoning
+            reasoningEffort: reasoning == Self.inheritReasoning ? nil : reasoning,
+            // The slot's endpoint stays while its provider does, as Hermes
+            // keeps it then.
+            baseURL: provider == saved?.provider ? saved?.baseURL : nil
         )
     }
 
+    /// Shows `setting`, or hides the section. The saved value goes with the
+    /// pickers', so these changes write nothing.
+    private mutating func show(_ setting: VoiceReplyModelSetting?) {
+        saved = setting
+        guard let setting else { return }
+        selection = Self.selection(for: setting)
+        reasoning = setting.reasoningEffort ?? Self.inheritReasoning
+    }
+}
+
+/// The model and reasoning Hermes answers classic-voice turns with, or
+/// (on a helper model's page) runs one of its helper jobs with. Hidden on
+/// a Hermes without the slot.
+struct VoiceReplyModelSettingsSection: View {
+    let settings: VoiceReplyModelSettingsModel
+    /// The page is asking Hermes again (Check again too).
+    var pageIsChecking = false
+    /// A helper model's own heading and words; nil for Voice replies.
+    var helper: HelperModelSlot?
+    @State private var picks = VoiceReplyModelPicks()
+    @State private var providers: [ProviderInfo] = []
+    @State private var providersFailed = false
+    /// Hermes answered the models read: only then is a model picked.
+    @State private var modelsAnswered = false
+    /// Counts the models reads, so only the last one asked lands.
+    @State private var providersRead = 0
+
+    var body: some View {
+        // Held, so the reads below run while nothing is shown yet.
+        ModifierHost {
+            let shown = picks.shown(onHelperPage: helper != nil)
+            if shown != .hidden {
+                ConduitSettingsSection(
+                    title: helper?.title ?? AppLocalization.string("Voice replies"),
+                    symbol: helper?.symbol ?? "waveform.circle",
+                    tint: .conduitAura
+                ) {
+                    switch shown {
+                    case .setting, .hidden:
+                        pickers
+                    case .loading:
+                        ProgressView().frame(maxWidth: .infinity).accessibilityLabel(AppLocalization.string("Loading…"))
+                    case .failed:
+                        ModelCatalogPlaceholder(state: .failed) { Task { await tryAgain() } }
+                    case .noSlot:
+                        Text(AppLocalization.string("This Hermes no longer has this helper model."))
+                            .scaledFont(.subheadline).foregroundStyle(.secondary)
+                    }
+                    if let helper {
+                        Text(verbatim: helper.caption)
+                            .scaledFont(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    } else {
+                        Text("The model Hermes answers you with in a voice conversation. Reasoning is off by default so replies start sooner; typed messages keep the chat's model. Hermes Desktop uses this setting too.")
+                            .scaledFont(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+        }
+        .onAppear(perform: showKept)
+        .task {
+            await read()
+            // Hermes fetches a stale provider list in the background
+            // meanwhile (issue 1807); a setting read that failed waits for
+            // the page's next check, as before.
+            await ModelCatalogSettle.readAgain {
+                guard !picks.readFailed else { return }
+                await reloadProviders()
+            }
+        }
+        // After a read that failed, the page's next check (its Check again
+        // too) asks Hermes again.
+        .onChange(of: pageIsChecking) { _, checking in
+            guard !checking, picks.readFailed else { return }
+            Task { await read() }
+        }
+        .onChange(of: picks.selection) { _, _ in save() }
+        .onChange(of: picks.reasoning) { _, _ in save() }
+    }
+
+    @ViewBuilder private var pickers: some View {
+        let followTitle = helper?.followTitle ?? AppLocalization.string("Same as chats")
+        let inherits = picks.reasoning == VoiceReplyModelPicks.inheritReasoning
+        TaggedModelChooserLink(
+            pageTitle: helper?.title ?? AppLocalization.string("Voice replies"),
+            defaultTitle: followTitle,
+            choice: TaggedModelChoice(defaultTag: VoiceReplyModelPicks.sameAsChats, selection: picks.selection),
+            catalog: ModelChooserCatalog(providers: providers, loaded: !providers.isEmpty || modelsAnswered, answered: modelsAnswered, failed: providersFailed || picks.readFailed),
+            disabled: pickersWait || !modelsAnswered,
+            retry: { Task { await tryAgain() } },
+            onSelect: { picks.selection = $0 },
+            reasoning: ModelChooserReasoning(
+                effort: inherits ? "" : picks.reasoning,
+                inheritTitle: AppLocalization.string("Same as chats"),
+                levels: VoiceJobModelSettingsSection.chooserLevels,
+                disabled: pickersWait,
+                set: { picks.reasoning = $0.isEmpty ? VoiceReplyModelPicks.inheritReasoning : $0 }
+            ),
+            reasoningTitle: inherits ? nil : ReasoningEffortLevel.displayTitle(for: picks.reasoning),
+            footer: AnyView(warnings),
+            identifier: helper.map { "settings.helperModel.\($0.id)" } ?? "settings.voiceReplies.model"
+        )
+        if providersFailed || picks.readFailed {
+            // What's listed stays up; Hermes didn't answer.
+            ModelCatalogPlaceholder(state: .failed) { Task { await tryAgain() } }
+        }
+        warnings
+    }
+
+    /// Hermes' refusal, Use It Anyway and the endpoint, under the row and
+    /// on its Model page, where the pick that brought them is made.
+    @ViewBuilder private var warnings: some View {
+        if let refusal = picks.refusal {
+            Text(verbatim: refusal)
+                .scaledFont(.caption)
+                .foregroundStyle(picks.confirmable == nil ? .red : .orange)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        if picks.confirmable != nil {
+            // Hermes' price check asked first: the user can
+            // choose the model anyway.
+            Button(AppLocalization.string("Use It Anyway")) { confirm() }
+                .scaledFont(.subheadline.weight(.semibold))
+                .tint(.conduitAccent)
+                .disabled(picks.writing)
+        }
+        if let endpoint = picks.endpointCaption {
+            Text(verbatim: endpoint)
+                .scaledFont(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    /// The pickers wait for Hermes' answer and for a save; Try Again
+    /// doesn't, as it's how a failed read asks again.
+    private var pickersWait: Bool { !picks.answered || picks.writing }
+
+    /// A read that fails keeps what's shown, and the pickers wait.
+    private func read() async {
+        let asked = picks.readAsked()
+        let setting: VoiceReplyModelSetting?
+        do {
+            setting = try await settings.load()
+        } catch {
+            picks.readDidFail(asked)
+            return
+        }
+        var loaded: [ProviderInfo]?
+        providersRead += 1
+        let modelsAsked = providersRead
+        if setting != nil { loaded = await settings.loadProviders() }
+        guard picks.hermesAnswered(setting, to: asked) else { return }
+        // A models read asked since has the newer list.
+        guard modelsAsked == providersRead else { return }
+        if let loaded {
+            providers = loaded
+            modelsAnswered = true
+        }
+        providersFailed = setting != nil && loaded == nil
+    }
+
+    /// Asks again for what didn't come: the setting with its models, or
+    /// the models alone.
+    private func tryAgain() async {
+        if picks.readFailed {
+            await read()
+        } else {
+            await reloadProviders()
+        }
+    }
+
+    /// A read that fails keeps the models listed, saying so.
+    private func reloadProviders() async {
+        providersRead += 1
+        let asked = providersRead
+        let loaded = await settings.loadProviders()
+        // A read asked since (the read again, Try Again) has the newer answer.
+        guard asked == providersRead else { return }
+        guard let loaded else {
+            providersFailed = true
+            return
+        }
+        providers = loaded
+        modelsAnswered = true
+        providersFailed = false
+    }
+
+    private func showKept() {
+        guard picks.opensOnKept else { return }
+        providers = settings.keptProviders()
+        picks.showKept(settings.kept())
+    }
+
+
     private func save() {
-        // Loading the saved values fires these changes too: only a real
-        // change is written.
-        guard let saved, chosen != saved else { return }
-        let next = chosen
+        guard let next = picks.writeAsked() else { return }
         Task {
-            if await settings.save(next) { self.saved = next }
+            let result = await settings.save(next, false)
+            picks.writeEnded(next, result: result)
+        }
+    }
+
+    private func confirm() {
+        guard let next = picks.confirmAsked() else { return }
+        Task {
+            let result = await settings.save(next, true)
+            picks.writeEnded(next, result: result)
         }
     }
 }

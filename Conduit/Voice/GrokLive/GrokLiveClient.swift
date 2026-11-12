@@ -19,7 +19,7 @@ enum GrokLiveClientError: LocalizedError, Equatable {
     var errorDescription: String? {
         switch self {
         case .unavailable(let availability):
-            return availability.userFacingReason
+            return PluginUpdateAsk.reason(availability.userFacingReason)
         case .socketUnavailable:
             return AppLocalization.string("Could not open the Grok Live connection.")
         }
@@ -66,6 +66,7 @@ final class GrokLiveClient: GrokLiveConnecting {
         do {
             response = try await request(DashboardPath.withProfile(Self.statusPath, profile: profile()), "GET", nil, 30_000)
         } catch let error as DashboardTicketBridgeError {
+            if let remedy = DashboardTicketBridgeError.pluginOffDetail(of: error) { return .unavailable(reason: remedy) }
             if GeminiLiveTokenClient.isMissingRoute(error) { return .pluginMissing }
             throw error
         }

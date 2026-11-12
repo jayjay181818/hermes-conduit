@@ -9,7 +9,8 @@
 //  where you are, older chats); its model; and behind the scenes, its time
 //  zone, token budgets, a look now and latest checks (PulseSettings.swift).
 //  Every change goes to the plugin and the page shows the state it answers
-//  with.
+//  with. It opens on the state it showed last time, kept on the phone,
+//  while it asks again (#1533).
 //
 
 import SwiftUI
@@ -21,6 +22,9 @@ struct PulseSettingsPage: View {
 
     @State private var state: PulseState?
     @State private var loadError: String?
+    /// Pulse has answered. Until then the page shows the state it kept
+    /// (#1533) and `waiting` holds back the steps that carry what's shown.
+    @State private var answered = false
     /// The step holding the page's one request slot; a switch of dashboard
     /// cancels it and frees the slot at once.
     @State private var workingID: UUID?
@@ -38,6 +42,14 @@ struct PulseSettingsPage: View {
     @State private var timesSave: Task<Void, Never>?
     /// The models Hermes offers, for the Model picker.
     @State private var providers: [ProviderInfo] = []
+    @State private var modelsFailed = false
+    /// Hermes answered the models read: only then is a model picked, as a
+    /// list that didn't load is never picked from.
+    @State private var modelsAnswered = false
+    /// Counts the models reads, so only the last one asked lands.
+    @State private var modelsRead = 0
+    /// The profile `providers` are from: Pulse's, as its state names it.
+    @State private var modelsProfile: String?
     /// The note to Pulse as it's being edited; nil shows the plugin's.
     @State private var noteDraft: String?
     @FocusState private var noteFocused: Bool
@@ -46,6 +58,12 @@ struct PulseSettingsPage: View {
 
     private var client: PulseClient { appState.pulseClient }
     private var working: Bool { workingID != nil }
+    /// A step that writes back what the page shows besides what was picked
+    /// (the rest of a list or of the note, the other end of the night, the
+    /// model to put back) or acts on it (Pulse's chat, a reading's phase)
+    /// waits until Pulse answers: a kept state may be stale. A setting
+    /// picked outright saves at once.
+    private var waiting: Bool { !KeptAnswerGate.canSave(answered: answered, saving: working) }
 
     var body: some View {
         SettingsDetailContainer {
@@ -55,6 +73,7 @@ struct PulseSettingsPage: View {
                 if state.enabled {
                     let budgets = appState.notifierPlugin.reports(PulseClient.nudgeCapability)
                     speakUpSection(state, budgets: budgets)
+                    if !appState.pulseDoItBotChoices.isEmpty || appState.pulseDoItBotSaved { doItSection }
                     let quiet = appState.notifierPlugin.reports(PulseClient.quietCapability)
                     let hours = appState.notifierPlugin.reports(PulseClient.hoursCapability)
                     if quiet || hours { quietSection(state, quiet: quiet, hours: hours) }
@@ -90,6 +109,9 @@ struct PulseSettingsPage: View {
             }
         }
         .navigationTitle(Text(AppLocalization.string("Pulse (beta)")))
+        // What it showed last time, before the first frame; Pulse's answer
+        // follows.
+        .onAppear(perform: showKept)
         // Read on every visit, also back from What Pulse remembers, whose
         // counts may have changed.
         .task(id: appState.activeDashboardID) { await load() }
@@ -103,6 +125,7 @@ struct PulseSettingsPage: View {
             actionTask = nil
             workingID = nil
             state = nil
+            answered = false
             loadError = nil
             errorMessage = nil
             notice = nil
@@ -111,9 +134,12 @@ struct PulseSettingsPage: View {
             draftTimes = nil
             noteDraft = nil
             providers = []
+            modelsFailed = false
+            modelsAnswered = false
             showsRecent = false
             // Turning deadlines off was asked of the old host; answered now, it would act on the new one.
             confirmsInboxOff = false
+            showKept()
         }
     }
 
@@ -135,6 +161,10 @@ struct PulseSettingsPage: View {
                     Label(AppLocalization.string("Pulse is running on the dashboard."), systemImage: "checkmark.circle")
                         .scaledFont(.caption)
                         .foregroundStyle(.secondary)
+                } else if state.hermesTooOld {
+                    Text("This Hermes is too old to run Pulse. Update Hermes, then restart the dashboard.")
+                        .scaledFont(.caption)
+                        .foregroundStyle(.orange)
                 } else {
                     Text("The dashboard isn't running Pulse. Restart it after updating the plugin.")
                         .scaledFont(.caption)
@@ -158,13 +188,26 @@ struct PulseSettingsPage: View {
                 // whether or not the plugin names it as a problem.
                 Button(AppLocalization.string("Pin it")) {
                     run { _ in
-                        try await appState.pinPulseHomeChat(id: chat.id)
+                        try await appState.pinPulseHomeChat(id: chat.id, profile: state.profile)
                         return nil
                     }
                 }
                 .buttonStyle(.settings)
-                .disabled(working || appState.client == nil)
+                .disabled(waiting || appState.client == nil)
                 .accessibilityIdentifier("settings.pulse.pin-chat")
+            }
+            if !answered, let loadError {
+                // What it kept stays up; the steps that wait, wait for this.
+                Text("Couldn't read Pulse's settings.")
+                    .scaledFont(.footnote)
+                    .foregroundStyle(.secondary)
+                Text(verbatim: loadError)
+                    .scaledFont(.caption)
+                    .foregroundStyle(.red)
+                Button(AppLocalization.string("Try again")) {
+                    Task { await load() }
+                }
+                .buttonStyle(.settings)
             }
             if let errorMessage {
                 Text(verbatim: errorMessage)
@@ -176,18 +219,19 @@ struct PulseSettingsPage: View {
 
     private func homeChatSection(_ state: PulseState) -> some View {
         ConduitSettingsSection(title: AppLocalization.string("Set up Pulse"), symbol: "pin", tint: .conduitAccent) {
-            Text(AppLocalization.string("Pulse keeps its reports in a chat of its own in the dashboard's default profile. It stays out of your chats."))
+            Text(AppLocalization.string("Pulse keeps its reports in a chat of its own in the profile it runs in, \(appState.profileDisplayName(state.profile ?? AppState.pulseDefaultProfile)). It stays out of your chats."))
                 .scaledFont(.footnote)
                 .foregroundStyle(.secondary)
             Button(AppLocalization.string("Set up Pulse")) {
                 let title = state.homeTitle
+                let profile = state.profile
                 run { _ in
-                    try await appState.createPulseHomeChat(title: title)
+                    try await appState.createPulseHomeChat(title: title, profile: profile)
                     return nil
                 }
             }
             .buttonStyle(.settingsPrimary)
-            .disabled(working || appState.client == nil)
+            .disabled(waiting || appState.client == nil)
             .accessibilityIdentifier("settings.pulse.create-chat")
             if !state.homeProblem.isEmpty {
                 // The plugin's own words, in English.
@@ -261,6 +305,41 @@ struct PulseSettingsPage: View {
         }
     }
 
+    /// Where Do it (and a pick's Ask) goes for a card from no chat (0.164.0): a new chat,
+    /// or a bot's Bot Chat. Kept on this phone, per dashboard; the widget's
+    /// Do it follows it too.
+    private var doItSection: some View {
+        ConduitSettingsSection(title: AppLocalization.string("Do it"), symbol: "arrow.right.circle", tint: .conduitAccent) {
+            ConduitMenuPicker(
+                value: appState.pulseDoItBot?.name ?? appState.pulseDoItBotSavedName ?? "",
+                choices: doItChoices,
+                onSelect: { picked in
+                    Haptics.selection()
+                    appState.setPulseDoItBot(picked.isEmpty ? nil : picked)
+                }
+            ) {
+                Text("Cards from no chat").foregroundStyle(.secondary)
+            }
+            .accessibilityIdentifier("settings.pulse.do-it-bot")
+            Text("Where Do it opens for a card that came from no chat, such as one from your calendar: a new chat, or a bot's Bot Chat. The widget's Do it goes there too. Long-press Do it to pick another for one card.")
+                .scaledFont(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    /// New chat and the bots Do it can open; a saved bot that isn't one now
+    /// (hidden, gone, or the list not read yet) stays listed by its name, so
+    /// the row never says New chat while Do it would go back to that bot.
+    private var doItChoices: [(id: String, title: String)] {
+        let bots = appState.pulseDoItBotChoices.map { (id: $0.name, title: $0.displayLabel) }
+        var choices = [(id: "", title: AppLocalization.string("New chat"))] + bots
+        if let saved = appState.pulseDoItBotSavedName, !bots.contains(where: { $0.id == saved }) {
+            let known = appState.botRoster.first { $0.name == saved }
+            choices.append((id: saved, title: known?.displayLabel ?? saved))
+        }
+        return choices
+    }
+
     /// Quiet times (0.80.2, `quiet`): the days of the week Pulse keeps to
     /// itself, and a vacation until a day. Quiet for today is on the Pulse
     /// screen and on a Pulse notification; it shows here as a vacation back
@@ -281,7 +360,7 @@ struct PulseSettingsPage: View {
         PulseQuietDaysPicker(days: Set(state.quietDays)) { days in
             change(["quiet_days": days]) { $0.quietDays = days }
         }
-        .disabled(working)
+        .disabled(waiting)
         .accessibilityIdentifier("settings.pulse.quiet-days")
         Toggle("Vacation", isOn: Binding(
             get: { state.quietUntil != nil },
@@ -372,7 +451,7 @@ struct PulseSettingsPage: View {
             ),
             displayedComponents: .hourAndMinute
         )
-        .disabled(working)
+        .disabled(waiting)
     }
 
     /// What the user wants from Pulse, in their own words: the plugin's
@@ -394,7 +473,7 @@ struct PulseSettingsPage: View {
             .textFieldStyle(.roundedBorder)
             .lineLimit(2...8)
             .focused($noteFocused)
-            .disabled(working)
+            .disabled(waiting)
             .accessibilityLabel(Text(AppLocalization.string("Note to Pulse")))
             .accessibilityHint(Text(limit))
             .accessibilityIdentifier("settings.pulse.note")
@@ -417,7 +496,7 @@ struct PulseSettingsPage: View {
                         saveNote(trimmed)
                     }
                     .buttonStyle(.settingsPrimary)
-                    .disabled(working || tooLong)
+                    .disabled(waiting || tooLong)
                     .accessibilityIdentifier("settings.pulse.note-save")
                 }
             }
@@ -455,17 +534,12 @@ struct PulseSettingsPage: View {
                 PulseMemoryList()
                     .v2TabBarClearance()
             } label: {
-                HStack {
-                    Label(AppLocalization.string("What Pulse remembers"), systemImage: "list.bullet.rectangle")
-                    Spacer(minLength: 8)
-                    if state.memory {
-                        Text(verbatim: state.memoryCounts.values.reduce(0, +).formatted())
-                            .foregroundStyle(.secondary)
-                    }
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .frame(minHeight: 44)
+                SettingsLinkRow(
+                    title: AppLocalization.string("What Pulse remembers"),
+                    value: state.memory ? state.memoryCounts.values.reduce(0, +).formatted() : nil
+                )
             }
+            .buttonStyle(.plain)
             .accessibilityIdentifier("settings.pulse.remembers")
             Text("Pulse keeps short notes on promises, plans and dates, so it can bring them up later. You can remove any of them.")
                 .scaledFont(.caption)
@@ -689,6 +763,8 @@ struct PulseSettingsPage: View {
                     displayedComponents: .hourAndMinute
                 )
                 .labelsHidden()
+                // A save writes the whole list.
+                .disabled(!answered)
                 .accessibilityLabel(Text(AppLocalization.string("Report time")))
                 Spacer(minLength: 8)
                 Button {
@@ -703,7 +779,7 @@ struct PulseSettingsPage: View {
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-                .disabled(times.count <= 1)
+                .disabled(!answered || times.count <= 1)
                 .accessibilityLabel(Text(AppLocalization.string("Remove \(time)")))
             }
         }
@@ -711,7 +787,7 @@ struct PulseSettingsPage: View {
             editTimes(times + [PulseReportTime.next(after: times)])
         }
         .buttonStyle(.settings)
-        .disabled(times.count >= PulseReportTime.maxCount)
+        .disabled(!answered || times.count >= PulseReportTime.maxCount)
         .accessibilityIdentifier("settings.pulse.add-time")
     }
 
@@ -732,33 +808,60 @@ struct PulseSettingsPage: View {
     private func modelSection(_ state: PulseState) -> some View {
         let selection = state.model.map { VoiceJobModelSettingsSection.tag(provider: $0.provider, model: $0.model) } ?? ""
         return ConduitSettingsSection(title: AppLocalization.string("Model"), symbol: "cpu", tint: .conduitAccent) {
-            ConduitMenuPicker(
-                value: selection,
-                choices: VoiceJobModelSettingsSection.modelChoices(
-                    defaultTitle: Self.defaultModelTitle(state, providers: providers),
-                    defaultTag: "",
-                    selection: selection,
-                    providers: providers
-                ),
+            TaggedModelChooserLink(
+                pageTitle: AppLocalization.string("Pulse model"),
+                defaultTitle: Self.defaultModelTitle(state, providers: providers),
+                choice: TaggedModelChoice(defaultTag: "", selection: selection),
+                catalog: ModelChooserCatalog(providers: providers, loaded: !providers.isEmpty || modelsAnswered, answered: modelsAnswered, failed: modelsFailed),
+                disabled: waiting || !modelsAnswered,
+                retry: { Task { await loadModels(profile: state.profile) } },
                 onSelect: { tag in
                     guard tag != selection else { return }
                     let pick = tag.isEmpty ? nil : VoiceJobModelSettingsSection.parse(tag)
                     setModel(pick.map { PulseModel(provider: $0.provider ?? "", model: $0.model) })
-                }
-            ) {
-                Text("Model").foregroundStyle(.secondary)
+                },
+                identifier: "settings.pulse.model"
+            )
+            if modelsFailed {
+                // The models listed stay up; Hermes didn't answer.
+                ModelCatalogPlaceholder(state: .failed) { Task { await loadModels(profile: state.profile) } }
             }
-            .disabled(working)
-            .accessibilityIdentifier("settings.pulse.model")
             Text("Pulse's reports, morning brief, follow-ups and memory run on this model. A fast, cheap model is plenty.")
                 .scaledFont(.caption)
                 .foregroundStyle(.secondary)
         }
-        .task(id: appState.activeDashboardID) {
-            let dashboard = appState.activeDashboardID
-            let loaded = await appState.loadVoiceJobModelProviders()
-            if appState.activeDashboardID == dashboard { providers = loaded }
+        // Pulse's profile's models, where its model is set (issue 1681).
+        .task(id: "\(appState.activeDashboardID?.uuidString ?? "")|\(state.profile ?? "")") {
+            await loadModels(profile: state.profile)
+            // Hermes fetches a stale provider list in the background
+            // meanwhile (issue 1807).
+            await ModelCatalogSettle.readAgain { await loadModels(profile: state.profile) }
         }
+    }
+
+    /// One that fails keeps the models listed, the kept ones included,
+    /// and says so with Try Again.
+    private func loadModels(profile: String?) async {
+        let dashboard = appState.activeDashboardID
+        if modelsProfile != profile {
+            // Another profile's models never stay up to be picked for this one.
+            providers = appState.keptModelProviders(inProfile: profile ?? AppState.pulseDefaultProfile)
+            modelsAnswered = false
+            modelsFailed = false
+        }
+        modelsProfile = profile
+        modelsRead += 1
+        let asked = modelsRead
+        let loaded = await appState.loadModelProviders(inProfile: profile ?? AppState.pulseDefaultProfile)
+        // A read for a profile no longer shown never lands on the picker,
+        // nor one a later read (the read again, Try Again) overtook.
+        guard !Task.isCancelled, modelsProfile == profile, appState.activeDashboardID == dashboard,
+              asked == modelsRead else { return }
+        if let loaded {
+            providers = loaded
+            modelsAnswered = true
+        }
+        modelsFailed = loaded == nil
     }
 
     /// The turns' model first, as Pulse checks it, then memory's slot. A
@@ -772,7 +875,7 @@ struct PulseSettingsPage: View {
             let next = try await client.update(["model": model?.setting ?? NSNull()])
             guard isShown(client) else { return nil }
             do {
-                try await appState.setPulseMemoryModel(model)
+                try await appState.setPulseMemoryModel(model, profile: shown.profile)
             } catch {
                 if isShown(client) { _ = try? await client.update(["model": previous?.setting ?? NSNull()]) }
                 throw error
@@ -820,7 +923,7 @@ struct PulseSettingsPage: View {
                         .buttonStyle(.settings)
                         .accessibilityIdentifier("settings.pulse.backfill-cancel")
                 }
-                .disabled(working)
+                .disabled(waiting)
             case .paused:
                 HStack(spacing: 10) {
                     Button(AppLocalization.string("Carry on")) { backfillStep(.start) }
@@ -830,7 +933,7 @@ struct PulseSettingsPage: View {
                         .buttonStyle(.settings)
                         .accessibilityIdentifier("settings.pulse.backfill-cancel")
                 }
-                .disabled(working)
+                .disabled(waiting)
             case .none, .done, .cancelled:
                 Stepper(value: $dayCount, in: 1...PulseBackfillEstimate.maxDays) {
                     HStack {
@@ -841,6 +944,8 @@ struct PulseSettingsPage: View {
                     }
                 }
                 .onChange(of: dayCount) { _, _ in estimate = nil }
+                // Its days come from Pulse's answer.
+                .disabled(!answered)
                 .accessibilityIdentifier("settings.pulse.days")
                 if let estimate, estimate.days == dayCount {
                     SettingsMetricRow(label: AppLocalization.string("Chats"), value: estimate.chats.formatted())
@@ -853,7 +958,7 @@ struct PulseSettingsPage: View {
                     }
                     Button(AppLocalization.string("Start")) { backfillStep(.start, days: dayCount) }
                         .buttonStyle(.settingsPrimary)
-                        .disabled(working)
+                        .disabled(waiting)
                         .accessibilityIdentifier("settings.pulse.backfill-start")
                 } else {
                     Button(AppLocalization.string("Estimate")) {
@@ -865,7 +970,7 @@ struct PulseSettingsPage: View {
                         }
                     }
                     .buttonStyle(.settings)
-                    .disabled(working)
+                    .disabled(waiting)
                     .accessibilityIdentifier("settings.pulse.estimate")
                 }
             }
@@ -933,6 +1038,22 @@ struct PulseSettingsPage: View {
 
     // MARK: Actions
 
+    /// The state the page showed last time on this dashboard, drawn until
+    /// Pulse answers. Only drawn: a kept state with Where you are off
+    /// doesn't stop this iPhone watching shops (`apply` does, on Pulse's
+    /// answer), and the days to read follow the answer again.
+    private func showKept() {
+        let keptState = appState.keptPulseState()
+        if providers.isEmpty {
+            providers = appState.keptModelProviders(
+                inProfile: (state ?? keptState)?.profile ?? AppState.pulseDefaultProfile
+            )
+        }
+        guard state == nil, let kept = keptState else { return }
+        state = kept
+        dayCount = kept.backfillDays
+    }
+
     private func load() async {
         let client = self.client
         let steps = stepsStarted
@@ -943,14 +1064,24 @@ struct PulseSettingsPage: View {
             loadError = nil
         } catch {
             guard isShown(client), !Task.isCancelled else { return }
-            if state == nil { loadError = PulseRefusal.message(for: error) }
+            // In place of the page, or under the state it kept; a page Pulse
+            // has answered keeps what it shows.
+            if !answered { loadError = PulseRefusal.message(for: error) }
         }
     }
 
+    /// After a step; one that fails before Pulse ever answered offers to
+    /// try again, as the first read does (that read gave way to the step).
     private func reload() async {
         let client = self.client
-        guard let next = try? await client.state(), isShown(client) else { return }
-        apply(next)
+        do {
+            let next = try await client.state()
+            guard isShown(client) else { return }
+            apply(next)
+        } catch {
+            guard isShown(client), !Task.isCancelled, !answered else { return }
+            loadError = PulseRefusal.message(for: error)
+        }
     }
 
     private func apply(_ next: PulseState) {
@@ -959,6 +1090,7 @@ struct PulseSettingsPage: View {
             seededDays = true
         }
         state = next
+        answered = true
         // Pulse, Where you are or Walking past off, here or elsewhere: this
         // iPhone stops watching shops for this dashboard now.
         if location.binding?.dashboardID == appState.activeDashboardID,
@@ -1072,6 +1204,7 @@ struct PulseSettingsPage: View {
             guard !Task.isCancelled, appState.activeDashboardID == dashboard else { return }
             let id = UUID()
             workingID = id
+            stepsStarted += 1
             defer { if workingID == id { workingID = nil } }
             errorMessage = nil
             do {
@@ -1135,6 +1268,9 @@ struct PulseMemoryList: View {
     @EnvironmentObject private var appState: AppState
     @ObservedObject var appLanguage = AppLanguageStore.shared
     @State private var items: [PulseMemoryItem] = []
+    /// There's a list to show: Pulse's, or the one kept from last time
+    /// (#1533) until Pulse answers. Forgetting a kept item is safe: it's
+    /// named by its id, and one already gone stays gone.
     @State private var loaded = false
     @State private var forgetting = false
 
@@ -1144,7 +1280,7 @@ struct PulseMemoryList: View {
     @State private var errorMessage: String?
 
     var body: some View {
-        List {
+        ConduitList {
             if let errorMessage {
                 Text(verbatim: errorMessage)
                     .scaledFont(.footnote)
@@ -1182,18 +1318,26 @@ struct PulseMemoryList: View {
         .overlay {
             if !loaded { ProgressView() }
         }
-        .scrollContentBackground(.hidden)
-        .background(SettingsBackdrop())
         .navigationTitle(Text(AppLocalization.string("What Pulse remembers")))
         .navigationBarTitleDisplayMode(.inline)
         .refreshable { await load() }
+        // What it listed last time, before the first frame; Pulse's answer
+        // follows.
+        .onAppear(perform: showKept)
         // Read again for another dashboard's host; nothing of the old one's stays.
         .task(id: appState.activeDashboardID) { await load() }
         .onChange(of: appState.activeDashboardID) { _, _ in
             items = []
             loaded = false
             errorMessage = nil
+            showKept()
         }
+    }
+
+    private func showKept() {
+        guard !loaded, let kept = appState.keptPulseMemory() else { return }
+        items = kept
+        loaded = true
     }
 
     private func row(_ item: PulseMemoryItem) -> some View {
@@ -1261,10 +1405,14 @@ struct PulseMemoryList: View {
         guard !forgetting else { return }
         forgetting = true
         let client = appState.pulseClient
+        let owner = appState.currentDashboardRuntimeOwner()
         Task {
             defer { forgetting = false }
             do {
                 _ = try await client.forget(id: item.id)
+                // The kept list follows on the dashboard it was forgotten on,
+                // shown or not.
+                if let owner { await appState.forgetKeptPulseMemoryItem(id: item.id, owner: owner) }
                 guard isShown(client) else { return }
                 items.removeAll { $0.id == item.id }
                 errorMessage = nil

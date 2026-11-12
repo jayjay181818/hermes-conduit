@@ -19,6 +19,7 @@ import SwiftUI
 /// runs, events, and metadata but never overwrites unsaved user edits; diffs
 /// run against the last-synced server baseline.
 struct KanbanTaskDetailView: View {
+    @EnvironmentObject private var appState: AppState
     @ObservedObject var appLanguage = AppLanguageStore.shared
     /// Editable fields as last synced from the server. The draft fields below
     /// are compared against this so a poll can refresh collections WITHOUT
@@ -121,11 +122,19 @@ struct KanbanTaskDetailView: View {
         displayedTask?.status == "blocked"
     }
 
-    /// The worker's question on a blocked task. Nil for a manual or
-    /// dependency block, which get neither the callout nor Reply & unblock.
-    private var blockedQuestion: String? {
+    /// What a blocked task waits on: the worker's question, a task created
+    /// Blocked, or a block with no reason. Nil for a dependency block, which
+    /// gets no callout (Dependencies shows what it waits for).
+    private var blockedWait: KanbanBlockedQuestion.Wait? {
         guard isBlocked, let detail else { return nil }
-        return KanbanBlockedQuestion.reason(in: detail)
+        return KanbanBlockedQuestion.wait(in: detail)
+    }
+
+    /// The worker's question on a blocked task. Only a question gets Reply &
+    /// unblock; any other block is moved on with Status.
+    private var blockedQuestion: String? {
+        if case .question(let question)? = blockedWait { return question }
+        return nil
     }
 
     private var hasUnsavedChanges: Bool {
@@ -183,8 +192,8 @@ struct KanbanTaskDetailView: View {
                         // worker's question (when it asked one) and the reply
                         // box sit together up top.
                         if isBlocked {
-                            if let question = blockedQuestion {
-                                blockedCallout(question: question)
+                            if let wait = blockedWait {
+                                blockedCallout(wait)
                             }
                             commentsSection
                         }
@@ -259,20 +268,31 @@ struct KanbanTaskDetailView: View {
                 await loadDetail(force: true)
             }
             // The poll stops in the background, and slows to a backstop
-            // while the board's live stream is connected.
+            // while the board's live stream is connected. Without the
+            // stream, reads that find nothing new space themselves out.
             .task(id: "\(displayedTaskID)|\(scenePhase == .background)|\(store.liveStreamConnected)") {
                 guard scenePhase != .background else { return }
+                var unchangedReads = 0
                 while !Task.isCancelled {
                     do {
                         try await Task.sleep(nanoseconds: KanbanPollingPolicy.detailInterval(
                             streaming: store.liveStreamConnected,
+                            unchangedReads: unchangedReads,
                             conditions: DeviceConditionsMonitor.shared.current
                         ))
                     } catch {
                         break
                     }
                     guard !Task.isCancelled else { break }
+                    // loadDetail skips a read under a write or another load:
+                    // that tick isn't a read, so it doesn't count.
+                    guard !isSaving, !isAddingComment, !isRequeuing, !isUnblocking, !isLoadingDetail else { continue }
+                    let before = detail
                     await loadDetail()
+                    // Only a read that landed and found nothing new counts:
+                    // a failed one keeps the base pace, so a recovery shows soon.
+                    let landed = detail != nil && refreshErrorMessage == nil
+                    unchangedReads = landed && detail == before ? unchangedReads + 1 : 0
                 }
             }
             // V3D: a coalesced live-event batch that TOUCHES the displayed
@@ -342,6 +362,7 @@ struct KanbanTaskDetailView: View {
             .sheet(isPresented: $showModelSheet) {
                 KanbanModelOverrideSheet(value: $modelOverrideDraft)
                     .environment(store)
+                    .environmentObject(appState)
                     .presentationDetents([.medium, .large])
             }
             .onChange(of: showModelSheet) { wasOpen, nowOpen in
@@ -470,14 +491,18 @@ struct KanbanTaskDetailView: View {
                 .frame(minHeight: 120)
                 .padding(4)
                 .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 12))
-            Picker("Status", selection: $status) {
-                ForEach(statusOptions) { value in
-                    Label(value.displayName, systemImage: value.systemImage)
-                        .tag(value.rawValue)
-                        .disabled(!value.isManuallySelectable)
+            // Settings' dropdown field. A status Hermes sets itself (Running,
+            // Review) is listed while the task is in it, but can't be picked.
+            ConduitMenuPicker(
+                value: status,
+                choices: statusOptions.map { (id: $0.rawValue, title: $0.displayName) },
+                onSelect: { picked in
+                    guard KanbanStatusPresentation.forStatus(picked).isManuallySelectable else { return }
+                    status = picked
                 }
+            ) {
+                Text("Status").foregroundStyle(.secondary)
             }
-            .pickerStyle(.menu)
             Button {
                 Task { await saveChanges() }
             } label: {
@@ -500,12 +525,14 @@ struct KanbanTaskDetailView: View {
     private var assignmentExecutionSection: some View {
         ConduitSettingsSection(title: AppLocalization.string("Assignment & Execution"), symbol: "person.crop.rectangle.stack", tint: .conduitAura) {
             HStack(spacing: 8) {
+                // Label and value as SettingsMetricRow draws them, so the
+                // card's rows read alike.
                 Text("Assignee")
-                    .scaledFont(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
                 Spacer(minLength: 8)
                 if let assignee = displayedTask?.assignee, !assignee.isEmpty {
                     Text(assignee)
+                        .scaledFont(.subheadline.weight(.medium))
                         .lineLimit(1)
                 } else {
                     Text(AppLocalization.string("Unassigned") + (displayedTask?.status == "ready" && hasDispatcherFallback ? " " + AppLocalization.string("→ default") : ""))
@@ -514,8 +541,12 @@ struct KanbanTaskDetailView: View {
                 Button {
                     showReassignSheet = true
                 } label: {
-                    Image(systemName: "arrow.triangle.2.circlepath.person")
+                    Image(systemName: "person.2")
+                        .foregroundStyle(.conduitAccent)
+                        .frame(minWidth: 32, minHeight: 32)
+                        .contentShape(Rectangle())
                 }
+                .buttonStyle(.plain)
                 .accessibilityLabel("Reassign task")
             }
             if let priority = displayedTask?.priority {
@@ -544,20 +575,21 @@ struct KanbanTaskDetailView: View {
             } label: {
                 HStack(spacing: 8) {
                     Text("Model")
-                        .scaledFont(.caption.weight(.semibold))
                         .foregroundStyle(.secondary)
                     Spacer(minLength: 8)
                     // Display-only: derived from the loaded server task,
                     // never from the editor draft.
                     Text(KanbanModelOverrideDisplayPolicy.label(for: displayedTask, inheritCopy: AppLocalization.string("Inherit from profile")))
+                        .scaledFont(.subheadline.weight(.medium))
                         .foregroundStyle(hasAnyServerOverride ? Color.primary : Color.secondary)
                         .lineLimit(2)
                         .multilineTextAlignment(.trailing)
-                    Image(systemName: "chevron.right")
-                        .scaledFont(.caption2.weight(.semibold))
-                        .foregroundStyle(.conduitTertiary)
+                    SettingsChevron()
                 }
+                .frame(minHeight: 44)
+                .contentShape(Rectangle())
             }
+            .buttonStyle(.plain)
             .accessibilityHint("Edits the per-task model, provider, and reasoning override")
             if isRunning, let pid = displayedTask?.workerPid {
                 SettingsMetricRow(label: AppLocalization.string("Worker PID"), value: String(pid))
@@ -681,18 +713,34 @@ struct KanbanTaskDetailView: View {
         }
     }
 
-    private func blockedCallout(question: String) -> some View {
+    /// Says in plain words what the task waits on and how to move it on;
+    /// never a code Hermes wrote, such as `initial_status` (issue #1601).
+    private func blockedCallout(_ wait: KanbanBlockedQuestion.Wait) -> some View {
         let tint = KanbanStatusPresentation.forStatus("blocked").tint
         return VStack(alignment: .leading, spacing: 6) {
-            Label("Waiting on you", systemImage: "questionmark.bubble")
-                .scaledFont(.subheadline.weight(.semibold))
-                .foregroundStyle(tint)
-            Text(question)
-                .scaledFont(.footnote)
-                .textSelection(.enabled)
-            Text("Reply & unblock posts your answer and moves the task back to Ready, so the next run sees it.")
-                .scaledFont(.caption2)
-                .foregroundStyle(.secondary)
+            switch wait {
+            case .question(let question):
+                Label("The agent needs you", systemImage: "questionmark.bubble")
+                    .scaledFont(.subheadline.weight(.semibold))
+                    .foregroundStyle(tint)
+                Text(question)
+                    .scaledFont(.footnote)
+                    .textSelection(.enabled)
+                Text("Reply & unblock posts your answer and moves the task back to Ready, so the next run sees it. Add comment only posts it, and the task stays Blocked.")
+                    .scaledFont(.caption2)
+                    .foregroundStyle(.secondary)
+            case .createdBlocked, .noReason:
+                Label("Waiting on you", systemImage: "hand.raised")
+                    .scaledFont(.subheadline.weight(.semibold))
+                    .foregroundStyle(tint)
+                Text(wait == .createdBlocked
+                     ? AppLocalization.string("This task was created as Blocked, so no worker starts it until you move it on. The agent didn't ask a question: the description says what the task is for.")
+                     : AppLocalization.string("No reason was given for this block, and the agent didn't ask a question."))
+                    .scaledFont(.footnote)
+                Text("When it can go ahead, set its status to Ready and save. Add a comment first if the worker needs to know something.")
+                    .scaledFont(.caption2)
+                    .foregroundStyle(.secondary)
+            }
         }
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -841,11 +889,12 @@ struct KanbanTaskDetailView: View {
                             }
                         }
                         Spacer()
-                        Image(systemName: "chevron.right")
-                            .scaledFont(.caption2.weight(.semibold))
-                            .foregroundStyle(.conduitTertiary)
+                        SettingsChevron()
                     }
+                    .frame(minHeight: 44)
+                    .contentShape(Rectangle())
                 }
+                .buttonStyle(.plain)
                 .accessibilityLabel("Open linked task \(linkedTaskTitle(for: linkedID))")
             }
         }
@@ -893,54 +942,65 @@ struct KanbanTaskDetailView: View {
                     .scaledFont(.caption2)
                     .foregroundStyle(.secondary)
             }
-            HStack(spacing: 10) {
-                Button {
-                    Task { await addComment() }
-                } label: {
-                    HStack {
-                        Spacer()
-                        if isAddingComment { ProgressView() } else { Label(isRunning ? AppLocalization.string("Send") : AppLocalization.string("Add comment"), systemImage: "paperplane") }
-                        Spacer()
-                    }
-                }
-                .buttonStyle(.bordered)
-                .disabled(comment.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isAddingComment || isUnblocking || isRequeuing)
-                .accessibilityLabel(isRunning ? AppLocalization.string("Send") : AppLocalization.string("Add comment"))
-                if isRunning {
-                    // Upstream "Note & requeue": post the note, then reclaim so
-                    // the dispatcher re-runs the task with the note in context.
-                    Button {
-                        Task { await noteAndRequeue() }
-                    } label: {
-                        HStack {
-                            Spacer()
-                            if isRequeuing { ProgressView() } else { Label("Note & requeue", systemImage: "arrow.uturn.backward.circle") }
-                            Spacer()
-                        }
-                    }
-                    .buttonStyle(.bordered)
-                    .tint(.orange)
-                    .disabled(comment.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isRequeuing || isAddingComment || isUnblocking)
-                    .accessibilityLabel("Note & requeue")
-                }
-                if blockedQuestion != nil {
-                    // A comment alone leaves the task parked in Blocked; the
-                    // worker only reads the answer once the task runs again.
-                    Button {
-                        Task { await replyAndUnblock() }
-                    } label: {
-                        HStack {
-                            Spacer()
-                            if isUnblocking { ProgressView() } else { Label("Reply & unblock", systemImage: "arrowshape.turn.up.left") }
-                            Spacer()
-                        }
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .tint(.conduitAccent)
-                    .disabled(comment.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isUnblocking || isAddingComment || isRequeuing)
-                    .accessibilityLabel("Reply & unblock")
+            // Side by side when every label fits on one line; stacked full
+            // width when one doesn't (a long translation on an iPhone),
+            // instead of pills whose labels wrap word by word (issue #1601).
+            // Stacked, a label may still wrap at the largest text sizes
+            // rather than be cut off.
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 10) { commentButtons(oneLine: true) }
+                VStack(spacing: 8) { commentButtons(oneLine: false) }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func commentButtons(oneLine: Bool) -> some View {
+        Button {
+            Task { await addComment() }
+        } label: {
+            HStack {
+                Spacer(minLength: 0)
+                if isAddingComment { ProgressView() } else { Label(isRunning ? AppLocalization.string("Send") : AppLocalization.string("Add comment"), systemImage: "paperplane").lineLimit(oneLine ? 1 : nil) }
+                Spacer(minLength: 0)
+            }
+        }
+        .buttonStyle(.bordered)
+        .disabled(comment.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isAddingComment || isUnblocking || isRequeuing)
+        .accessibilityLabel(isRunning ? AppLocalization.string("Send") : AppLocalization.string("Add comment"))
+        if isRunning {
+            // Upstream "Note & requeue": post the note, then reclaim so
+            // the dispatcher re-runs the task with the note in context.
+            Button {
+                Task { await noteAndRequeue() }
+            } label: {
+                HStack {
+                    Spacer(minLength: 0)
+                    if isRequeuing { ProgressView() } else { Label("Note & requeue", systemImage: "arrow.uturn.backward.circle").lineLimit(oneLine ? 1 : nil) }
+                    Spacer(minLength: 0)
                 }
             }
+            .buttonStyle(.bordered)
+            .tint(.orange)
+            .disabled(comment.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isRequeuing || isAddingComment || isUnblocking)
+            .accessibilityLabel("Note & requeue")
+        }
+        if blockedQuestion != nil {
+            // A comment alone leaves the task parked in Blocked; the
+            // worker only reads the answer once the task runs again.
+            Button {
+                Task { await replyAndUnblock() }
+            } label: {
+                HStack {
+                    Spacer(minLength: 0)
+                    if isUnblocking { ProgressView() } else { Label("Reply & unblock", systemImage: "arrowshape.turn.up.left").lineLimit(oneLine ? 1 : nil) }
+                    Spacer(minLength: 0)
+                }
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(.conduitAccent)
+            .disabled(comment.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isUnblocking || isAddingComment || isRequeuing)
+            .accessibilityLabel("Reply & unblock")
         }
     }
 
@@ -1729,14 +1789,15 @@ struct KanbanReassignSheet: View {
 
     var body: some View {
         NavigationStack {
-            Form {
-                Section("Profiles") {
+            SettingsDetailContainer {
+                ConduitSettingsSection(title: AppLocalization.string("Profiles"), symbol: "person.2", tint: .conduitAccent) {
                     ForEach(store.profiles) { profile in
                         Button {
                             Task { await reassign(to: profile.name) }
                         } label: {
                             HStack {
                                 Text(profile.name)
+                                    .foregroundStyle(.primary)
                                 Spacer()
                                 if profile.name == currentAssignee {
                                     Image(systemName: "checkmark")
@@ -1746,27 +1807,33 @@ struct KanbanReassignSheet: View {
                                     ProgressView()
                                 }
                             }
+                            .frame(minHeight: 36)
+                            .contentShape(Rectangle())
                         }
+                        .buttonStyle(.plain)
                         .disabled(pendingProfile != nil)
                     }
                 }
                 if (currentAssignee ?? "").isEmpty == false {
-                    Section {
-                        Button(role: .destructive) {
+                    SettingsCard {
+                        Button {
                             Task { await reassign(to: nil) }
                         } label: {
                             HStack {
                                 Text("Unassign (parked — won't run)")
+                                    .foregroundStyle(.red)
+                                Spacer()
                                 if pendingProfile == "__unassign__" { ProgressView() }
                             }
+                            .frame(minHeight: 36)
+                            .contentShape(Rectangle())
                         }
+                        .buttonStyle(.plain)
                         .disabled(pendingProfile != nil)
                     }
                 }
                 if let errorMessage {
-                    Section {
-                        Text(errorMessage).foregroundStyle(.red).scaledFont(.footnote)
-                    }
+                    Text(errorMessage).foregroundStyle(.red).scaledFont(.footnote)
                 }
             }
             .navigationTitle("Reassign")

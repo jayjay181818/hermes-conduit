@@ -47,6 +47,23 @@ struct RootView: View {
             ConnectLinkSheet(link: link)
                 .environmentObject(appState)
         }
+        // A Link invite, the same way: it waits there for Conduit to
+        // connect when it opened Conduit.
+        .sheet(item: $appState.pendingRoomLink) { invite in
+            RoomLinkOpenedSheet(invite: invite)
+                .environmentObject(appState)
+        }
+        // An invite to a room whose notification was tapped: its join card.
+        .sheet(item: $appState.presentedRoomInvite) { invite in
+            RoomInviteSheet(invite: invite)
+                .environmentObject(appState)
+        }
+        // An approval in a room hosted elsewhere whose notification was
+        // tapped: its card.
+        .sheet(item: $appState.presentedRoomApproval) { approval in
+            RoomApprovalSheet(approval: approval)
+                .environmentObject(appState)
+        }
         // A draft shared from another app before Conduit listed any chats,
         // with more than one dashboard it could be for (#812). An alert, so
         // it shows the same on iPad, where a dialog would need an anchor.
@@ -134,14 +151,23 @@ struct MainView: View {
     /// Conduit V2's tab shell (V2Shell.swift). Off brings back the drawer
     /// shell, the fallback while V2 is on its branch.
     @AppStorage(V2ShellPreference.key) private var useV2Shell = V2ShellPreference.defaultValue
+    /// The tab whose chat this window showed, which iOS keeps for a launch
+    /// after it ended Conduit in the background (V2ReopenedConversation).
+    @SceneStorage(V2ReopenedConversation.sceneStorageKey) private var conversationOnLeave = ""
     @AppStorage(VoiceScreenAwake.preferenceKey) private var keepScreenAwake = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var availableWindowWidth: CGFloat = 0
+    /// The window's side safe area, read here outside every navigation
+    /// stack: the drawer shell's screens take it in place of what UIKit
+    /// hands their stack (`windowSideContent`, #1900). V2 reads its own.
+    @State private var windowSideInsets: WindowSideInsets?
     @State private var settingsPresentation: SettingsSnapshot?
     @State private var shouldPresentSettingsAfterSidebarDismissal = false
     /// The page Settings opens at next, for an in-app settings link.
     @State private var settingsOpensAt: ConduitAppLink.SettingsLink?
     @State private var chatTitlePendingRename: SessionSummary?
+    /// The Keyboard Shortcuts sheet, from ⌘/ (KeyboardShortcuts.swift).
+    @State private var showsKeyboardShortcuts = false
     @State private var chatTitlePendingDeletion: SessionSummary?
 
     private var sidebarPresentation: SidebarPresentation {
@@ -149,6 +175,18 @@ struct MainView: View {
             idiom: UIDevice.current.userInterfaceIdiom,
             prefersPersistentSidebar: prefersPersistentSidebar,
             availableWidth: availableWindowWidth
+        )
+    }
+
+    /// Where V2 opens: read once, when the shell is made.
+    private var conversationToReopen: V2ReopenedConversation.Launch? {
+        guard !conversationOnLeave.isEmpty else { return nil }
+        return V2ReopenedConversation.launch(
+            stored: conversationOnLeave,
+            lastChat: appState.chatResumeLastSessionReference(for: appState.activeProfile)?.kind,
+            hasSavedCopy: appState.offlineChatPresentation?.displayedTranscript != nil,
+            projects: appState.projects,
+            showsPulse: appState.showsPulseScreen
         )
     }
 
@@ -177,6 +215,11 @@ struct MainView: View {
                 NotifierPluginUpdateBanner()
                 // Send the report of a crash or freeze? (CrashReportOffer.swift)
                 CrashReportBanner()
+                // Another chat started waiting on the user (NeedsYou.swift);
+                // a call's screen shows it over the call.
+                if !appState.isVoiceCallScreenPresented {
+                    NeedsYouBanner(store: appState.needsYou)
+                }
                 // Calendar changes Hermes asked for (AppState+PhoneSync.swift);
                 // a call's screen shows them over the call.
                 if !appState.isVoiceCallScreenPresented {
@@ -184,6 +227,8 @@ struct MainView: View {
                 }
             }
         }
+        // Every profile's waiting chats, read while Conduit is on screen.
+        .task { await appState.runNeedsYouPoll() }
         // Confirmations Hermes asks to present (PresentedScreens.swift); a
         // call's screen shows its own over the call.
         .overlay(alignment: .bottom) {
@@ -387,7 +432,17 @@ struct MainView: View {
         // swaps in sign-in), and SwiftUI doesn't promise the sheet's
         // onDismiss then. Its flag must not outlive it: it holds back the
         // return surface while it claims a sheet is up.
-        .onDisappear { appState.isSettingsSheetPresented = false }
+        .onDisappear {
+            appState.isSettingsSheetPresented = false
+            // Signed out: the next sign-in is a launch the user chose, not
+            // a return to the chat (#1559).
+            conversationOnLeave = ""
+        }
+        // The drawer shell doesn't keep the record current: drop it, so
+        // turning V2 back on later doesn't open an old chat.
+        .onChange(of: useV2Shell) { _, usesV2 in
+            if !usesV2 { conversationOnLeave = "" }
+        }
         .background(windowWidthReader)
         .onPreferenceChange(MainViewWindowWidthKey.self) { availableWindowWidth = $0 }
         .onChange(of: isPersistentSidebarActive) { _, persistentActive in
@@ -419,11 +474,34 @@ struct MainView: View {
         }
         // A widget's New Chat or Talk asks Settings out of the way
         // (revealChatForWidgetLaunch); the chat it opens must end up on top.
+        // The sheet's pages belong to the dashboard it opened on, as the
+        // V2 tab's start over on a switch (V2SettingsTab): a switch made
+        // under it, by a notification's route, closes it (issue 2016).
+        .onChange(of: appState.activeDashboardID) { _, _ in
+            shouldPresentSettingsAfterSidebarDismissal = false
+            settingsOpensAt = nil
+            settingsPresentation = nil
+        }
         .onChange(of: appState.settingsDismissRequest) { _, _ in
             // A drawer closing on its way to Settings doesn't open it either.
             shouldPresentSettingsAfterSidebarDismissal = false
             settingsOpensAt = nil
             settingsPresentation = nil
+        }
+        // ⌘, in the drawer shell, which has no tabs: Settings' sheet. V2
+        // selects its tab (V2Shell).
+        .onReceive(KeyboardCommands.tabRequests) { tab in
+            guard !useV2Shell, tab == .settings, settingsPresentation == nil else { return }
+            presentSettings()
+        }
+        // ⌘/: the list of shortcuts, with nothing else in front. With the
+        // list up, the sheet closes itself (KeyboardShortcutsSheet).
+        .onReceive(KeyboardCommands.shortcutListRequests) { _ in
+            guard !showsKeyboardShortcuts, KeyboardCommands.nothingInFront else { return }
+            showsKeyboardShortcuts = true
+        }
+        .sheet(isPresented: $showsKeyboardShortcuts) {
+            KeyboardShortcutsSheet()
         }
         .onChange(of: appState.settingsLinkRequest) { _, page in
             // V2 opens the page in its Settings tab (V2Shell).
@@ -471,8 +549,10 @@ struct MainView: View {
     private var voiceScreenshotBanner: some View {
         ScreenQuestionVoiceBanner(
             screenshot: appState.voiceScreenshot,
+            kind: appState.voiceScreenshotKind,
             onDiscard: appState.discardVoiceScreenshot,
-            onNewChat: appState.canMoveVoiceScreenshotToNewChat
+            // A photo was taken for the conversation's own chat.
+            onNewChat: appState.canMoveVoiceScreenshotToNewChat && appState.voiceScreenshotKind == .screenshot
                 ? { Task { await appState.moveVoiceScreenshotToNewChat() } }
                 : nil
         )
@@ -485,9 +565,10 @@ struct MainView: View {
     @ViewBuilder
     private var sidebarLayoutContent: some View {
         if useV2Shell {
-            // V2 always opens on the Chats list (Eric, 2026-10-15); a chat
-            // a notification or widget opens is pushed over it.
-            V2Shell()
+            // V2 opens on the Chats list (Eric, 2026-10-15), or on the chat
+            // iOS closed it on in the background (#1559); a chat a
+            // notification or widget opens is pushed over it.
+            V2Shell(conversationOnLeave: $conversationOnLeave, reopening: conversationToReopen)
         } else if isPersistentSidebarActive {
             HStack(spacing: 0) {
                 SidebarView(
@@ -495,6 +576,8 @@ struct MainView: View {
                     presentation: .persistent
                 )
                 .frame(width: persistentSidebarWidth)
+                // The leading column's share of the window's side insets.
+                .environment(\.windowSideInsets, windowSideInsets?.reaching(.leading, width: persistentSidebarWidth))
 
                 // Drags the sidebar's width, as V2's list (#1487).
                 ColumnDivider(
@@ -508,9 +591,11 @@ struct MainView: View {
                 )
 
                 chatNavigationContent
+                    .environment(\.windowSideInsets, windowSideInsets?.reaching(.trailing, width: availableWindowWidth - persistentSidebarWidth - 1))
             }
         } else {
             chatNavigationContent
+                .environment(\.windowSideInsets, windowSideInsets)
         }
     }
 
@@ -541,6 +626,7 @@ struct MainView: View {
                 // the backdrop still fills it.
                 .readableChatColumn()
             }
+            .windowSideContent()
             .overlay(alignment: .leading) {
                 if !isPersistentSidebarActive {
                     EdgePanGesture { appState.showSidebar = true }
@@ -605,6 +691,16 @@ struct MainView: View {
                 }
             }
         }
+        // A prompt over the chat holds its read clear, and closing it, or a
+        // sheet over the chat, clears what came in under it (#1579).
+        .onChange(of: chatTitlePendingRename != nil || chatTitlePendingDeletion != nil) { _, covered in
+            appState.chatCoveredBySheet = covered
+            if !covered { appState.clearShownChatNotifications() }
+        }
+        .onChange(of: appState.isModalSheetPresented) { _, presented in
+            if !presented { appState.clearShownChatNotifications() }
+        }
+        .onDisappear { appState.chatCoveredBySheet = false }
         // The chat title's menu needs host-owned rename and delete prompts,
         // like the session list's rows.
         .sheet(item: $chatTitlePendingRename) { session in
@@ -689,6 +785,8 @@ struct MainView: View {
             voiceScreenshotBanner
             PhoneChangeOverlay(engine: appState.phoneSync)
                 .environmentObject(appState)
+            NeedsYouBanner(store: appState.needsYou)
+                .environmentObject(appState)
             // Only V2 draws notices, as its shell does under the call.
             if useV2Shell, let notice = appState.pinSyncNotice {
                 V2NoticeBanner(notice: notice) { appState.dismissPinSyncNotice(notice.id) }
@@ -710,6 +808,10 @@ struct MainView: View {
             },
             onEdit: inCall ? nil : { prompt in
                 Task { await appState.editPresentedConfirm(prompt) }
+            },
+            // Typed on the panel, so it stays open over a call too.
+            onSayInstead: { prompt, text in
+                Task { await appState.answerPresentedConfirm(prompt, outcome: .edit, via: .tap, editText: text) }
             }
         )
     }
@@ -717,6 +819,9 @@ struct MainView: View {
     private var windowWidthReader: some View {
         GeometryReader { proxy in
             Color.clear.preference(key: MainViewWindowWidthKey.self, value: proxy.size.width)
+                .onGeometryChange(for: WindowSideInsets.self) { WindowSideInsets($0.safeAreaInsets, width: $0.size.width) } action: { insets in
+                    if windowSideInsets != insets { windowSideInsets = insets }
+                }
         }
     }
 
@@ -816,9 +921,13 @@ struct ConnectionStatusIndicator: View {
     @ObservedObject var appLanguage = AppLanguageStore.shared
     @EnvironmentObject var appState: AppState
 
+    /// Grey while a reconnect back in the app is still kept quiet, as the
+    /// V2 conversation menu's dot is (#1624).
     private var color: Color {
         if appState.isConnected {
             return .green
+        } else if appState.hidesBriefReconnect {
+            return .secondary
         } else if appState.isRecoveringConnection {
             return .orange
         } else {

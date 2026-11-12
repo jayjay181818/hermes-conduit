@@ -16,8 +16,11 @@ import SwiftUI
 
 /// Where the voice button sits, which decides what a tap starts.
 enum V2VoiceContext: Equatable {
-    /// Chats, Tasks, Bots and Settings: a new call in the current profile.
+    /// Sessions, Tasks and Settings: a new call in the current profile.
     case home
+    /// Bots Home: a tap lists the bots, the one used last first, and
+    /// picking one calls it in its Bot Chat (Eric 2026-11-03).
+    case bots
     /// A project's page: a new chat in that project's folder, in voice.
     case project(ProjectSummary)
     /// The open conversation: voice in it (a Bot Chat calls its bot, a
@@ -41,6 +44,7 @@ struct V2VoiceButton: View {
     /// Faded out (the expanded composer): its bars stop redrawing unseen.
     var isHidden = false
     @EnvironmentObject private var appState: AppState
+    @Environment(\.v2MainButtonDiameter) private var mainButtonDiameter
     /// What the big button beside a chat does, app-wide (Settings >
     /// Appearance); a profile can override it.
     @AppStorage(ChatVoiceButtonAction.key) private var appChatVoiceButton = ChatVoiceButtonAction.defaultValue.rawValue
@@ -131,6 +135,24 @@ struct V2VoiceButton: View {
         context == .home && !returnsToCall && !needsSetup && !recentSessions.isEmpty
     }
 
+    /// Bots Home's button: which bot to call, never a call of its own.
+    private var showsBotMenu: Bool {
+        context == .bots && !returnsToCall && !needsSetup && !callableBots.isEmpty
+    }
+
+    /// The bots shown on Bots Home, the one that talked last first.
+    private var callableBots: [BotProfile] {
+        Self.botsToCall(appState.shownBotRoster)
+    }
+
+    static func botsToCall(_ roster: [BotProfile]) -> [BotProfile] {
+        let shown = roster.filter { !$0.isHiddenByMeta }
+        return shown.enumerated().sorted { a, b in
+            let left = a.element.lastActive ?? 0, right = b.element.lastActive ?? 0
+            return left != right ? left > right : a.offset < b.offset
+        }.map(\.element)
+    }
+
     /// Touch and hold on the chat's big button: a live call or dictation,
     /// whichever the tap doesn't do.
     private var showsChatMenu: Bool { isChatButton && !returnsToCall && !recordsMessage }
@@ -151,6 +173,8 @@ struct V2VoiceButton: View {
         if needsSetup { return AppLocalization.string("Set up voice") }
         switch context {
         case .home: return AppLocalization.string("New voice call")
+        case .bots:
+            return callableBots.isEmpty ? AppLocalization.string("New voice call") : AppLocalization.string("Call a bot")
         case .project(let project):
             return Self.folder(of: project) == nil
                 ? AppLocalization.string("New voice call")
@@ -173,12 +197,32 @@ struct V2VoiceButton: View {
         }
         if !canAct { return appState.phoneVoiceUnavailableReason }
         if showsChatMenu { return AppLocalization.string("Touch and hold to dictate instead") }
+        if showsBotMenu { return AppLocalization.string("Lists your bots to call one") }
         return showsRecentMenu ? AppLocalization.string("Touch and hold for recent conversations") : nil
     }
 
     var body: some View {
         Group {
-            if showsRecentMenu {
+            if showsBotMenu {
+                Menu {
+                    ForEach(callableBots) { bot in
+                        Button {
+                            call(bot)
+                        } label: {
+                            Label {
+                                Text(verbatim: bot.displayLabel)
+                            } icon: {
+                                Image(systemName: "waveform")
+                            }
+                        }
+                    }
+                } label: {
+                    face
+                }
+                .menuIndicator(.hidden)
+                // The one used last stays nearest the button.
+                .menuOrder(.fixed)
+            } else if showsRecentMenu {
                 Menu {
                     Button {
                         tap()
@@ -274,7 +318,7 @@ struct V2VoiceButton: View {
                 V2VoiceBars(isLive: returnsToCall && !isHidden)
             }
         }
-        .frame(width: Self.diameter, height: Self.diameter)
+        .frame(width: mainButtonDiameter, height: mainButtonDiameter)
         .background(Color.conduitAccent, in: Circle())
         .opacity(canAct ? 1 : 0.55)
         .contentShape(Circle())
@@ -402,7 +446,7 @@ struct V2VoiceButton: View {
         Haptics.medium()
         isStarting = true
         switch context {
-        case .home:
+        case .home, .bots:
             // A call of its own, like the old drawer's New voice call. Its
             // screen covers the tabs; the list stays where it was.
             Task { @MainActor in
@@ -464,6 +508,24 @@ struct V2VoiceButton: View {
             : AppLocalization.string("Reconnect to Hermes to start voice.")
     }
 
+    /// Opens a bot's Bot Chat and calls the bot in it.
+    private func call(_ bot: BotProfile) {
+        guard !isStarting else { return }
+        Haptics.medium()
+        isStarting = true
+        Task { @MainActor in
+            defer { isStarting = false }
+            appState.beginOpeningBotChat(bot.name)
+            let opened = await appState.openBotChatFromList(bot)
+            // A failed open says why itself; a superseded one (a newer
+            // navigation took over) is no failure, so nothing more is said.
+            guard opened else { return }
+            await startVoice(
+                PendingVoiceIntent(profile: appState.activeProfile, startsFreshConversation: false, source: .composer)
+            )
+        }
+    }
+
     /// Opens a recent conversation and talks in it.
     private func talk(in sessionID: String) {
         guard !isStarting else { return }
@@ -492,6 +554,7 @@ struct V2VoiceButton: View {
 struct V2NewChatButton: View {
     let context: V2VoiceContext
     @EnvironmentObject private var appState: AppState
+    @Environment(\.v2MainButtonDiameter) private var mainButtonDiameter
     /// A creation in a project's folder in flight: a second tap doesn't
     /// make a second chat.
     @State private var isCreating = false
@@ -537,7 +600,7 @@ struct V2NewChatButton: View {
                 .font(.system(size: 21, weight: .semibold))
                 .conduitFixedGlyph()
                 .foregroundStyle(Color.black.opacity(0.82))
-                .frame(width: V2VoiceButton.diameter, height: V2VoiceButton.diameter)
+                .frame(width: mainButtonDiameter, height: mainButtonDiameter)
                 .background(Color.conduitAccent, in: Circle())
                 .opacity(canAct ? 1 : 0.55)
                 .contentShape(Circle())
@@ -581,5 +644,19 @@ struct V2VoiceBars: View {
         guard isLive, !reduceMotion else { return resting }
         let wave = sin(time * 6 + Double(index) * 1.1)
         return max(0.22, min(1, resting + CGFloat(wave) * 0.3))
+    }
+}
+
+private struct V2MainButtonDiameterKey: EnvironmentKey {
+    static let defaultValue: CGFloat = V2VoiceButton.diameter
+}
+
+extension EnvironmentValues {
+    /// The main button's circle (Voice or New chat): 56 pt beside the
+    /// floating tabs, the 50 pt of iOS's own controls in a Duo's status
+    /// strip (issue 2118).
+    var v2MainButtonDiameter: CGFloat {
+        get { self[V2MainButtonDiameterKey.self] }
+        set { self[V2MainButtonDiameterKey.self] = newValue }
     }
 }

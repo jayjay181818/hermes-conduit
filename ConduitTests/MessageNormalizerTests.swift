@@ -3,6 +3,56 @@ import XCTest
 
 @MainActor
 final class MessageNormalizerTests: XCTestCase {
+    func testHistoryCommentaryProjectionPreservesOrderToolsAndFinal() {
+        let messages = MessageNormalizer.normalizeMessages([
+            .object([
+                "id": .string("a"), "role": .string("assistant"), "content": .string("Final answer"),
+                "reasoning": .string("private\nChecking\nReading"),
+                "display_reasoning": .string("private"),
+                "display_commentary": .array([.string("Checking"), .string("Reading")]),
+                "codex_message_items": .array([.object(["text": .string("secret sidecar")])]),
+                "tool_calls": .array([.object(["id": .string("call-1"), "name": .string("search")])])
+            ]),
+            .object(["role": .string("tool"), "tool_call_id": .string("call-1"), "content": .string("result")])
+        ])
+        XCTAssertEqual(messages.map(\.role), [.reasoning, .assistant, .assistant, .assistant, .tool])
+        XCTAssertEqual(messages.map(\.content), ["private", "Checking", "Reading", "Final answer", ""])
+        XCTAssertEqual(messages.map(\.id), ["a-reasoning", "a-commentary-0", "a-commentary-1", "a", "a-tool-0"])
+        XCTAssertEqual(messages.last?.tool?.id, "call-1")
+        XCTAssertEqual(messages.last?.tool?.output, "result")
+    }
+
+    func testHistoryEmptyAndMalformedProjectionsNeverFallBackOrPromoteSidecars() {
+        for projection in [AnyCodable.string(""), .null, .object(["text": .string("bad")])] {
+            let messages = MessageNormalizer.normalizeMessages([
+                .object([
+                    "role": .string("assistant"), "content": .string("Answer"),
+                    "reasoning": .string("private and withheld commentary"),
+                    "display_reasoning": projection, "display_commentary": .array([]),
+                    "codex_message_items": .array([.object(["text": .string("withheld")])])
+                ])
+            ])
+            XCTAssertEqual(messages.map(\.content), ["Answer"])
+            XCTAssertEqual(messages.map(\.role), [.assistant])
+        }
+    }
+
+    func testHistoryProjectionAcceptsOnlyAssistantStringCommentaryAndLegacyReasoning() {
+        let messages = MessageNormalizer.normalizeMessages([
+            .object(["role": .string("user"), "content": .string("Question"),
+                     "display_commentary": .array([.string("not assistant")])]),
+            .object(["role": .string("assistant"), "content": .string(""),
+                     "reasoning_content": .string("legacy thought"),
+                     "display_commentary": .array([.string("Progress"), .null, .object(["text": .string("unsafe")]), .string(" ")])]),
+            .object(["role": .string("assistant"), "content": .string("Already included"),
+                     "display_commentary": .array([])]),
+            .object(["role": .string("assistant"), "display_kind": .string("hidden"),
+                     "content": .string("hidden"), "display_commentary": .array([.string("hidden progress")])])
+        ])
+        XCTAssertEqual(messages.map(\.role), [.user, .reasoning, .assistant, .assistant])
+        XCTAssertEqual(messages.map(\.content), ["Question", "legacy thought", "Progress", "Already included"])
+    }
+
     func testRuntimeSnapshotReadsLiveAssistantProjection() {
         let snapshot = SessionRuntimeSnapshot(
             object: [:],
@@ -178,6 +228,43 @@ final class MessageNormalizerTests: XCTestCase {
             ),
             "Once more from the top. Checking the logs."
         )
+    }
+
+    func testGatewayPlatformsAreNamedByTheirHermesSource() {
+        let expected: [(String, SessionSource)] = [
+            ("slack", .slack), ("whatsapp", .whatsapp), ("whatsapp_cloud", .whatsapp),
+            ("signal", .signal), ("bluebubbles", .imessage), ("photon", .imessage),
+            ("matrix", .matrix), ("mattermost", .mattermost), ("teams", .teams),
+            ("google_chat", .googleChat), ("email", .email), ("sms", .sms), ("irc", .irc),
+            ("line", .line), ("simplex", .simplex), ("weixin", .wechat), ("wecom", .wecom),
+            ("wecom_callback", .wecom), ("feishu", .feishu), ("dingtalk", .dingtalk),
+            ("qqbot", .qq), ("yuanbao", .yuanbao), ("buzz", .buzz), ("raft", .raft),
+            ("ntfy", .ntfy), ("a2a", .a2a), ("msgraph_webhook", .webhook),
+            ("api_server", .api), ("Slack", .slack)
+        ]
+        for (source, category) in expected {
+            XCTAssertEqual(MessageNormalizer.classifySource(["source": .string(source)]), category, source)
+        }
+        // The app's own sessions stay chats, and a plugin platform Conduit
+        // doesn't know yet is Other rather than a guess.
+        XCTAssertEqual(MessageNormalizer.classifySource(["source": .string("desktop")]), .chat)
+        XCTAssertEqual(MessageNormalizer.classifySource(["source": .string("relay")]), .other)
+        XCTAssertEqual(MessageNormalizer.classifySource(["source": .string("voice")]), .other)
+        // A handoff files the chat where it went once it completed, not
+        // while it's pending or after it failed.
+        XCTAssertEqual(MessageNormalizer.classifySource([
+            "source": .string("desktop"), "handoff_platform": .string("slack"), "handoff_state": .string("completed")
+        ]), .slack)
+        XCTAssertEqual(MessageNormalizer.classifySource([
+            "source": .string("desktop"), "handoff_platform": .string("slack"), "handoff_state": .string("failed")
+        ]), .chat)
+        XCTAssertEqual(MessageNormalizer.classifySource([
+            "source": .string("desktop"), "handoff_platform": .string("slack"), "handoff_state": .string("pending")
+        ]), .chat)
+        // Every platform has a place in the filter order.
+        XCTAssertTrue(SessionSource.gatewayPlatforms.allSatisfy(AppState.defaultSessionFilterOrder.contains))
+        XCTAssertEqual(Set(AppState.defaultSessionFilterOrder), Set(SessionSource.allCases))
+        XCTAssertEqual(AppState.defaultSessionFilterOrder.count, SessionSource.allCases.count)
     }
 
     func testSessionNormalizationLeavesSessionsThatArentChatsOut() {
@@ -2913,6 +3000,30 @@ final class MessageNormalizerTests: XCTestCase {
         ])
 
         XCTAssertEqual(messages.first?.isSteer, false)
+    }
+
+    func testAReplyThatIsOnlyASilenceMarkerShowsNothingOnReload() {
+        // A Bot Chat's work update the bot had nothing to say about: Hermes
+        // sends the live turn an empty reply and stores "[SILENT]".
+        let messages = MessageNormalizer.normalizeMessages([
+            .object(["id": .number(31), "role": .string("user"), "display_kind": .string("hidden"),
+                     "content": .string("Work update from your workstreams.")]),
+            .object(["id": .number(32), "role": .string("assistant"), "content": .string("[SILENT]\n")]),
+            .object(["id": .number(33), "role": .string("user"), "content": .string("How's W1?")]),
+            .object(["id": .number(34), "role": .string("assistant"),
+                     "content": .string("[SILENT] is what I answer when nothing changed.")])
+        ])
+
+        XCTAssertEqual(messages.map(\.content), ["How's W1?", "[SILENT] is what I answer when nothing changed."])
+
+        // Every marker Hermes has, and a reply that only starts with one.
+        for marker in MessageNormalizer.silenceMarkers {
+            let read = MessageNormalizer.normalizeMessages([
+                .object(["id": .number(41), "role": .string("assistant"), "content": .string(" \(marker)\n")]),
+                .object(["id": .number(42), "role": .string("assistant"), "content": .string("\(marker) and more")])
+            ])
+            XCTAssertEqual(read.map(\.content), ["\(marker) and more"], marker)
+        }
     }
 
     func testHiddenUserRowIsDroppedEntirely() {

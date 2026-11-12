@@ -28,9 +28,9 @@ struct MarkdownText: View {
     @StateObject private var selectionCoordinator = MarkdownSelectionCoordinator()
 
     /// True only for the actively streaming reply, whose `source` changes
-    /// every frame. Settled messages (the default) populate the render cache;
-    /// the streaming instance still parses each frame but skips inserting a
-    /// snapshot that would be dead the moment the next delta arrives.
+    /// most frames. Settled messages (the default) populate the render cache;
+    /// the streaming instance parses each new source and keeps it only in a
+    /// small cache of its own, for the frames that just move the fade.
     var isStreaming: Bool = false
 
     /// The source is a cut of a longer message (a large document's
@@ -140,9 +140,18 @@ struct MarkdownText: View {
                 )
             } else {
                 VStack(alignment: .leading, spacing: MarkdownProseRun.Spacing.betweenBlocks) {
-                    ForEach(MarkdownProseRun.pieces(blockCount: rendering.blocks.count, runs: proseRuns)) { piece in
+                    ForEach(MarkdownProseRun.pieces(
+                        blockCount: rendering.blocks.count,
+                        runs: proseRuns,
+                        pictures: MarkdownProseRun.pictureRanges(in: rendering.blocks)
+                    )) { piece in
                         let index = piece.blocks.lowerBound
-                        if piece.isRun {
+                        if piece.isPictures {
+                            MarkdownPictureGrid(
+                                blocks: Array(rendering.blocks[piece.blocks]),
+                                gatewayMediaDataURL: gatewayMediaDataURL
+                            )
+                        } else if piece.isRun {
                             MarkdownProseRunView(
                                 text: rendering.proseRunText(
                                     for: piece.blocks,
@@ -369,6 +378,42 @@ final class MarkdownRendering {
     }
 }
 
+/// A cache key holding a message's text as it is, rather than joined into
+/// one new string per lookup (issue 1729). A row looks its rendering up every
+/// time it mounts, so the key must cost little for a long message: hashing
+/// reads the content's lengths and its ends, and only a key with the same
+/// hash compares the whole text.
+final class MarkdownCacheKey: NSObject {
+    private let tokens: String
+    private let content: [String]
+    private let contentHash: Int
+
+    init(tokens: [String], content: [String]) {
+        self.tokens = tokens.joined(separator: "\u{1F}")
+        self.content = content
+        var hasher = Hasher()
+        hasher.combine(self.tokens)
+        hasher.combine(content.count)
+        for part in content {
+            let bytes = part.utf8
+            hasher.combine(bytes.count)
+            for byte in bytes.prefix(32) { hasher.combine(byte) }
+            if bytes.count > 32 { for byte in bytes.suffix(32) { hasher.combine(byte) } }
+        }
+        contentHash = hasher.finalize()
+    }
+
+    /// About the bytes the key holds, for a cache's cost.
+    var byteCount: Int { content.reduce(tokens.utf8.count) { $0 + $1.utf8.count } }
+
+    override var hash: Int { contentHash }
+
+    override func isEqual(_ object: Any?) -> Bool {
+        guard let other = object as? MarkdownCacheKey else { return false }
+        return other === self || (other.contentHash == contentHash && other.tokens == tokens && other.content == content)
+    }
+}
+
 /// Every visible MarkdownText body re-evaluates ~30x/s while a reply streams
 /// (each delta publishes an AppState change), and each evaluation used to
 /// re-parse the source and rebuild the attributed string from scratch —
@@ -377,10 +422,20 @@ final class MarkdownRendering {
 /// pays for parsing. Streaming-tail fades stay per-frame but are applied to a
 /// copy of the cached base rather than triggering a rebuild.
 enum MarkdownRenderCache {
-    private static let cache: NSCache<NSString, MarkdownRendering> = {
-        let cache = NSCache<NSString, MarkdownRendering>()
+    private static let cache: NSCache<MarkdownCacheKey, MarkdownRendering> = {
+        let cache = NSCache<MarkdownCacheKey, MarkdownRendering>()
         cache.countLimit = 256
         cache.totalCostLimit = 32 * 1024 * 1024
+        return cache
+    }()
+
+    /// The last few streaming renderings, apart from the settled ones so they
+    /// can't push those out. A streaming reply draws again with the same text
+    /// while its newest characters fade in, and that draw takes the parse
+    /// from here instead of doing it again (issue 1720).
+    private static let streamingCache: NSCache<MarkdownCacheKey, MarkdownRendering> = {
+        let cache = NSCache<MarkdownCacheKey, MarkdownRendering>()
+        cache.countLimit = 4
         return cache
     }()
 
@@ -412,18 +467,21 @@ enum MarkdownRenderCache {
         // needs no cache migration. Reading preferredContentSizeCategory
         // touches UIApplication.shared, hence the @MainActor isolation on
         // this function.
-        let key = [
-            recognizesGatewayMedia ? "1" : "0",
-            usesAccentSurface ? "1" : "0",
-            UIApplication.shared.preferredContentSizeCategory.rawValue,
-            chatTextSize.cacheIdentity,
-            // Hermes' @session links are titled with the chat's name once
-            // Conduit lists it.
-            HermesSessionReference.titleKey(for: source),
-            source
-        ].joined(separator: "|") as NSString
+        let key = MarkdownCacheKey(
+            tokens: [
+                recognizesGatewayMedia ? "1" : "0",
+                usesAccentSurface ? "1" : "0",
+                UIApplication.shared.preferredContentSizeCategory.rawValue,
+                chatTextSize.cacheIdentity,
+                // Hermes' @session links are titled with the chat's name once
+                // Conduit lists it.
+                HermesSessionReference.titleKey(for: source)
+            ],
+            content: [source]
+        )
 
         if let cached = cache.object(forKey: key) { return cached }
+        if isStreaming, let cached = streamingCache.object(forKey: key) { return cached }
         let document = MarkdownParser.parseDocument(source, recognizesGatewayMedia: recognizesGatewayMedia)
         let rendering = MarkdownRendering(
             blocks: document.blocks,
@@ -437,12 +495,14 @@ enum MarkdownRenderCache {
                 chatTextSize: chatTextSize
             )
         )
-        // While streaming, `source` changes every frame, so a cached entry is
-        // dead on insertion and would only evict reusable settled entries.
-        // Parse anyway (unavoidable — the content is new), but skip the write.
+        // While streaming, `source` changes most frames, so a cached entry
+        // would mostly evict reusable settled entries: it goes to the small
+        // streaming cache instead, for the frames that only move the fade.
         // The message is cached on its first settled render via the
         // non-streaming call sites (isStreaming == false).
-        if !isStreaming {
+        if isStreaming {
+            streamingCache.setObject(rendering, forKey: key)
+        } else {
             // Approximate byte cost: source bytes + attributed-string storage
             // (each char carries attribute runs), so a few large messages can't
             // crowd out many small ones within totalCostLimit.
@@ -1511,9 +1571,17 @@ enum MarkdownTableLayout {
     static let dividerWidth: CGFloat = 1
     static let borderAllowance: CGFloat = 2
 
-    private static let cache: NSCache<NSString, NSArray> = {
-        let cache = NSCache<NSString, NSArray>()
+    private static let cache: NSCache<MarkdownCacheKey, NSArray> = {
+        let cache = NSCache<MarkdownCacheKey, NSArray>()
         cache.countLimit = 64
+        cache.totalCostLimit = 4 * 1024 * 1024
+        return cache
+    }()
+
+    /// Each cell's measured ideal width, by its text, font and references.
+    private static let cellWidthCache: NSCache<MarkdownCacheKey, NSNumber> = {
+        let cache = NSCache<MarkdownCacheKey, NSNumber>()
+        cache.countLimit = 4096
         cache.totalCostLimit = 4 * 1024 * 1024
         return cache
     }()
@@ -1536,34 +1604,55 @@ enum MarkdownTableLayout {
         // decision, and on the reference definitions (they change how cell
         // source measures). A chat-size change must never serve stale
         // measurements from the previous size.
-        let key = (
-            [
+        // The header and each row are led by their cell count, so the cells
+        // keep their rows.
+        var cells = ["\u{1F}\(headers.count)"] + headers
+        for row in rows {
+            cells.append("\u{1F}\(row.count)")
+            cells.append(contentsOf: row)
+        }
+        let key = MarkdownCacheKey(
+            tokens: [
                 UIApplication.shared.preferredContentSizeCategory.rawValue,
                 chatTextSize.cacheIdentity,
                 String(format: "%.1f", availableWidth),
                 references.definitionsMarkdown
-            ]
-                + headers
-                + rows.flatMap { $0.isEmpty ? ["<empty-row>"] : $0 }
-        ).joined(separator: "\u{1F}") as NSString
+            ],
+            content: cells
+        )
 
         if let cached = cache.object(forKey: key) as? [CGFloat] { return cached }
 
         let headerFont = ChatTypography.font(for: .tableHeader, appearance: chatTextSize)
         let bodyFont = ChatTypography.font(for: .tableBody, appearance: chatTextSize)
+        // A cell measures the same at any width, so it's measured once:
+        // a table streaming in measures only the cells that are new or
+        // still being written, not every cell again on each delta.
+        let cellTokens = [
+            UIApplication.shared.preferredContentSizeCategory.rawValue,
+            chatTextSize.cacheIdentity,
+            references.definitionsMarkdown
+        ]
+        func measured(_ source: String, header: Bool) -> CGFloat {
+            let cellKey = MarkdownCacheKey(tokens: cellTokens + [header ? "h" : "b"], content: [source])
+            if let width = cellWidthCache.object(forKey: cellKey) { return CGFloat(width.doubleValue) }
+            let width = idealWidth(of: source, font: header ? headerFont : bodyFont, references: references)
+            cellWidthCache.setObject(NSNumber(value: Double(width)), forKey: cellKey, cost: cellKey.byteCount)
+            return width
+        }
 
         var ideals = [CGFloat](repeating: 0, count: columnCount)
         for (index, header) in headers.enumerated() {
-            ideals[index] = max(ideals[index], idealWidth(of: header, font: headerFont, references: references))
+            ideals[index] = max(ideals[index], measured(header, header: true))
         }
         for row in rows {
             for (index, cell) in row.enumerated() where index < columnCount {
-                ideals[index] = max(ideals[index], idealWidth(of: cell, font: bodyFont, references: references))
+                ideals[index] = max(ideals[index], measured(cell, header: false))
             }
         }
 
         let widths = resolveColumnContentWidths(ideals: ideals, availableWidth: availableWidth)
-        cache.setObject(widths as NSArray, forKey: key, cost: key.length)
+        cache.setObject(widths as NSArray, forKey: key, cost: key.byteCount)
         return widths
     }
 
@@ -1759,7 +1848,7 @@ struct MarkdownTable: View {
                 },
                 selectText: { [turnedOn = $selectionTurnedOn] in turnedOn.wrappedValue = true },
                 selectionCoordinator: selectionCoordinator,
-                selectionSegmentID: selectionSegment(row: 0, column: 0)?.id,
+                selectionSegmentID: selectionSegment(row: 0, column: 0).map { MarkdownSelectionCoordinator.tableMountKey(forSegmentID: $0.id) },
                 tableWidth: MarkdownTableLayout.tableWidth(columnContentWidths: widths)
             ))
         }
@@ -1796,11 +1885,47 @@ struct MarkdownTableRowView: View {
     let foregroundStyle: Color
     let usesAccentSurface: Bool
     /// Each cell a selectable text view, or plain text: the chat's tables,
-    /// until selection turns on (MarkdownTableMenu).
+    /// until selection turns on (MarkdownTableMenu). A cell with a link is
+    /// a selectable text view either way (`cellDrawsAsText`).
     let selectsText: Bool
     let selectionCoordinator: MarkdownSelectionCoordinator?
     let segmentFor: (Int) -> MarkdownSelectionSegmentDescriptor?
     @Environment(\.chatTextSize) private var chatTextSize
+    @Environment(\.markdownReferences) private var references
+
+    /// Whether a cell draws as the reply's text does, a selectable text view
+    /// (drawn until touched in the chat), rather than as plain text. A cell
+    /// with a link always does: the text view opens its links on the click
+    /// or tap as the reply's other links do, where a plain cell's SwiftUI
+    /// link lost the click to the row's tap that puts the keyboard away
+    /// (issue 1585). Links are few, so the chat still draws most cells
+    /// plain (#693). The fragment is the one either cell draws, cached.
+    static func cellDrawsAsText(
+        source: String,
+        selectsText: Bool,
+        references: MarkdownReferenceContext,
+        foregroundStyle: Color,
+        usesAccentSurface: Bool,
+        font: UIFont
+    ) -> Bool {
+        if selectsText { return true }
+        let bridged = InlineMarkdownContent.bridged(
+            source: source,
+            references: references,
+            foregroundStyle: foregroundStyle,
+            usesAccentSurface: usesAccentSurface,
+            font: font,
+            trailingCharacterOpacities: []
+        )
+        var hasLink = false
+        bridged.enumerateAttribute(.link, in: NSRange(location: 0, length: bridged.length)) { value, _, stop in
+            if value != nil {
+                hasLink = true
+                stop.pointee = true
+            }
+        }
+        return hasLink
+    }
 
     var body: some View {
         HStack(spacing: 0) {
@@ -1814,7 +1939,14 @@ struct MarkdownTableRowView: View {
                     appearance: chatTextSize
                 )
                 Group {
-                    if selectsText {
+                    if Self.cellDrawsAsText(
+                        source: cell,
+                        selectsText: selectsText,
+                        references: references,
+                        foregroundStyle: foregroundStyle,
+                        usesAccentSurface: usesAccentSurface,
+                        font: font
+                    ) {
                         InlineMarkdown(
                             source: cell,
                             foregroundStyle: foregroundStyle,
@@ -1853,8 +1985,9 @@ struct MarkdownTableRowView: View {
 /// A table cell drawn as plain text, from the attributed content the
 /// selectable cell shows. A selectable text view per cell made a table
 /// most of what a long answer cost to build as it scrolled in; plain text
-/// costs a fraction of that. Links stay tappable: SwiftUI opens them
-/// through the environment's openURL, as the text views do.
+/// costs a fraction of that. A cell with a link isn't plain: it draws as
+/// a selectable text view, which opens the link
+/// (MarkdownTableRowView.cellDrawsAsText).
 private struct MarkdownPlainCell: View {
     let source: String
     let foregroundStyle: Color
@@ -1893,8 +2026,9 @@ private struct MarkdownTableMenu: ViewModifier {
     let copyText: @Sendable () -> String
     let selectText: () -> Void
     let selectionCoordinator: MarkdownSelectionCoordinator?
-    /// The table's first cell segment, the key its deferred mount waits
-    /// under in the message's coordinator.
+    /// The key its deferred mount waits under in the message's
+    /// coordinator, made from the table's first cell segment
+    /// (MarkdownSelectionCoordinator.tableMountKey).
     let selectionSegmentID: String?
     /// The drawn table's width, so the Copy Table button sits at its
     /// corner, not at the column's edge, when the table is narrower.
@@ -2170,7 +2304,7 @@ struct LargeMarkdownTable: View {
                 },
                 selectText: { [turnedOn = $selectionTurnedOn] in turnedOn.wrappedValue = true },
                 selectionCoordinator: selectionCoordinator,
-                selectionSegmentID: segmentDescriptor(row: 0, column: 0)?.id,
+                selectionSegmentID: segmentDescriptor(row: 0, column: 0).map { MarkdownSelectionCoordinator.tableMountKey(forSegmentID: $0.id) },
                 tableWidth: MarkdownTableLayout.tableWidth(columnContentWidths: widths)
             ))
             if renderedRowCount < rows.count {
@@ -2243,19 +2377,69 @@ struct GuardedSourceCard: View {
     }
 }
 
+/// Two or more pictures in a row in a reply, as one grid of square tiles
+/// (issue 1801): as many to a row as the reply's width takes, the last one
+/// shown saying how many more there are.
+struct MarkdownPictureGrid: View {
+    let blocks: [MarkdownBlock]
+    let gatewayMediaDataURL: ((String) async -> String?)?
+    @Environment(\.imageGallery) private var inheritedGallery
+    @Environment(\.gatewayMediaFiles) private var gatewayMediaFiles
+    /// The pictures a tile pages through: the surface's own list when it
+    /// holds this run, else the run itself, so the pictures without a tile
+    /// stay reachable where a surface lists none of them.
+    @State private var runGallery = ImageGallerySource()
+
+    var body: some View {
+        let pictures: [(url: String, alt: String)] = blocks.compactMap {
+            guard case .image(let url, let alt) = $0 else { return nil }
+            return (url, alt)
+        }
+        let shown = PictureGrid.shownCount(pictures.count)
+        let more = PictureGrid.moreCount(total: pictures.count)
+        let _ = runGallery.update { [inheritedGallery, gatewayMediaFiles, gatewayMediaDataURL] in
+            let run = pictures.compactMap {
+                ImageGalleryItem.markdownImage(url: $0.url, alt: $0.alt, resolver: gatewayMediaFiles, dataURL: gatewayMediaDataURL)
+            }
+            let inherited = inheritedGallery?.items() ?? []
+            let listed = Set(inherited.map(\.id))
+            return run.allSatisfy { listed.contains($0.id) } ? inherited : run
+        }
+        PictureGridLayout {
+            ForEach(0..<shown, id: \.self) { index in
+                RemoteMarkdownImage(
+                    url: pictures[index].url,
+                    alt: pictures[index].alt,
+                    gatewayMediaDataURL: gatewayMediaDataURL,
+                    isTile: true,
+                    opensViewerWhenUnavailable: more != nil && index == shown - 1
+                )
+                .modifier(PictureGridMoreBadge(more: index == shown - 1 ? more : nil))
+            }
+        }
+        .environment(\.imageGallery, runGallery)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
 private struct RemoteMarkdownImage: View {
     @ObservedObject var appLanguage = AppLanguageStore.shared
     let url: String
     let alt: String
     let gatewayMediaDataURL: ((String) async -> String?)?
+    /// A square tile of a picture grid, filling the size it is proposed,
+    /// instead of the picture at its own shape (issue 1801).
+    var isTile = false
+    /// The "+N" tile opens the viewer even when its own web picture won't
+    /// load here, since it is the way to the pictures without a tile.
+    var opensViewerWhenUnavailable = false
+    @Environment(\.openURL) private var openURL
     /// Scopes where a `MEDIA:` picture is kept on the phone; without one
     /// (a surface that sets no resolver) it is fetched each time.
     @Environment(\.gatewayMediaFiles) private var gatewayMediaFiles
-    /// The chat's scroll engine, which says when a picture that will grow
-    /// its row shows (#1238).
+    /// Set in the chat's transcript alone: elsewhere (a job sheet, a group
+    /// room) a fresh web picture fades in.
     @Environment(\.chatRowDisclosure) private var disclosure
-    /// The row's frame, and the picture waiting to show in it.
-    @StateObject private var arrival = ChatRowArrival()
     @State private var gatewayImage: UIImage?
     /// The cache key `gatewayImage` was loaded for, so a row kept across a
     /// dashboard or profile switch never shows the picture it held before.
@@ -2291,26 +2475,17 @@ private struct RemoteMarkdownImage: View {
 
     /// A picture still in memory shows on the row's first frame, so a row
     /// scrolled back into view doesn't grow from its loading line (#1238).
-    /// A row laid out with its loading line (another row of the same
-    /// picture showed it since) takes it through the task, which asks the
-    /// scroll engine.
     private var shownGatewayImage: UIImage? {
         let key = gatewayCacheKey
         if let gatewayImage, gatewayImageKey == key { return gatewayImage }
-        guard let kept = key.flatMap(TranscriptPictureMemory.image(for:)),
-              arrival.holds(rowHeight(showing: kept.size)) else { return nil }
-        return kept
+        return key.flatMap(TranscriptPictureMemory.image(for:))
     }
 
     private var shownRemoteOutcome: BoundedRemoteImage.Outcome? {
         if let remoteOutcome, remoteOutcomeURL == url { return remoteOutcome }
-        // A picture decoded already shows on the row's first frame, or where
-        // the row has its height already (its size was remembered). One that
-        // would grow the row waits for the task, which asks the scroll
-        // engine (#1238).
+        // A picture decoded already shows on the row's first frame (#1238).
         guard !isGatewayMedia, let remoteURL = URL(string: url),
-              let cached = BoundedRemoteImage.cachedImage(remoteURL, maxPixelSize: Self.remoteMaxPixelSize),
-              arrival.holds(rowHeight(showing: cached.size)) else { return nil }
+              let cached = BoundedRemoteImage.cachedImage(remoteURL, maxPixelSize: Self.remoteMaxPixelSize) else { return nil }
         return .image(cached)
     }
 
@@ -2333,7 +2508,9 @@ private struct RemoteMarkdownImage: View {
 
     var body: some View {
         Group {
-            if let gatewayFileKind {
+            if isTile {
+                tileContent
+            } else if let gatewayFileKind {
                 GatewayMediaFileCard(
                     path: gatewayPath,
                     name: alt,
@@ -2349,23 +2526,15 @@ private struct RemoteMarkdownImage: View {
                     .opensMediaPreview { openImage(showing: image) }
                     .accessibilityLabel(alt.isEmpty ? Text("Image") : Text(verbatim: alt))
             case .unavailable:
-                WebFallbackImage(url: url, alt: alt, arrival: arrival, engine: disclosure?.engine)
+                WebFallbackImage(url: url, alt: alt)
             case .tooLarge:
-                WebFallbackImage(url: url, alt: alt, loadsInPage: false, arrival: arrival, engine: disclosure?.engine)
+                WebFallbackImage(url: url, alt: alt, loadsInPage: false)
             case nil:
                 loadingLabel
             }
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .chatRowFrame(arrival)
-        .onDisappear {
-            // A picture still waiting to show is dropped with the row; the
-            // task loads it again when the row is back.
-            arrival.rowDisappeared()
-        }
-        // Handed another picture: whatever still waits was the last one's.
-        .onChange(of: loadIdentity) { arrival.rowDisappeared() }
         .task(id: loadIdentity) {
             guard isGatewayMedia else {
                 // An outcome for another address goes; this one's stays
@@ -2450,69 +2619,86 @@ private struct RemoteMarkdownImage: View {
         }
     }
 
-    /// Puts a picture from Hermes in the row once the reader's scrolling
-    /// allows (ChatRowArrival), remembering it then: remembered first,
-    /// its size would resize the loading line on its own. After a sign-out
-    /// it shows, but isn't remembered.
+    /// Puts a picture from Hermes in the row, remembering it. After a
+    /// sign-out it shows, but isn't remembered.
     private func placeGatewayImage(_ image: UIImage, for cacheKey: String?, generation: Int) {
-        arrival.arrive(rowHeight: rowHeight(showing: image.size), engine: disclosure?.engine) {
-            if let cacheKey, generation == TranscriptImageCache.generation {
-                TranscriptPictureMemory.remember(image, for: cacheKey)
-            }
-            gatewayImage = image
-            gatewayImageKey = cacheKey
+        if let cacheKey, generation == TranscriptImageCache.generation {
+            TranscriptPictureMemory.remember(image, for: cacheKey)
         }
+        gatewayImage = image
+        gatewayImageKey = cacheKey
     }
 
-    /// Puts a web picture in the row the same way, its size remembered as
-    /// it shows. Outside a chat a fresh load fades in; in a chat it lands
-    /// in one pass, which the engine makes good above the reader.
+    /// Puts a web picture in the row, its size remembered as it shows.
+    /// Outside a chat a fresh load fades in; in a chat it lands in one
+    /// pass, and the transcript keeps the reader's row where it is.
     private func placeRemoteImage(_ image: UIImage, generation: Int, fades: Bool) {
-        let engine = disclosure?.engine
-        let sizeKey = remoteSizeKey
-        let placedURL = url
-        arrival.arrive(rowHeight: rowHeight(showing: image.size), engine: engine) {
-            // The row moved on to another address while this one waited.
-            guard remoteOutcomeURL == placedURL else { return }
-            if generation == TranscriptImageCache.generation {
-                TranscriptPictureMemory.rememberSize(image.size, for: sizeKey)
-            }
-            if fades, engine == nil {
-                withAnimation(.easeInOut(duration: 0.2)) { remoteOutcome = .image(image) }
+        if generation == TranscriptImageCache.generation {
+            TranscriptPictureMemory.rememberSize(image.size, for: remoteSizeKey)
+        }
+        if fades, disclosure == nil {
+            withAnimation(.easeInOut(duration: 0.2)) { remoteOutcome = .image(image) }
+        } else {
+            remoteOutcome = .image(image)
+        }
+    }
+
+    /// The tile: the picture cropped to its square, else its place with a
+    /// spinner while it loads or a symbol when it won't. Every state takes
+    /// the same square, so the reply never changes height as they load. A
+    /// web picture that won't load here opens its address on a tap, as its
+    /// link does outside a grid.
+    @ViewBuilder
+    private var tileContent: some View {
+        let image: UIImage? = {
+            if isGatewayMedia { return shownGatewayImage }
+            if case .image(let image) = shownRemoteOutcome { return image }
+            return nil
+        }()
+        if let image {
+            PictureTileImage(image: image)
+                .opensMediaPreview { openImage(showing: image) }
+                .accessibilityLabel(alt.isEmpty ? Text("Image") : Text(verbatim: alt))
+                .accessibilityAddTraits(.isImage)
+        } else {
+            let failed = isGatewayMedia ? gatewayLoadFailed : shownRemoteOutcome != nil
+            let label = failed
+                ? (alt.isEmpty ? AppLocalization.string("Image unavailable") : AppLocalization.string("\(alt) unavailable"))
+                : (alt.isEmpty ? AppLocalization.string("Loading image…") : alt)
+            if failed, !isGatewayMedia, !opensViewerWhenUnavailable, let webURL = URL(string: url) {
+                PictureTilePlaceholder(state: .unavailable)
+                    .contentShape(Rectangle())
+                    .onTapGesture { openURL(webURL) }
+                    .accessibilityElement()
+                    .accessibilityLabel(Text(verbatim: label))
+                    .accessibilityAddTraits(.isLink)
             } else {
-                remoteOutcome = .image(image)
+                // The viewer fetches the picture itself, so a tile still
+                // loading opens it too, the "+N" tile included.
+                PictureTilePlaceholder(state: failed ? .unavailable : .loading)
+                    .accessibilityElement()
+                    .accessibilityLabel(Text(verbatim: label))
+                    .opensMediaPreview { openImage(showing: nil) }
             }
         }
     }
 
-    /// A picture from Hermes that won't load gives its place to its label
-    /// the same way, a height only the label's layout tells.
+    /// A picture from Hermes that won't load gives its place to its label.
     private func placeGatewayFailure() {
         let failedLoad = loadIdentity
         // Its label shows already (the task restarting as the row comes back).
         guard gatewayFailedLoad != failedLoad else { return }
-        arrival.arrive(rowHeight: nil, engine: disclosure?.engine) {
-            gatewayFailedLoad = failedLoad
-        }
+        gatewayFailedLoad = failedLoad
     }
 
-    /// A web picture that won't show here gives its place to its fallback
-    /// the same way: the page that tries it, at its starting height, or the
-    /// link, which only its layout measures. Outside a chat it fades in.
+    /// A web picture that won't show here gives its place to its fallback:
+    /// the page that tries it, or the link. Outside a chat it fades in.
     private func placeRemoteFailure(_ outcome: BoundedRemoteImage.Outcome) {
         guard !showsFallback(for: outcome) else { return }
-        let engine = disclosure?.engine
-        let placedURL = url
-        var rowHeight: CGFloat?
-        if case .unavailable = outcome { rowHeight = WebFallbackImage.startingHeight }
-        arrival.arrive(rowHeight: rowHeight, engine: engine) {
-            // The row moved on to another address while this one waited.
-            guard remoteOutcomeURL == placedURL else { return }
-            if engine == nil {
-                withAnimation(.easeInOut(duration: 0.2)) { remoteOutcome = outcome }
-            } else {
-                remoteOutcome = outcome
-            }
+        if disclosure == nil {
+            withAnimation(.easeInOut(duration: 0.2)) { remoteOutcome = outcome }
+        } else {
+            remoteOutcome = outcome
         }
     }
 
@@ -2524,15 +2710,6 @@ private struct RemoteMarkdownImage: View {
         case (.unavailable?, .unavailable), (.tooLarge?, .tooLarge): return true
         default: return false
         }
-    }
-
-    /// The height the row takes with a picture of `size` in it: scaled to
-    /// the row's width, up to the ceiling, which a placeholder at the
-    /// remembered size already has. The arrival compares it with the row's
-    /// frame, since a row laid out before a cold launch's kept sizes loaded
-    /// still draws its loading line.
-    private func rowHeight(showing size: CGSize) -> CGFloat {
-        ChatRowArrival.fittedHeight(of: size, inWidth: arrival.stackFrame?.width ?? 0, maxHeight: Self.maxHeight)
     }
 
     @ViewBuilder
@@ -2557,9 +2734,7 @@ private struct RemoteMarkdownImage: View {
     }
 
     /// At the picture's own size when that's known, so the row doesn't
-    /// change height when it arrives: known as the row was first laid out,
-    /// since a size remembered after (another row of the same picture, or
-    /// a cold launch's kept sizes loading) would resize the line on its own.
+    /// change height when it arrives.
     @ViewBuilder
     private var loadingLabel: some View {
         let label = HStack(spacing: 8) {
@@ -2568,7 +2743,7 @@ private struct RemoteMarkdownImage: View {
                 .scaledFont(.footnote)
                 .foregroundStyle(.secondary)
         }
-        if let size = reservedSize, arrival.holds(rowHeight(showing: size)) {
+        if let size = reservedSize {
             Color.primary.opacity(0.05)
                 .aspectRatio(size, contentMode: .fit)
                 .frame(maxHeight: Self.maxHeight)
@@ -2596,9 +2771,12 @@ private struct RemoteMarkdownImage: View {
     /// opening re-fetches them: from the copy kept on the phone, which stays
     /// after Hermes sweeps its own, else from Hermes; a web picture again
     /// (usually from URLCache) to share it at full quality.
-    private func openImage(showing image: UIImage) {
+    private func openImage(showing image: UIImage?) {
+        // The "+N" tile is the way to the pictures without a tile, so when
+        // its own address can't be shown it opens the run at its first.
         guard let item = ImageGalleryItem.markdownImage(url: url, alt: alt, resolver: gatewayMediaFiles,
-                                                        dataURL: gatewayMediaDataURL) else { return }
+                                                        dataURL: gatewayMediaDataURL)
+            ?? (opensViewerWhenUnavailable ? imageGallery?.items().first : nil) else { return }
         ImageGallery.open(item, in: imageGallery, placeholder: image)
     }
 }
@@ -2616,6 +2794,8 @@ private struct GatewayMediaFileCard: View {
     @State private var failed = false
     @State private var tooLarge = false
     @State private var openTask: Task<Void, Never>?
+    /// A Markdown file opens in the Markdown reader, as from Artifacts.
+    @State private var markdown: MarkdownDocument?
 
     var body: some View {
         Group {
@@ -2639,6 +2819,9 @@ private struct GatewayMediaFileCard: View {
             openTask?.cancel()
             openTask = nil
             loading = false
+        }
+        .sheet(item: $markdown) { document in
+            MarkdownDocumentSheet(document: document)
         }
     }
 
@@ -2740,6 +2923,12 @@ private struct GatewayMediaFileCard: View {
     /// URL ceiling still opens (#569); the data URL when the download is
     /// unavailable (an older Hermes, or no sign-in yet).
     private func fetchAndPresent() async -> OpenOutcome {
+        if MarkdownArtifact.isMarkdown(path), let document = await markdownDocument() {
+            guard !Task.isCancelled else { return .failed }
+            markdown = document
+            return .presented
+        }
+        guard !Task.isCancelled else { return .failed }
         if let gatewayMediaFiles {
             switch await gatewayMediaFiles.file(for: path) {
             case .downloaded(let download):
@@ -2753,6 +2942,20 @@ private struct GatewayMediaFileCard: View {
         guard !Task.isCancelled, let gatewayMediaDataURL,
               let dataURL = await gatewayMediaDataURL(path), !Task.isCancelled else { return .failed }
         return await MediaPreviewPresenter.shared.present(dataURL: dataURL, filename: path) ? .presented : .failed
+    }
+
+    /// The Markdown file's text for the reader, or nil when it falls back
+    /// to Quick Look (not UTF-8, over the ceiling, or not fetched).
+    private func markdownDocument() async -> MarkdownDocument? {
+        let files = gatewayMediaFiles
+        var dataURL = gatewayMediaDataURL
+        if dataURL == nil, let files {
+            dataURL = { path in await files.dataURL(for: path) }
+        }
+        guard let dataURL,
+              let text = await MarkdownArtifact.load(path: path, dataURL: dataURL) else { return nil }
+        return MarkdownDocument(name: displayName, path: path, text: text,
+                                gatewayMediaDataURL: dataURL, gatewayMediaFiles: files)
     }
 }
 
@@ -2920,24 +3123,10 @@ private struct WebFallbackImage: View {
     let alt: String
     /// False for a picture too large to load here: just the link.
     var loadsInPage = true
-    /// The row's arrival, which what the page reports goes through, as the
-    /// picture would have (#1238).
-    let arrival: ChatRowArrival
-    /// The chat's scroll engine, nil outside a chat.
-    let engine: ChatScrollEngine?
     /// The page's height before it has measured the picture.
     static let startingHeight: CGFloat = 220
     @State private var height: CGFloat = WebFallbackImage.startingHeight
     @State private var failed = false
-    /// What the page last reported, kept until the row takes it: a row
-    /// that left the screen first takes it when it's back, since the page
-    /// doesn't report again.
-    @State private var reported: PageReport? = nil
-
-    enum PageReport {
-        case height(CGFloat)
-        case failed
-    }
 
     var body: some View {
         Group {
@@ -2955,9 +3144,6 @@ private struct WebFallbackImage: View {
                     .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
             }
         }
-        .onAppear {
-            if let reported { take(reported) }
-        }
     }
 
     private static func shownHeight(_ height: CGFloat) -> CGFloat {
@@ -2969,32 +3155,19 @@ private struct WebFallbackImage: View {
         Binding(get: { height }, set: { measured in
             // Web view callbacks arrive on the main thread; said so,
             // whatever isolation the SDK gives this closure.
-            MainActor.assumeIsolated { take(.height(measured)) }
-        })
-    }
-
-    /// The page couldn't show it either.
-    private var pageFailed: Binding<Bool> {
-        Binding(get: { failed }, set: { didFail in
             MainActor.assumeIsolated {
-                if didFail { take(.failed) }
+                if !failed, measured != height { height = measured }
             }
         })
     }
 
-    /// The row takes what the page reported once the reader's scrolling
-    /// allows: the picture's height, or the link, a height only its layout
-    /// tells.
-    private func take(_ report: PageReport) {
-        reported = report
-        guard !failed else { return }
-        switch report {
-        case .height(let measured):
-            guard measured != height else { return }
-            arrival.arrive(rowHeight: Self.shownHeight(measured), engine: engine) { height = measured }
-        case .failed:
-            arrival.arrive(rowHeight: nil, engine: engine) { failed = true }
-        }
+    /// The page couldn't show it either: the link instead.
+    private var pageFailed: Binding<Bool> {
+        Binding(get: { failed }, set: { didFail in
+            MainActor.assumeIsolated {
+                if didFail, !failed { failed = true }
+            }
+        })
     }
 
     @ViewBuilder
@@ -3271,9 +3444,11 @@ enum MarkdownParser {
         // walker ever produces nothing for non-whitespace input, surface the
         // stripped body rather than rendering an empty message. Definitions
         // were already removed from visibleSource, so they cannot resurface
-        // here even in that fallback.
-        let finalBlocks = blocks.isEmpty && !visibleSource.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            ? [.paragraph(visibleSource)]
+        // here even in that fallback, nor can the plugin's hidden board line:
+        // a reply that was only that line stays empty.
+        let fallbackSource = blocks.isEmpty ? TranscriptDirectives.removingBoards(from: visibleSource) : visibleSource
+        let finalBlocks = blocks.isEmpty && !fallbackSource.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? [.paragraph(fallbackSource)]
             : blocks
         return MarkdownParsedDocument(
             blocks: finalBlocks,
@@ -3432,14 +3607,34 @@ enum MarkdownParser {
         return blocks
     }
 
+    // The line patterns are compiled once: the parser tries them on every
+    // line of every parse, and a streaming reply parses up to 30 times a
+    // second (issue 1721).
+    private static func compiledLine(_ pattern: String, options: NSRegularExpression.Options = []) -> NSRegularExpression {
+        // swiftlint:disable:next force_try
+        try! NSRegularExpression(pattern: pattern, options: options)
+    }
+    private static let taskItemPattern = compiledLine(#"^\[([ xX])\]\s+"#)
+    private static let calloutPattern = compiledLine(#"^\[!([A-Za-z]+)\]\s*"#)
+    private static let referenceDefinitionPattern = compiledLine(#"^\[([^\[\]\^][^\[\]]*)\]:[ \t]+(<[^>]+>|[^\s<][^\s]*)(?:[ \t]+("[^"]*"|'[^']*'|\([^)]*\)))?[ \t]*$"#)
+    private static let imageMarkdownPattern = compiledLine(#"^!\[([^\]]*)\]\((https?://[^\s)]+)(?:\s+\"[^\"]*\")?\)$"#)
+    private static let directImagePattern = compiledLine(#"^https?://\S+\.(png|jpe?g|gif|webp)(\?\S*)?$"#, options: [.caseInsensitive])
+    private static let orderedItemPattern = compiledLine(#"^[0-9]{1,9}[.)]\s+"#)
+
+    /// The range of `expression`'s first match in `value`.
+    private static func firstRange(of expression: NSRegularExpression, in value: String) -> Range<String.Index>? {
+        guard let match = expression.firstMatch(in: value, range: NSRange(value.startIndex..., in: value)) else { return nil }
+        return Range(match.range, in: value)
+    }
+
     static func taskItem(_ value: String) -> (complete: Bool, text: String)? {
-        guard let range = value.range(of: #"^\[([ xX])\]\s+"#, options: .regularExpression) else { return nil }
+        guard let range = firstRange(of: taskItemPattern, in: value) else { return nil }
         let marker = String(value[value.index(after: value.startIndex)])
         return (marker.lowercased() == "x", String(value[range.upperBound...]))
     }
 
     static func calloutMarker(_ value: String) -> (kind: String, remainder: String)? {
-        guard let range = value.range(of: #"^\[!([A-Za-z]+)\]\s*"#, options: .regularExpression) else { return nil }
+        guard let range = firstRange(of: calloutPattern, in: value) else { return nil }
         let marker = String(value[range]).dropFirst(2).prefix { $0.isLetter }
         return (String(marker), String(value[range.upperBound...]))
     }
@@ -3466,10 +3661,7 @@ enum MarkdownParser {
     /// title continuation lines are deliberately unsupported; this renderer
     /// documents and tests the single-line forms only.
     private static func referenceDefinition(_ value: String) -> String? {
-        guard let range = value.range(
-            of: #"^\[([^\[\]\^][^\[\]]*)\]:[ \t]+(<[^>]+>|[^\s<][^\s]*)(?:[ \t]+("[^"]*"|'[^']*'|\([^)]*\)))?[ \t]*$"#,
-            options: .regularExpression
-        ) else { return nil }
+        guard let range = firstRange(of: referenceDefinitionPattern, in: value) else { return nil }
         return String(value[range])
     }
 
@@ -3522,11 +3714,11 @@ enum MarkdownParser {
         return ["note", "info", "tip", "hint", "warning", "caution", "danger", "error", "important", "columns"].contains(name) ? name : nil
     }
     private static func imageMarkdown(_ value: String) -> (url: String, alt: String)? {
-        guard let match = try? NSRegularExpression(pattern: #"^!\[([^\]]*)\]\((https?://[^\s)]+)(?:\s+\"[^\"]*\")?\)$"#).firstMatch(in: value, range: NSRange(value.startIndex..., in: value)), let altRange = Range(match.range(at: 1), in: value), let urlRange = Range(match.range(at: 2), in: value) else { return nil }
+        guard let match = imageMarkdownPattern.firstMatch(in: value, range: NSRange(value.startIndex..., in: value)), let altRange = Range(match.range(at: 1), in: value), let urlRange = Range(match.range(at: 2), in: value) else { return nil }
         return (String(value[urlRange]), String(value[altRange]))
     }
     private static func directImageURL(_ value: String) -> String? {
-        value.range(of: #"^https?://\S+\.(png|jpe?g|gif|webp)(\?\S*)?$"#, options: [.regularExpression, .caseInsensitive]) != nil ? value : nil
+        firstRange(of: directImagePattern, in: value) != nil ? value : nil
     }
     /// The path when `value` is a line holding exactly one `MEDIA:` tag.
     static func gatewayMediaPath(_ value: String) -> String? {
@@ -3556,7 +3748,7 @@ enum MarkdownParser {
     }
     private static func orderedItem(_ value: String) -> String? {
         // CommonMark: one to nine ASCII digits, so anything else is text.
-        guard let range = value.range(of: #"^[0-9]{1,9}[.)]\s+"#, options: .regularExpression) else { return nil }
+        guard let range = firstRange(of: orderedItemPattern, in: value) else { return nil }
         return String(value[range.upperBound...])
     }
     /// The number an ordered item is written with.
@@ -3584,7 +3776,13 @@ enum MarkdownParser {
     private static func directiveSegments(in trimmed: String, recognizesGatewayMedia: Bool) -> [TranscriptDirectives.Segment]? {
         guard !trimmed.hasPrefix(">"), let segments = TranscriptDirectives.segments(in: trimmed) else { return nil }
         if recognizesGatewayMedia { return segments }
-        return segments.contains { if case .desktopCard = $0 { return true } else { return false } } ? segments : nil
+        // Without a host a lone preview stays text; a Desktop card, or a
+        // board line that's hidden (no segment of its own), is still taken.
+        let holdsPreview = segments.contains { if case .preview = $0 { return true } else { return false } }
+        let holdsCard = segments.contains { if case .desktopCard = $0 { return true } else { return false } }
+        // A board the grammar took (not an example in a code span).
+        let holdsBoard = TranscriptDirectives.removingBoards(from: trimmed) != trimmed
+        return !holdsPreview || holdsCard || holdsBoard ? segments : nil
     }
     /// Whether the gateway-media branches of `parseBlocks` take `line`.
     private static func claimsGatewayMedia(_ line: String) -> Bool {
@@ -3646,8 +3844,8 @@ enum SyntaxHighlighter {
     /// transcript — have a constant key and hit on every subsequent frame, so
     /// writes here are worth keeping. The one transient entry per frame is
     /// bounded and self-evicting under NSCache's LRU/memory policy.
-    private static let cache: NSCache<NSString, HighlightedCode> = {
-        let cache = NSCache<NSString, HighlightedCode>()
+    private static let cache: NSCache<MarkdownCacheKey, HighlightedCode> = {
+        let cache = NSCache<MarkdownCacheKey, HighlightedCode>()
         cache.countLimit = 128
         cache.totalCostLimit = 16 * 1024 * 1024
         return cache
@@ -3658,21 +3856,25 @@ enum SyntaxHighlighter {
     /// bridged into an NSAttributedString with a caller-supplied default
     /// font — so one highlighted value serves every typography.
     static func highlight(_ source: String, language: String) -> AttributedString {
-        let key = "\(language)|\(source)" as NSString
+        let key = MarkdownCacheKey(tokens: [language], content: [source])
         if let cached = cache.object(forKey: key) { return cached.value }
         let highlighted = tokenize(source, language: language)
         cache.setObject(HighlightedCode(highlighted), forKey: key, cost: source.utf8.count)
         return highlighted
     }
 
+    private static let keywords: Set<String> = ["as", "async", "await", "break", "case", "catch", "class", "const", "continue", "def", "else", "enum", "false", "final", "for", "func", "guard", "if", "import", "in", "init", "let", "nil", "null", "private", "public", "return", "self", "static", "struct", "switch", "throw", "true", "try", "var", "while"]
+    // Compiled once rather than per block (issue 1721).
+    // String-literal alternatives must be disjoint (`\\.` vs `[^"\\]`):
+    // if both branches can match a backslash, an unterminated literal with
+    // many escapes — the normal transient state while a code block streams —
+    // backtracks exponentially and wedges the main thread (~2^k paths).
+    private static let tokenPattern = try? NSRegularExpression(
+        pattern: #"(//[^\n]*|#[^\n]*|/\*[\s\S]*?\*/|\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|\b\d+(?:\.\d+)?\b|\b[A-Za-z_][A-Za-z0-9_]*\b)"#
+    )
+
     private static func tokenize(_ source: String, language: String) -> AttributedString {
-        let keywords: Set<String> = ["as", "async", "await", "break", "case", "catch", "class", "const", "continue", "def", "else", "enum", "false", "final", "for", "func", "guard", "if", "import", "in", "init", "let", "nil", "null", "private", "public", "return", "self", "static", "struct", "switch", "throw", "true", "try", "var", "while"]
-        // String-literal alternatives must be disjoint (`\\.` vs `[^"\\]`):
-        // if both branches can match a backslash, an unterminated literal with
-        // many escapes — the normal transient state while a code block streams —
-        // backtracks exponentially and wedges the main thread (~2^k paths).
-        let pattern = #"(//[^\n]*|#[^\n]*|/\*[\s\S]*?\*/|\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|\b\d+(?:\.\d+)?\b|\b[A-Za-z_][A-Za-z0-9_]*\b)"#
-        guard let expression = try? NSRegularExpression(pattern: pattern) else { return AttributedString(source) }
+        guard let expression = tokenPattern else { return AttributedString(source) }
         let range = NSRange(source.startIndex..., in: source)
         var cursor = source.startIndex
         var output = AttributedString()

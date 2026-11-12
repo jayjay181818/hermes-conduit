@@ -78,12 +78,13 @@ struct NotifierPluginUpdateSlot: Equatable {
         dashboardID == activeDashboardID ? state : .idle
     }
 
-    mutating func start(on dashboardID: UUID?) -> UUID {
+    /// A restart-only run starts at the gateway restart: nothing downloads.
+    mutating func start(on dashboardID: UUID?, first: NotifierPluginUpdateStep = .downloading) -> UUID {
         let id = UUID()
         runID = id
         self.dashboardID = dashboardID
         startedAt = Date()
-        state = .updating(.downloading)
+        state = .updating(first)
         return id
     }
 
@@ -158,6 +159,11 @@ struct NotifierPluginUpdater {
     /// Hand the update to the host (`selfUpdateCapability`): Conduit only
     /// follows it. The profile that asked gets the notification.
     var onHost = false
+    /// Only the restarts: a host that manages the plugin (`managedBy`) has
+    /// put the new plugin on disk itself, and refuses a pull from Conduit.
+    var restartOnly = false
+    /// The run's first step: a restart-only run downloads nothing.
+    private var firstStep: NotifierPluginUpdateStep { restartOnly ? .restartingGateway(nil) : .downloading }
     var profile: String?
     /// Each capabilities answer read after the update: the new plugin's
     /// report, so the screen doesn't wait for another status refresh.
@@ -169,38 +175,64 @@ struct NotifierPluginUpdater {
     /// Reports each step to `progress` and returns how it ended. Returns
     /// `.idle` when cancelled.
     func run(progress: (NotifierPluginUpdateState) -> Void) async -> NotifierPluginUpdateState {
-        let request = renewingSignIn(self.request)
-        if onHost, !install, let outcome = await runOnHost(request: request, progress: progress) {
+        await run(request: renewingSignIn(self.request), progress: progress, restartedForHermes: false)
+    }
+
+    /// `restartedForHermes`: the dashboard was restarted to load the Hermes
+    /// updated under it, so a pull that meets mixed Hermes again isn't retried.
+    private func run(request: @escaping Request, progress: (NotifierPluginUpdateState) -> Void,
+                     restartedForHermes: Bool) async -> NotifierPluginUpdateState {
+        // A restart only when the host still waits on one: the status this
+        // was offered from can be stale (another phone finished it).
+        if restartOnly, let current = try? await request(NotifierPluginStatus.path, "GET", nil),
+           let runtime = NotifierPluginStatus.runtime(from: current), !runtime.restartNeeded {
+            report?(current)
+            return .updated(version: runtime.loadedVersion)
+        }
+        // A managed host's own job runs only the restarts there (plugin
+        // 0.147.2+), with the gateway's drain and its root-unit fallback;
+        // one that refuses (0.146.0-0.147.1) gets the restarts from here.
+        if onHost, !install,
+           let outcome = await runOnHost(request: request, progress: progress, restartedForHermes: restartedForHermes) {
             return outcome
         }
-        // 1. The new plugin onto the host.
-        progress(.updating(install ? .installing : .downloading))
-        do {
-            var installs = install
-            var replaces = false
-            if !installs {
-                do {
-                    // Installing writes the profile config's plugin list,
-                    // so it waits its turn with Settings' saves.
-                    try Self.check(try await ProfileConfigWriteQueue.runThrowing { try await request(Self.updatePath, "POST", nil) })
-                } catch let error where Self.isNotInstalled(error) {
-                    installs = true
-                } catch let error where Self.needsReinstall(error) {
-                    installs = true
-                    replaces = true
+        // 1. The new plugin onto the host, unless the host put it there.
+        if !restartOnly {
+            progress(.updating(install ? .installing : .downloading))
+            do {
+                var installs = install
+                var replaces = false
+                if !installs {
+                    do {
+                        // Installing writes the profile config's plugin list,
+                        // so it waits its turn with Settings' saves.
+                        try Self.check(try await ProfileConfigWriteQueue.runThrowing { try await request(Self.updatePath, "POST", nil) })
+                    } catch let error where Self.isNotInstalled(error) {
+                        installs = true
+                    } catch let error where Self.needsReinstall(error) {
+                        installs = true
+                        replaces = true
+                    }
                 }
+                if installs {
+                    progress(.updating(.installing))
+                    var body: [String: Any] = ["identifier": NotifierPluginStatus.repository, "enable": true]
+                    // Replacing the copy on disk takes force. The plugin keeps its
+                    // state in the Hermes home, not in its own folder.
+                    if replaces { body["force"] = true }
+                    try Self.check(try await ProfileConfigWriteQueue.runThrowing { try await request(Self.installPath, "POST", body) })
+                }
+            } catch {
+                if Task.isCancelled { return .idle }
+                if !restartedForHermes, Self.httpStatus(of: error) == 400, Self.ranMixedHermes(Self.detail(of: error)) {
+                    // Hermes' own pull, in a dashboard Hermes was updated under (issue 1889).
+                    let detail = Self.detail(of: error)
+                    return await restartForUpdatedHermes(request: request, progress: progress, detail: detail) {
+                        await run(request: request, progress: progress, restartedForHermes: true)
+                    } ?? .failed(detail: Self.explainingMixedHermes(detail))
+                }
+                return Self.outcome(forRequestError: error)
             }
-            if installs {
-                progress(.updating(.installing))
-                var body: [String: Any] = ["identifier": NotifierPluginStatus.repository, "enable": true]
-                // Replacing the copy on disk takes force. The plugin keeps its
-                // state in the Hermes home, not in its own folder.
-                if replaces { body["force"] = true }
-                try Self.check(try await ProfileConfigWriteQueue.runThrowing { try await request(Self.installPath, "POST", body) })
-            }
-        } catch {
-            if Task.isCancelled { return .idle }
-            return Self.outcome(forRequestError: error)
         }
         if Task.isCancelled { return .idle }
 
@@ -254,25 +286,44 @@ struct NotifierPluginUpdater {
         }
         let capabilities = before["capabilities"] as? [String] ?? []
         guard capabilities.contains(Self.selfRestartCapability) else { return .needsDashboardRestart(detail: nil) }
+        switch await restartDashboard(from: runtime, request: request, progress: progress) {
+        case .ended(let outcome):
+            return outcome
+        case .back(let json, let after):
+            report?(json)
+            return after.restartNeeded ? .needsDashboardRestart(detail: nil) : .updated(version: after.loadedVersion)
+        }
+    }
 
+    private enum DashboardRestart {
+        /// The new process answered: its report and what it runs.
+        case back([String: Any], NotifierPluginStatus.Runtime)
+        /// How the update ends instead.
+        case ended(NotifierPluginUpdateState)
+    }
+
+    /// Restarts the dashboard through the plugin (`selfRestartPath`), waiting
+    /// for its running chats first, and waits for the new process.
+    private func restartDashboard(from runtime: NotifierPluginStatus.Runtime, request: Request,
+                                  progress: (NotifierPluginUpdateState) -> Void) async -> DashboardRestart {
         let waitStarted = now()
         while true {
             do {
                 _ = try await request(Self.selfRestartPath, "POST", nil)
                 break
             } catch {
-                if Task.isCancelled { return .idle }
+                if Task.isCancelled { return .ended(.idle) }
                 switch Self.httpStatus(of: error) {
                 case 409:
                     guard now().timeIntervalSince(waitStarted) < Self.chatsWaitLimit else {
-                        return .needsDashboardRestart(detail: Self.detail(of: error))
+                        return .ended(.needsDashboardRestart(detail: Self.detail(of: error)))
                     }
                     progress(.updating(.waitingForChats(count: Self.runningChats(in: Self.detail(of: error)))))
-                    do { try await sleep(pollInterval) } catch { return .idle }
+                    do { try await sleep(pollInterval) } catch { return .ended(.idle) }
                 case 404, 405, 501:
-                    return .needsDashboardRestart(detail: Self.detail(of: error))
+                    return .ended(.needsDashboardRestart(detail: Self.detail(of: error)))
                 default:
-                    return .failed(detail: UserFacingError.message(for: error))
+                    return .ended(.failed(detail: UserFacingError.message(for: error)))
                 }
             }
         }
@@ -280,33 +331,53 @@ struct NotifierPluginUpdater {
         progress(.updating(.restartingDashboard))
         let restartStarted = now()
         while now().timeIntervalSince(restartStarted) < Self.comeBackLimit {
-            do { try await sleep(pollInterval) } catch { return .idle }
-            if Task.isCancelled { return .idle }
+            do { try await sleep(pollInterval) } catch { return .ended(.idle) }
+            if Task.isCancelled { return .ended(.idle) }
             // Requests fail while the dashboard is down; the next poll asks
             // again. A refused sign-in means it is back.
             let json: [String: Any]
             do {
                 json = try await request(NotifierPluginStatus.path, "GET", nil)
             } catch DashboardTicketBridgeError.signInRequired {
-                return Self.outcome(forRequestError: DashboardTicketBridgeError.signInRequired)
+                return .ended(Self.outcome(forRequestError: DashboardTicketBridgeError.signInRequired))
             } catch {
                 continue
             }
             guard let after = NotifierPluginStatus.runtime(from: json),
                   after.bootID != runtime.bootID else { continue }
-            report?(json)
-            return after.restartNeeded ? .needsDashboardRestart(detail: nil) : .updated(version: after.loadedVersion)
+            return .back(json, after)
         }
-        return .failed(detail: AppLocalization.string("The dashboard hasn't come back yet. Check that Hermes is running on the host."))
+        return .ended(.failed(detail: AppLocalization.string("The dashboard hasn't come back yet. Check that Hermes is running on the host.")))
+    }
+
+    /// Nil when the run may go on from here, after a start on the host that
+    /// started nothing. A host that manages the plugin now, unknown to the
+    /// status this started from, never gets Hermes' own pull, nor does one
+    /// that can't say: the pull would replace a pinned copy. A restart-only
+    /// run pulls nothing: its restarts run from here.
+    private func managedRefusal(request: Request) async -> NotifierPluginUpdateState? {
+        if restartOnly { return nil }
+        let current: [String: Any]
+        do {
+            current = try await request(NotifierPluginStatus.path, "GET", nil)
+        } catch {
+            if Task.isCancelled { return .idle }
+            return .failed(detail: UserFacingError.message(for: error))
+        }
+        if let managedBy = NotifierPluginStatus.managedBy(from: current) {
+            report?(current)
+            return .failed(detail: NotifierPluginStatus.managedText(managedBy))
+        }
+        return nil
     }
 
     /// Starts the update on the host and follows it. Nil when the host
     /// can't run it (an older Hermes, a dashboard that can't restart
     /// itself) or the plugin isn't one Hermes can pull: the steps above
     /// then run from here.
-    private func runOnHost(request: Request,
-                           progress: (NotifierPluginUpdateState) -> Void) async -> NotifierPluginUpdateState? {
-        progress(.updating(.downloading))
+    private func runOnHost(request: Request, progress: (NotifierPluginUpdateState) -> Void,
+                           restartedForHermes: Bool = false) async -> NotifierPluginUpdateState? {
+        progress(.updating(firstStep))
         let path = profile.map { DashboardPath.withProfile(Self.selfUpdatePath, profile: $0) } ?? Self.selfUpdatePath
         var job: [String: Any]
         do {
@@ -317,25 +388,62 @@ struct NotifierPluginUpdater {
             return Self.outcome(forRequestError: DashboardTicketBridgeError.signInRequired)
         } catch {
             if Task.isCancelled { return .idle }
-            // No answer at all (a timeout, a dropped connection) may still
-            // have started the job: follow one that runs rather than start
-            // a second update from here.
-            guard Self.httpStatus(of: error) == nil,
-                  let probe = try? await request(path, "GET", nil),
-                  let running = probe["job"] as? [String: Any], Self.hostStep(running) != nil else { return nil }
-            job = running
+            // 409: the host manages the plugin (plugin 0.146.0+) and refuses
+            // the update. Never fall back to Hermes' own pull, which would
+            // replace the copy the host pinned.
+            // A restart-only run pulls nothing either way: the restarts run from here.
+            if Self.httpStatus(of: error) == 409 {
+                guard restartOnly else { return .failed(detail: Self.detail(of: error)) }
+                // 0.147.2+ also answers 409 when nothing waits any more (another
+                // phone finished it): restart nothing. Older plugins refuse every
+                // job, and their copy still waits, so the restarts run from here.
+                if let current = try? await request(NotifierPluginStatus.path, "GET", nil),
+                   let runtime = NotifierPluginStatus.runtime(from: current), !runtime.restartNeeded {
+                    report?(current)
+                    return .updated(version: runtime.loadedVersion)
+                }
+                return nil
+            }
+            // No answer at all (a timeout, a dropped connection, the bridge's
+            // fetch failure, which reads as status 0) may still have started
+            // the job: follow one that runs rather than start a second
+            // update from here.
+            let status = Self.httpStatus(of: error)
+            // Any other answer (an older Hermes' 404, a proxy's 502 while
+            // the host restarts) started nothing; Hermes' own pull runs from
+            // here only on a host that says it doesn't manage the plugin
+            // (issue 2061).
+            guard status == nil || status == 0 else {
+                return await managedRefusal(request: request)
+            }
+            if let probe = try? await request(path, "GET", nil),
+               let running = probe["job"] as? [String: Any], Self.hostStep(running) != nil {
+                job = running
+            } else {
+                // Nothing runs there.
+                return await managedRefusal(request: request)
+            }
         }
         guard let jobID = job["id"] as? String else { return nil }
         let started = now()
         while true {
             if let step = Self.hostStep(job) {
-                progress(.updating(step))
+                // A restart-only job opens on "downloading" for its no-op pull.
+                progress(.updating(restartOnly && step == .downloading ? firstStep : step))
             } else if let outcome = Self.hostOutcome(job) {
-                return await finishHostUpdate(outcome, pullFailed: job["failed_step"] as? String == "downloading",
-                                              request: request)
+                let pullFailed = job["failed_step"] as? String == "downloading"
+                if pullFailed, case .failed(let detail) = outcome, Self.ranMixedHermes(detail) {
+                    // Hermes was updated under the running dashboard (issue 1889): its
+                    // restart loads the new Hermes whole, then the update runs again.
+                    guard !restartedForHermes else { return .failed(detail: Self.explainingMixedHermes(detail)) }
+                    return await restartForUpdatedHermes(request: request, progress: progress, detail: detail) {
+                        await runOnHost(request: request, progress: progress, restartedForHermes: true)
+                    }
+                }
+                return await finishHostUpdate(outcome, pullFailed: pullFailed, request: request)
             } else {
                 // A step this Conduit doesn't know (a newer plugin's).
-                progress(.updating(.downloading))
+                progress(.updating(firstStep))
             }
             guard now().timeIntervalSince(started) < Self.hostFollowLimit else {
                 return .runningOnHost
@@ -360,6 +468,55 @@ struct NotifierPluginUpdater {
         }
     }
 
+    /// Restarts a dashboard still running the Hermes it started with, then
+    /// runs the update again (`again`) on the new one.
+    private func restartForUpdatedHermes(request: Request, progress: (NotifierPluginUpdateState) -> Void,
+                                         detail: String?,
+                                         again: () async -> NotifierPluginUpdateState?) async -> NotifierPluginUpdateState? {
+        let failed = NotifierPluginUpdateState.failed(detail: Self.explainingMixedHermes(detail))
+        // The dashboard answered a moment ago: a read that fails once is asked again.
+        var fetched: [String: Any]?
+        for attempt in 0..<3 {
+            do {
+                fetched = try await request(NotifierPluginStatus.path, "GET", nil)
+                break
+            } catch DashboardTicketBridgeError.signInRequired {
+                // Signing in again didn't work: that, not the restart, is what to fix.
+                return Self.outcome(forRequestError: DashboardTicketBridgeError.signInRequired)
+            } catch {}
+            if Task.isCancelled { return .idle }
+            if attempt < 2 { do { try await sleep(pollInterval) } catch { return .idle } }
+        }
+        guard let json = fetched, let runtime = NotifierPluginStatus.runtime(from: json),
+              (json["capabilities"] as? [String] ?? []).contains(Self.selfRestartCapability) else { return failed }
+        switch await restartDashboard(from: runtime, request: request, progress: progress) {
+        case .ended(.idle):
+            return .idle
+        case .ended(let outcome) where outcome == Self.outcome(forRequestError: DashboardTicketBridgeError.signInRequired):
+            return outcome
+        case .ended:
+            return failed
+        case .back:
+            return await again()
+        }
+    }
+
+    /// Hermes' pull failing inside Hermes' own code with a name it can't
+    /// find: the running dashboard mixes the Hermes it started with and the
+    /// one updated under it ("'PythonDeclaration' object has no attribute
+    /// 'installs_packages'", issue 1889).
+    static func ranMixedHermes(_ detail: String?) -> Bool {
+        guard let detail else { return false }
+        return detail.contains("has no attribute '") || detail.contains("cannot import name '")
+    }
+
+    /// What to do about a dashboard running mixed Hermes, then Hermes' words:
+    /// the notice shows the first lines only.
+    static func explainingMixedHermes(_ detail: String?) -> String? {
+        guard ranMixedHermes(detail), let detail else { return detail }
+        return AppLocalization.string("Hermes was updated on the host while its dashboard kept running. Restart the Hermes dashboard on the host, then update again.") + "\n\n" + detail
+    }
+
     /// The host's last word, with the new plugin's report. A pull that
     /// failed because Hermes can't pull this plugin (not cloned by Hermes,
     /// not installed) is nil: the steps from here handle those.
@@ -382,7 +539,11 @@ struct NotifierPluginUpdater {
     static func hostStep(_ job: [String: Any]) -> NotifierPluginUpdateStep? {
         switch job["step"] as? String ?? "" {
         case "downloading": return .downloading
-        case "restarting_gateway": return .restartingGateway(nil)
+        case "restarting_gateway":
+            // The host waits for the gateway's running work before the restart, and a restart
+            // that meets some lets it finish first (notifier #546).
+            let stage = job["gateway_stage"] as? String
+            return .restartingGateway(stage == "waiting" || stage == "draining" ? .draining : nil)
         case "waiting_for_chats": return .waitingForChats(count: max(1, job["running_chats"] as? Int ?? 1))
         case "restarting_dashboard": return .restartingDashboard
         default: return nil
@@ -449,7 +610,7 @@ struct NotifierPluginUpdater {
     static func outcome(forRequestError error: Error) -> NotifierPluginUpdateState {
         switch httpStatus(of: error) {
         case 404, 405, 501: return .unsupported
-        case 400: return .failed(detail: detail(of: error))
+        case 400: return .failed(detail: explainingMixedHermes(detail(of: error)))
         default: return .failed(detail: UserFacingError.message(for: error))
         }
     }

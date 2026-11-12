@@ -9,6 +9,7 @@
 //
 
 import CarPlay
+import UIKit
 import XCTest
 @testable import Conduit
 
@@ -47,7 +48,52 @@ extension CarPlayVoiceCoordinatorTests {
         XCTAssertTrue(VoiceSetupIssue.voiceOff.message.contains("Settings > Voice"))
         XCTAssertTrue(VoiceSetupIssue.noTextToSpeech.message.contains("Settings > Voice"))
         XCTAssertTrue(VoiceSetupIssue.noSpeechToText(detail: nil).message.contains("Settings > Voice"))
-        XCTAssertTrue(VoiceSetupIssue.microphoneDenied.message.contains("iPhone Settings > Conduit"))
+        let microphoneSettings: String
+        if ProcessInfo.processInfo.runsOnMac {
+            microphoneSettings = "System Settings → Privacy & Security → Microphone"
+        } else if UIDevice.current.userInterfaceIdiom == .pad {
+            microphoneSettings = "iPad Settings > Conduit"
+        } else {
+            microphoneSettings = "iPhone Settings > Conduit"
+        }
+        XCTAssertTrue(VoiceSetupIssue.microphoneDenied.message.contains(microphoneSettings))
+    }
+
+    /// Issue 2208: on a Mac the iPad app's settings URLs opened its own
+    /// settings window, and the words named iPhone Settings. Each place
+    /// to allow something is worded for the device, and a Mac's Open
+    /// Settings goes to that pane of System Settings.
+    func testPermissionTextsAndSettingsLinksFollowTheDevice() {
+        let runsOnMac = ProcessInfo.processInfo.runsOnMac
+        let currentDevice: SystemSettings.Device = runsOnMac
+            ? .mac
+            : (UIDevice.current.userInterfaceIdiom == .pad ? .iPad : .iPhone)
+        XCTAssertEqual(SystemSettings.Device.current, currentDevice)
+        XCTAssertTrue(ServerCertificateSection.installSteps[0].contains(runsOnMac ? "Finder" : "Files"))
+
+        XCTAssertEqual(SystemSettings.worded(iPhone: "phone", iPad: "pad", mac: "mac", on: .iPhone), "phone")
+        XCTAssertEqual(SystemSettings.worded(iPhone: "phone", iPad: "pad", mac: "mac", on: .iPad), "pad")
+        XCTAssertEqual(SystemSettings.worded(iPhone: "phone", iPad: "pad", mac: "mac", on: .mac), "mac")
+        XCTAssertEqual(
+            SystemSettings.macURL(for: .notifications, bundleID: "com.milim.relay")?.absoluteString,
+            "x-apple.systempreferences:com.apple.Notifications-Settings.extension?id=com.milim.relay"
+        )
+        XCTAssertEqual(
+            SystemSettings.macURL(for: .microphone, bundleID: "com.milim.relay")?.absoluteString,
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"
+        )
+        let panes: [SystemSettings.Pane] = [.notifications, .microphone, .speechRecognition, .camera, .location, .contacts]
+        XCTAssertEqual(Set(panes.compactMap { SystemSettings.macURL(for: $0, bundleID: nil)?.absoluteString }).count, panes.count)
+        let notificationsOff: String
+        switch currentDevice {
+        case .mac:
+            notificationsOff = "Notifications are off for Conduit in System Settings → Notifications."
+        case .iPad:
+            notificationsOff = "Notifications are off for Conduit in iPad Settings."
+        case .iPhone:
+            notificationsOff = "Notifications are off for Conduit in iPhone Settings."
+        }
+        XCTAssertEqual(SystemSettings.notificationsOffText, notificationsOff)
     }
 
     func testOnlyTheErrorStateTakesTheIssueTitle() {

@@ -8,6 +8,7 @@
 //  Hermes wants, and the banner after one went in without asking.
 //
 
+import ContactsUI
 import SwiftUI
 import UIKit
 
@@ -29,6 +30,8 @@ struct PhoneSettingsPage: View {
     @State private var askingVoiceMode: LiveVoiceModeName?
     /// Loaded on appear (loading prunes and saves).
     @State private var voiceUses = HealthVoiceReadLog()
+    /// Limited Contacts access's picker, to let Conduit see picked people.
+    @State private var showsContactAccess = false
 
     private var preferences: PhoneSyncPreferences { engine.preferences }
     private var pluginServes: Bool { appState.notifierPlugin.reports(AppState.phoneSyncCapability) }
@@ -41,6 +44,18 @@ struct PhoneSettingsPage: View {
     private var showsPeople: Bool {
         appState.notifierPlugin.reports(AppState.phoneContactsCapability) || choices.contacts
     }
+    private var showsContactEdits: Bool {
+        appState.notifierPlugin.reports(AppState.phoneContactEditsCapability) || choices.contactsEdit
+    }
+    private var showsShortcuts: Bool {
+        appState.notifierPlugin.reports(AppState.phoneShortcutsCapability) || choices.shortcuts
+    }
+    private var showsPhotos: Bool {
+        appState.notifierPlugin.reports(AppState.phonePhotosCapability) || choices.photos
+    }
+    @State private var showsAddShortcut = false
+    @State private var newShortcutName = ""
+    @State private var newShortcutNote = ""
 
     var body: some View {
         SettingsDetailContainer {
@@ -51,17 +66,22 @@ struct PhoneSettingsPage: View {
                 if preferences.isOn {
                     statusRows
                 } else if !pluginServes {
-                    Text("Update the Conduit plugin on your Hermes host to share your calendar and phone status.")
+                    Text(PluginUpdateAsk.text(AppLocalization.string("Update the Conduit plugin on your Hermes host to share your calendar and phone status.")))
                         .scaledFont(.caption)
                         .foregroundStyle(.orange)
                 }
             }
             if preferences.isOn || pluginServes {
                 calendarSection
-                if choices.takesChanges { changesSection }
+                // Runs have their own choice, in Shortcuts.
+                if choices.calendar.adds || (choices.reminders && !choices.remindersReadOnly) || choices.alarms {
+                    changesSection
+                }
                 phoneSection
                 if showsAlarms { alarmsSection }
                 if showsPeople { peopleSection }
+                if showsShortcuts { shortcutsSection }
+                if showsPhotos { photosSection }
                 if preferences.isOn { voiceSection }
                 actionSection
             }
@@ -117,7 +137,7 @@ struct PhoneSettingsPage: View {
                 .scaledFont(.caption)
                 .foregroundStyle(.secondary)
         } else if let pause = engine.state.pause {
-            Text(pause.message)
+            Text(pause.message(managedBy: appState.pluginManagedBy(forDashboard: preferences.destination?.dashboardID)))
                 .scaledFont(.caption)
                 .foregroundStyle(.orange)
         } else if let last = engine.state.lastSync {
@@ -287,13 +307,117 @@ struct PhoneSettingsPage: View {
         }
     }
 
+    // MARK: Shortcuts
+
+    private var shortcutsSection: some View {
+        ConduitSettingsSection(title: AppLocalization.string("Shortcuts"), symbol: "square.2.layers.3d", tint: .conduitAccent) {
+            Toggle(isOn: binding(\.shortcuts)) {
+                Label("Let Hermes run shortcuts you list", systemImage: "square.2.layers.3d")
+            }
+            .accessibilityIdentifier("settings.phone.shortcuts")
+            Text("Add shortcuts from the Shortcuts app by name, with a note on what each does. Hermes can ask to run one, with some text as its input, and gets back the text it ends with. A run opens the Shortcuts app, so it happens with Conduit open: Hermes' request waits on a card until you tap Run. With Run without asking on, it runs straight away when Conduit is open.")
+                .scaledFont(.caption)
+                .foregroundStyle(.secondary)
+            if choices.shortcuts {
+                ForEach(choices.shortcutList) { shortcut in
+                    HStack(spacing: 10) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(shortcut.name)
+                                .scaledFont(.subheadline)
+                            if let note = shortcut.note {
+                                Text(note)
+                                    .scaledFont(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        Spacer(minLength: 4)
+                        Button(role: .destructive) {
+                            Haptics.selection()
+                            var list = choices.shortcutList
+                            list.removeAll { $0.id == shortcut.id }
+                            binding(\.shortcutList).wrappedValue = list
+                        } label: {
+                            Image(systemName: "minus.circle.fill")
+                                .foregroundStyle(.red)
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel(Text(AppLocalization.string("Remove \(shortcut.name)")))
+                    }
+                }
+                Button {
+                    Haptics.selection()
+                    newShortcutName = ""
+                    newShortcutNote = ""
+                    showsAddShortcut = true
+                } label: {
+                    Label("Add a shortcut", systemImage: "plus.circle")
+                }
+                .disabled(choices.shortcutList.count >= PhoneShortcut.maximum)
+                .accessibilityIdentifier("settings.phone.shortcuts.add")
+                Toggle(isOn: binding(\.shortcutsRunWithoutAsking)) {
+                    Text("Run without asking")
+                }
+                .accessibilityIdentifier("settings.phone.shortcuts.auto")
+                Text("When Conduit is open, a shortcut Hermes asks for runs straight away. When it isn't, it waits on its card.")
+                    .scaledFont(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .alert("Add a shortcut", isPresented: $showsAddShortcut) {
+            TextField("Name in Shortcuts", text: $newShortcutName)
+            TextField("What it does (optional)", text: $newShortcutNote)
+            Button("Add") {
+                guard let shortcut = PhoneShortcut(name: newShortcutName, note: newShortcutNote) else { return }
+                var list = choices.shortcutList.filter { $0.id != shortcut.id }
+                list.append(shortcut)
+                binding(\.shortcutList).wrappedValue = list
+            }
+            .disabled(newShortcutName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Type its name exactly as the Shortcuts app shows it.")
+        }
+    }
+
+    private var photosSection: some View {
+        ConduitSettingsSection(title: AppLocalization.string("Photos"), symbol: "photo.on.rectangle", tint: .conduitAccent) {
+            Toggle(isOn: binding(\.photos)) {
+                Label("Let Hermes search your photos", systemImage: "photo.on.rectangle")
+            }
+            .accessibilityIdentifier("settings.phone.photos")
+            Text("Conduit describes each photo on this iPhone, a few at a time while it's open: what's in it (Apple's on-device labels), words in the picture, the town or area, and when it was taken. Only that description goes to your Hermes host, for your newest 5,000 photos, never the photo itself.")
+                .scaledFont(.caption)
+                .foregroundStyle(.secondary)
+            Text("To name the town or area, Conduit looks up the photo's location with Apple's map service. The description also says whether it's a favorite or a screenshot, and its size.")
+                .scaledFont(.caption)
+                .foregroundStyle(.secondary)
+            Text("When Hermes wants to see a photo, it shows on a card and goes to your host only if you tap Send.")
+                .scaledFont(.caption)
+                .foregroundStyle(.secondary)
+            if choices.photos, preferences.photos {
+                let progress = engine.photoSource.progress
+                if progress.total > 0 {
+                    Text(AppLocalization.string("Photos described so far: \(Int(progress.described))"))
+                        .scaledFont(.caption)
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                }
+                if engine.photoSource.access == .limited {
+                    Text("Conduit sees only the photos you chose for it. To let Hermes search them all, allow full access for Conduit in Settings.")
+                        .scaledFont(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+
     private var peopleSection: some View {
         ConduitSettingsSection(title: AppLocalization.string("People"), symbol: "person.2", tint: .conduitAccent) {
             Toggle(isOn: binding(\.contacts)) {
                 Label("Share the people you pick", systemImage: "person.2")
             }
             .accessibilityIdentifier("settings.phone.contacts")
-            Text("Pick the people Hermes should know, and say who they are to you, such as wife or boss, so \"text my wife\" or \"Mum's birthday\" just works. Hermes gets their name, phone numbers, email addresses and birthday. Conduit doesn't read your contacts: only the people you pick here.")
+            Text("Pick the people Hermes should know, and say who they are to you, such as wife or boss, so \"text my wife\" or \"Mum's birthday\" just works. Hermes gets their name, phone numbers, email addresses and birthday. Conduit reads only the people you pick here, nothing else in your contacts.")
                 .scaledFont(.caption)
                 .foregroundStyle(.secondary)
             Text("Their nickname and company go too, when the contact has them.")
@@ -304,9 +428,19 @@ struct PhoneSettingsPage: View {
                     .scaledFont(.caption)
                     .foregroundStyle(.secondary)
             }
+            if choices.contacts, showsContactEdits {
+                Toggle(isOn: binding(\.contactsEdit)) {
+                    Text("Let Hermes ask to add or change contacts")
+                }
+                .accessibilityIdentifier("settings.phone.contacts.edit")
+                Text("Hermes can ask to add someone to your contacts, or change or delete the card of someone you picked here. Each waits on a card for your yes. Changing contacts needs Contacts access.")
+                    .scaledFont(.caption)
+                    .foregroundStyle(.secondary)
+            }
             if choices.contacts {
                 ForEach(engine.people) { person in
-                    PhonePersonRow(person: person) { relation in
+                    PhonePersonRow(person: person, problem: engine.peopleProblems[person.id],
+                                   allowAccess: { showsContactAccess = true }) { relation in
                         var people = engine.people
                         guard let index = people.firstIndex(where: { $0.id == person.id }) else { return }
                         people[index].relation = relation.isEmpty ? nil : String(relation.prefix(PhonePerson.relationLength))
@@ -330,7 +464,55 @@ struct PhoneSettingsPage: View {
                 }
                 .disabled(engine.people.count >= PhonePerson.maximum)
                 .accessibilityIdentifier("settings.phone.contacts.add")
+                if !engine.people.isEmpty { peopleUpdates }
             }
+        }
+        .task(id: choices.contacts) {
+            if choices.contacts { await engine.refreshPeople() }
+        }
+        // Back from the Settings app, where access may have changed.
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)) { _ in
+            guard choices.contacts else { return }
+            Task { await engine.refreshPeople() }
+        }
+        .modifier(PhoneContactAccessPicker(isPresented: $showsContactAccess) {
+            Task {
+                await engine.refreshPeople()
+                syncPeople()
+            }
+        })
+    }
+
+    /// Whether edits made in Contacts reach Hermes, and how to let them.
+    @ViewBuilder
+    private var peopleUpdates: some View {
+        switch engine.contactsAccess {
+        case .notAsked:
+            Text("Conduit has what each card said when you picked them. To bring in edits you make in Contacts, let Conduit read the people you pick.")
+                .scaledFont(.caption)
+                .foregroundStyle(.secondary)
+            Button {
+                Haptics.selection()
+                Task {
+                    await engine.requestContactsAccess()
+                    syncPeople()
+                }
+            } label: {
+                Label("Keep them up to date", systemImage: "arrow.triangle.2.circlepath")
+            }
+            .accessibilityIdentifier("settings.phone.contacts.access")
+        case .denied:
+            Text("Edits you make in Contacts reach Hermes only when you pick the person again. To bring them in at each sync, allow Contacts for Conduit in Settings.")
+                .scaledFont(.caption)
+                .foregroundStyle(.secondary)
+            Button(AppLocalization.string("Open Settings")) {
+                SystemSettings.open(.contacts)
+            }
+            .scaledFont(.subheadline)
+        case .limited, .full:
+            Text("Each sync reads the people you picked again, so edits you make in Contacts reach Hermes.")
+                .scaledFont(.caption)
+                .foregroundStyle(.secondary)
         }
     }
 
@@ -537,7 +719,11 @@ struct PhoneSettingsPage: View {
         Task {
             let done = await appState.turnOffPhoneSync(deleteFromHost: delete)
             if !done {
-                errorMessage = AppLocalization.string("Sharing is off. The host couldn't be reached, so Conduit deletes the data there the next time it connects.")
+                // A profile that turned the plugin off was reached and refused:
+                // say how to turn it on (issue 1671).
+                errorMessage = appState.phoneSync.deleteRefusedPluginOff.map {
+                    AppLocalization.string("Sharing is off. \($0) Conduit deletes the data there once it's on.")
+                } ?? AppLocalization.string("Sharing is off. The host couldn't be reached, so Conduit deletes the data there the next time it connects.")
             }
             choices = PhoneSyncPreferences(calendar: .full, reminders: true, status: true, focus: true)
             voiceUses = HealthVoiceReadLog()
@@ -550,6 +736,10 @@ struct PhoneSettingsPage: View {
 /// One picked person in Settings: who they are to the user, editable.
 struct PhonePersonRow: View {
     let person: PhonePerson
+    /// Why the last read from Contacts missed them, if it did.
+    var problem: PhonePersonProblem?
+    /// Opens limited Contacts access's picker.
+    var allowAccess: () -> Void = {}
     let save: (String) -> Void
     let remove: () -> Void
     @State private var relation = ""
@@ -565,6 +755,7 @@ struct PhonePersonRow: View {
                     .submitLabel(.done)
                     .accessibilityLabel(Text(AppLocalization.string("Relation to \(person.name)")))
                     .onSubmit { save(relation.trimmingCharacters(in: .whitespacesAndNewlines)) }
+                if let problem { problemNote(problem) }
             }
             Spacer(minLength: 4)
             Button(role: .destructive, action: remove) {
@@ -584,6 +775,67 @@ struct PhonePersonRow: View {
             let typed = relation.trimmingCharacters(in: .whitespacesAndNewlines)
             if typed != (person.relation ?? "") { save(typed) }
         }
+    }
+
+    @ViewBuilder
+    private func problemNote(_ problem: PhonePersonProblem) -> some View {
+        switch problem {
+        case .notShared:
+            Label("Conduit can't see this contact, so edits to it don't reach Hermes. Hermes keeps what Conduit last read.",
+                  systemImage: "exclamationmark.triangle.fill")
+                .scaledFont(.caption)
+                .foregroundStyle(.orange)
+            if #available(iOS 18.0, *) {
+                Button("Let Conduit see them", action: allowAccess)
+                    .scaledFont(.caption.weight(.semibold))
+                    .buttonStyle(.borderless)
+            }
+        case .notFound:
+            Label("This contact isn't in Contacts any more. Hermes keeps what Conduit last read.",
+                  systemImage: "exclamationmark.triangle.fill")
+                .scaledFont(.caption)
+                .foregroundStyle(.orange)
+        case .unreadable:
+            Label("Contacts couldn't be read just now. Hermes keeps what Conduit last read.",
+                  systemImage: "exclamationmark.triangle.fill")
+                .scaledFont(.caption)
+                .foregroundStyle(.orange)
+        }
+    }
+}
+
+/// Limited Contacts access's own picker (iOS 18 and later), where the user
+/// adds people Conduit may see.
+private struct PhoneContactAccessPicker: ViewModifier {
+    @Binding var isPresented: Bool
+    let done: () -> Void
+    #if targetEnvironment(macCatalyst)
+    @State private var waitingForSettings = false
+    #endif
+
+    func body(content: Content) -> some View {
+        #if targetEnvironment(macCatalyst)
+        // ContactsUI's limited-access sheet is iOS-only. Let the Mac's
+        // permission pane handle access, then refresh when it returns.
+        content
+            .onChange(of: isPresented) { _, presented in
+                guard presented else { return }
+                isPresented = false
+                waitingForSettings = true
+                SystemSettings.open(.contacts)
+            }
+            .onReceive(NotificationCenter.default.publisher(for: Notification.Name("NSApplicationDidBecomeActiveNotification"))) { _ in
+                guard waitingForSettings else { return }
+                waitingForSettings = false
+                done()
+            }
+        #else
+        if #available(iOS 18.0, *) {
+            content.contactAccessPicker(isPresented: $isPresented) { _ in done() }
+        } else {
+            content
+        }
+        #endif
     }
 }
 
@@ -654,6 +906,11 @@ enum PhoneChangeWording {
         case .setAlarm: return AppLocalization.string("Hermes wants to set an alarm")
         case .setTimer: return AppLocalization.string("Hermes wants to start a timer")
         case .cancelAlarm: return AppLocalization.string("Hermes wants to cancel an alarm")
+        case .runShortcut: return AppLocalization.string("Hermes wants to run a shortcut")
+        case .addContact: return AppLocalization.string("Hermes wants to add a contact")
+        case .updateContact: return AppLocalization.string("Hermes wants to change a contact")
+        case .deleteContact: return AppLocalization.string("Hermes wants to delete a contact")
+        case .sendPhoto: return AppLocalization.string("Hermes wants to see a photo")
         }
     }
 
@@ -691,8 +948,16 @@ enum PhoneChangeWording {
     }
 
     /// The item's title and time, as far as the change says.
-    static func detail(_ change: PhoneChange) -> String {
+    static func detail(_ change: PhoneChange, personName: String? = nil) -> String {
         if change.kind == .setAlarm || change.kind == .setTimer { return alarmSummary(change.fields, kind: change.kind) }
+        if change.kind == .runShortcut { return shortcutSummary(change.fields) }
+        if change.kind == .sendPhoto { return photoSummary(change.fields) }
+        if change.kind.isContact {
+            // Who it's about, then what changes (a new contact's name is in it).
+            let edit = change.fields.contact?.summary ?? ""
+            if change.kind == .addContact { return edit }
+            return [personName ?? change.fields.personName, edit.isEmpty ? nil : edit].compactMap { $0 }.joined(separator: " → ")
+        }
         var parts: [String] = []
         if let title = change.fields.title, !title.isEmpty { parts.append(title) }
         let allDay = change.fields.allDay ?? false
@@ -722,18 +987,50 @@ enum PhoneChangeWording {
         case .setAlarm: return AppLocalization.string("Set")
         case .setTimer: return AppLocalization.string("Start")
         case .cancelAlarm: return AppLocalization.string("Cancel alarm")
+        case .runShortcut: return AppLocalization.string("Run")
+        case .addContact: return AppLocalization.string("Add")
+        case .updateContact: return AppLocalization.string("Change")
+        case .deleteContact: return AppLocalization.string("Delete")
+        case .sendPhoto: return AppLocalization.string("Send")
         }
+    }
+
+    /// When and where a photo was taken: "4 Aug 2026 · Lisbon, Portugal".
+    static func photoSummary(_ fields: PhoneChangeFields) -> String {
+        [fields.taken?.formatted(date: .abbreviated, time: .omitted), fields.place].compactMap { $0 }
+            .joined(separator: " · ")
+    }
+
+    /// A run in a line: the shortcut's name, and the start of its text.
+    static func shortcutSummary(_ fields: PhoneChangeFields) -> String {
+        let name = fields.shortcut ?? AppLocalization.string("Shortcut")
+        guard let input = fields.input?.trimmingCharacters(in: .whitespacesAndNewlines), !input.isEmpty else { return name }
+        let preview = input.count > shortcutPreviewChars ? String(input.prefix(shortcutPreviewChars)) + "…" : input
+        return "\(name) · “\(preview)”"
+    }
+
+    static let shortcutPreviewChars = 120
+
+    /// A shortcut's whole input, when the line cuts it short: the card
+    /// lets the user read all of it before Run.
+    static func longShortcutInput(_ fields: PhoneChangeFields) -> String? {
+        guard let input = fields.input?.trimmingCharacters(in: .whitespacesAndNewlines),
+              input.count > shortcutPreviewChars else { return nil }
+        return input
     }
 
     static func symbol(_ kind: PhoneChange.Kind) -> String {
         if kind == .setTimer { return "timer" }
+        if kind == .runShortcut { return "square.2.layers.3d" }
+        if kind == .sendPhoto { return "photo" }
+        if kind.isContact { return kind == .deleteContact ? "person.crop.circle.badge.minus" : "person.crop.circle.badge.plus" }
         if kind.isAlarm { return "alarm" }
         return kind.isEvent ? "calendar.badge.plus" : "checklist"
     }
 
     /// Changes whose approve button is the red one.
     static func isRemoval(_ kind: PhoneChange.Kind) -> Bool {
-        kind == .deleteEvent || kind == .deleteReminder || kind == .cancelAlarm
+        kind == .deleteEvent || kind == .deleteReminder || kind == .cancelAlarm || kind == .deleteContact
     }
 }
 
@@ -741,17 +1038,91 @@ enum PhoneChangeWording {
 struct PhoneChangeCard: View {
     let prompt: PhoneChangePrompt
     let waiting: Int
+    /// A photo Hermes asks for, from the library, so the user sees it before Send.
+    var photo: (@MainActor (String) async -> UIImage?)?
     let answer: (Bool) -> Void
+    /// A long shortcut input, shown whole before the user taps Run.
+    @State private var showsFullInput = false
+    @State private var picture: UIImage?
+    /// The request `picture` is for: a card that moves on to the next
+    /// request never shows the last one's photo.
+    @State private var pictureFor: String?
+    @State private var pictureMissing = false
+    /// Bumped by Try again, to read the photo once more.
+    @State private var pictureAttempt = 0
+
+    /// A photo request is sent only once the user sees that photo.
+    private var waitsForPicture: Bool {
+        prompt.change.kind == .sendPhoto && (picture == nil || pictureFor != prompt.id)
+    }
 
     var body: some View {
         let change = prompt.change
         VStack(alignment: .leading, spacing: 10) {
             Label(PhoneChangeWording.headline(change), systemImage: PhoneChangeWording.symbol(change.kind))
                 .scaledFont(.subheadline.weight(.semibold))
-            let detail = prompt.alarmTitle ?? PhoneChangeWording.detail(change)
+            let detail = prompt.alarmTitle ?? PhoneChangeWording.detail(change, personName: prompt.personName)
             if !detail.isEmpty {
                 Text(detail)
                     .scaledFont(.subheadline)
+            }
+            if change.kind == .runShortcut, let input = PhoneChangeWording.longShortcutInput(change.fields) {
+                if showsFullInput {
+                    ScrollView {
+                        Text(verbatim: input)
+                            .scaledFont(.caption)
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .frame(maxHeight: 220)
+                }
+                Button(showsFullInput ? AppLocalization.string("Show less") : AppLocalization.string("Show all")) {
+                    showsFullInput.toggle()
+                }
+                .scaledFont(.caption)
+                .buttonStyle(.borderless)
+                .accessibilityIdentifier("phone.change.full-input")
+            }
+            if change.kind == .sendPhoto {
+                Group {
+                    if let picture, pictureFor == prompt.id {
+                        Image(uiImage: picture)
+                            .resizable()
+                            .scaledToFit()
+                            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                            .accessibilityLabel(Text(AppLocalization.string("The photo Hermes asks for")))
+                    } else if pictureMissing {
+                        VStack(spacing: 6) {
+                            Text(AppLocalization.string("This photo isn't on your iPhone any more."))
+                                .scaledFont(.caption)
+                                .foregroundStyle(.secondary)
+                            // A read that failed for now (iCloud, no connection) may work later.
+                            Button(AppLocalization.string("Try again")) { pictureAttempt += 1 }
+                                .scaledFont(.caption)
+                                .buttonStyle(.borderless)
+                                .accessibilityIdentifier("phone.change.photo-retry")
+                        }
+                    } else {
+                        ProgressView()
+                            .frame(maxWidth: .infinity, minHeight: 80)
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: 260)
+                .task(id: "\(prompt.id)#\(pictureAttempt)") {
+                    let asked = prompt.id
+                    picture = nil
+                    pictureFor = nil
+                    pictureMissing = false
+                    guard let id = change.photoID, let photo else {
+                        pictureMissing = true
+                        return
+                    }
+                    let found = await photo(id)
+                    guard !Task.isCancelled, asked == prompt.id else { return }
+                    picture = found
+                    pictureFor = found == nil ? nil : asked
+                    pictureMissing = found == nil
+                }
             }
             if let calendar = prompt.calendarTitle, change.kind.isAddition {
                 Text(AppLocalization.string("In \(calendar)"))
@@ -784,6 +1155,7 @@ struct PhoneChangeCard: View {
                         .foregroundStyle(Color.white)
                 }
                 .conduitGlassControl(cornerRadius: 14, tint: PhoneChangeWording.isRemoval(change.kind) ? .red : .conduitAccent, prominent: true)
+                .disabled(waitsForPicture)
                 .accessibilityIdentifier("phone.change.approve")
             }
             if waiting > 1 {
@@ -847,9 +1219,12 @@ struct PhoneChangeOverlay: View {
     var body: some View {
         VStack(spacing: 8) {
             if let prompt = engine.prompts.first {
-                PhoneChangeCard(prompt: prompt, waiting: engine.prompts.count) { approve in
+                PhoneChangeCard(prompt: prompt, waiting: engine.prompts.count,
+                                photo: { [engine] id in await engine.photoSource.thumbnail(photoID: id, side: 260) }) { approve in
                     Task { await appState.answerPhoneChange(prompt, approve: approve) }
                 }
+                // Each request its own card, so nothing (a photo) carries over.
+                .id(prompt.id)
                 .transition(.move(edge: .top).combined(with: .opacity))
             }
             if let added = engine.autoAdded {
@@ -871,8 +1246,9 @@ struct PhoneChangeOverlay: View {
         .animation(.spring(duration: 0.3), value: engine.autoAdded?.id)
         .onChange(of: engine.prompts.first?.id) { _, id in
             // The card isn't modal: tell VoiceOver users Hermes is waiting.
-            guard id != nil, let change = engine.prompts.first?.change else { return }
-            let spoken = [PhoneChangeWording.headline(change), PhoneChangeWording.detail(change)].filter { !$0.isEmpty }
+            guard id != nil, let prompt = engine.prompts.first else { return }
+            let change = prompt.change
+            let spoken = [PhoneChangeWording.headline(change), prompt.alarmTitle ?? PhoneChangeWording.detail(change, personName: prompt.personName)].filter { !$0.isEmpty }
             UIAccessibility.post(notification: .announcement, argument: spoken.joined(separator: ". "))
         }
     }

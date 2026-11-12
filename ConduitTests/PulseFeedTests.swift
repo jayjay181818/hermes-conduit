@@ -306,6 +306,7 @@ final class PulseFeedTests: XCTestCase {
         let active = SavedDashboard(id: UUID(), label: "Home", normalizedURL: "http://127.0.0.1:1")
         let other = SavedDashboard(id: UUID(), label: "Office", normalizedURL: "http://127.0.0.1:2")
         defaults.set([active.id.uuidString: "p", other.id.uuidString: "q"], forKey: AppState.pulseHomesKey)
+        defaults.set([active.id.uuidString: "rei-ii", other.id.uuidString: "work"], forKey: AppState.pulseProfilesKey)
         let appState = AppState(defaults: defaults, loadSavedConnection: false,
                                 dashboardRegistry: SavedDashboardRegistry(activeDashboardID: active.id,
                                                                           dashboards: [active, other]),
@@ -315,7 +316,115 @@ final class PulseFeedTests: XCTestCase {
 
         XCTAssertEqual(defaults.dictionary(forKey: AppState.pulseHomesKey) as? [String: String],
                        [active.id.uuidString: "p"])
+        XCTAssertEqual(defaults.dictionary(forKey: AppState.pulseProfilesKey) as? [String: String],
+                       [active.id.uuidString: "rei-ii"])
         XCTAssertEqual(appState.pulseHomeChat, "p")
+        XCTAssertEqual(appState.pulseHomeProfile, "rei-ii")
+    }
+
+    /// Pulse's chat, left out of Chats, is never the chat Conduit opens on
+    /// by itself, though Pulse's turns make it the newest: Jump to latest
+    /// activity, and Continue, pick the newest listed chat, even over a saved
+    /// Pulse chat; the chat on screen stays. A call's chat search never finds
+    /// it either.
+    func testTheChatConduitResumesIsNeverPulsesHiddenChat() throws {
+        let suite = "PulseFeedTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        addTeardownBlock { defaults.removePersistentDomain(forName: suite) }
+        let store = ChatResumeStore(defaults: defaults)
+        store.setBehavior(.latestActivity)
+        let coordinator = ChatResumeCoordinator(store: store)
+        let state = AppState(defaults: defaults, chatResumeCoordinator: coordinator, loadSavedConnection: false)
+        let now = Date().timeIntervalSince1970
+        func row(_ id: String, stored: String? = nil, at: TimeInterval) -> SessionSummary {
+            SessionSummary(id: id, storedSessionId: stored, alternateIds: [], title: "Chat", model: "Hermes",
+                           updatedLabel: "now", lastActivityAt: at, profile: nil, source: .chat,
+                           isActive: false, isArchived: false)
+        }
+        let catalog = [row("runtime-p", stored: "20261105_pulse", at: now), row("plain", at: now - 600)]
+        func pick() -> String? {
+            state.selectChatResumeTarget(in: catalog, profile: "default", purpose: .automaticReturn,
+                                         currentSessionID: nil)?.id
+        }
+        // Before the feed names Pulse's chat nothing hides it, so it can be
+        // resumed and saved for the next launch.
+        XCTAssertEqual(pick(), "runtime-p")
+        coordinator.rememberSession(.dashboard(profile: "default", sessionID: "20261105_pulse"), for: "default")
+
+        // Once the feed names it, the next pick drops that saved choice.
+        state.applyPulseFeed(try XCTUnwrap(PulseFeedPage(json: json(
+            #"{"home_chat_id": "20261105_pulse", "cards": []}"#))))
+        XCTAssertTrue(state.showsPulseScreen)
+        XCTAssertEqual(pick(), "plain")
+        XCTAssertNil(coordinator.lastSessionID(for: "default"))
+        XCTAssertEqual(
+            state.selectChatResumeTarget(in: catalog, profile: "default", purpose: .preserveCurrent,
+                                         currentSessionID: nil)?.id,
+            "plain"
+        )
+
+        coordinator.setBehavior(.continueWhereLeftOff)
+        XCTAssertEqual(pick(), "plain")
+        // Saved by its runtime id (opened from a push, or by an older build):
+        // still never resumed by itself, and the saved choice goes.
+        coordinator.rememberSession(.dashboard(profile: "default", sessionID: "runtime-p"), for: "default")
+        XCTAssertEqual(pick(), "plain")
+        XCTAssertNil(coordinator.lastSessionID(for: "default"))
+        // The chat on screen stays across a reconnect.
+        XCTAssertEqual(
+            state.selectChatResumeTarget(in: catalog, profile: "default", purpose: .preserveCurrent,
+                                         currentSessionID: "runtime-p")?.id,
+            "runtime-p"
+        )
+
+        // With only Pulse's chat listed there's no chat to pick: a new one starts.
+        coordinator.setBehavior(.latestActivity)
+        XCTAssertNil(state.selectChatResumeTarget(in: [catalog[0]], profile: "default",
+                                                  purpose: .automaticReturn, currentSessionID: nil))
+
+        // A call's chat search: by id, in Pulse's profile only.
+        XCTAssertTrue(state.isUnlistedChat(id: "20261105_pulse", profile: "default"))
+        XCTAssertFalse(state.isUnlistedChat(id: "20261105_pulse", profile: "work"))
+        XCTAssertFalse(state.isUnlistedChat(id: "plain", profile: "default"))
+
+        // A branch of Pulse's chat is a chat of its own: its saved choice stays.
+        var branch = row("branch", at: now - 60)
+        branch.lineageRootId = "20261105_pulse"
+        coordinator.setBehavior(.continueWhereLeftOff)
+        coordinator.rememberSession(.dashboard(profile: "default", sessionID: "branch"), for: "default")
+        state.forgetResumedPulseChat("20261105_pulse", profile: "default", among: catalog + [branch])
+        XCTAssertEqual(coordinator.lastSessionID(for: "default"), "branch")
+        // Another profile's saved choice is never Pulse's chat.
+        coordinator.rememberSession(.dashboard(profile: "work", sessionID: "runtime-p"), for: "work")
+        state.forgetResumedPulseChat("20261105_pulse", profile: "work", among: catalog)
+        XCTAssertEqual(coordinator.lastSessionID(for: "work"), "runtime-p")
+        // Switching to Pulse's profile doesn't reopen its chat either.
+        coordinator.rememberSession(.dashboard(profile: "default", sessionID: "20261105_pulse"), for: "default")
+        state.restoreActiveSessionState(for: "default")
+        XCTAssertNil(coordinator.lastSessionID(for: "default"))
+    }
+
+    func testPulsesChatIsInTheProfileTheFeedNames() throws {
+        // Issue 1681: a plugin in a named profile runs Pulse there.
+        let suite = "PulseFeedTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        addTeardownBlock { defaults.removePersistentDomain(forName: suite) }
+        let dashboard = SavedDashboard(id: UUID(), label: "Home", normalizedURL: "http://127.0.0.1:1")
+        let registry = SavedDashboardRegistry(activeDashboardID: dashboard.id, dashboards: [dashboard])
+        let first = AppState(defaults: defaults, loadSavedConnection: false, dashboardRegistry: registry,
+                             clearSessionPresentationCache: {})
+        XCTAssertEqual(first.pulseHomeProfile, "default")
+        first.applyPulseFeed(try XCTUnwrap(PulseFeedPage(json: json(
+            #"{"home_chat_id": "p", "profile": "rei-ii", "cards": []}"#))))
+        XCTAssertEqual(first.pulseHomeProfile, "rei-ii")
+
+        // Kept across a launch, until the feed is read again.
+        let next = AppState(defaults: defaults, loadSavedConnection: false, dashboardRegistry: registry,
+                            clearSessionPresentationCache: {})
+        XCTAssertEqual(next.pulseHomeProfile, "rei-ii")
+        // An older plugin's feed names none: the default profile.
+        next.applyPulseFeed(try XCTUnwrap(PulseFeedPage(json: json(#"{"home_chat_id": "p", "cards": []}"#))))
+        XCTAssertEqual(next.pulseHomeProfile, "default")
     }
 
     func testDoneAndActedPostTheCardToThePlugin() async throws {
@@ -341,6 +450,143 @@ final class PulseFeedTests: XCTestCase {
         XCTAssertEqual(calls[0].body?["done"] as? Bool, true)
         XCTAssertEqual(calls[1].body?["done"] as? Bool, false)
         XCTAssertEqual(calls[2].body?["card"] as? Int, 9)
+    }
+
+    func testActedNamesTheBotChatDoItUsed() async throws {
+        var bodies: [[String: Any]] = []
+        let client = PulseClient { _, _, body in
+            bodies.append(body ?? [:])
+            return ["ok": true, "booked": true]
+        }
+        try await client.acted(card: 3, chat: PulseActedChat(profile: "atlas", id: "atlas-tip"))
+        try await client.acted(card: 4)
+        XCTAssertEqual(bodies[0]["chat"] as? [String: String], ["profile": "atlas", "id": "atlas-tip"])
+        XCTAssertNil(bodies[1]["chat"], "a new chat is found by its subject: none named")
+    }
+
+    /// A gateway that can't host bots has answered: a bot saved for Do it
+    /// isn't there, so Do it starts a new chat rather than waiting on a list
+    /// that never comes (#2211's review).
+    func testDoItOnAGatewayWithoutBotsStartsANewChat() async throws {
+        let suite = "PulseFeedTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        addTeardownBlock { defaults.removePersistentDomain(forName: suite) }
+        let home = SavedDashboard(id: UUID(), label: "Home", normalizedURL: "https://one.example")
+        var operations = ChatResumeLifecycleOperations()
+        operations.botRoster = { _ in throw RpcError(code: -32601, message: "unknown method") }
+        let state = AppState(defaults: defaults, loadSavedConnection: false,
+                             dashboardRegistry: SavedDashboardRegistry(activeDashboardID: home.id, dashboards: [home]),
+                             clearSessionPresentationCache: {}, chatResumeLifecycleOperations: operations)
+        state.client = HermesClient(connection: HermesConnection(baseUrl: "https://one.example", ticket: "ticket"),
+                                    profile: "default")
+        state.isConnected = true
+        state.setNotifierPluginStateForTesting(.reported(version: "0.164.0", capabilities: [
+            PulseClient.feedCapability, PulseClient.actedCapability, PulseClient.actedChatCapability
+        ]))
+        state.setPulseDoItBot("atlas")
+        XCTAssertFalse(state.pulseDoItBotRosterRead)
+        await state.refreshBotRoster()
+        XCTAssertEqual(state.botModePhase, .gatewayUnsupported)
+        XCTAssertNil(state.pulseDoItBot)
+        XCTAssertNil(state.pulseDoItBotUnconfirmed, "the gateway's answer says the bot isn't there")
+        XCTAssertTrue(state.pulseDoItBotRosterRead, "so the widget doesn't ask again")
+        XCTAssertEqual(state.pulseDoItBotSavedName, "atlas", "Settings still shows it, to clear")
+    }
+
+    /// Settings > Pulse's bot for cards from no chat, per dashboard, offered
+    /// only by a plugin that reads the chat Do it names, and a long press's
+    /// pick for one card over it.
+    func testDoItGoesToTheBotPickedForCardsFromNoChat() async throws {
+        let suite = "PulseFeedTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        addTeardownBlock { defaults.removePersistentDomain(forName: suite) }
+        let home = SavedDashboard(id: UUID(), label: "Home", normalizedURL: "https://one.example")
+        let work = SavedDashboard(id: UUID(), label: "Work", normalizedURL: "https://two.example")
+        func bot(_ name: String, hidden: Bool = false) -> BotProfile {
+            BotProfile(name: name, botTitle: nil, displayName: name.capitalized, profileDescription: "", model: nil,
+                       provider: nil, hasAvatar: false, isPinned: false, isHiddenByMeta: hidden, appearanceColor: nil,
+                       canonicalSession: nil, lastActive: nil, lastPreview: nil)
+        }
+        let gate = PulseRosterGate()
+        var operations = ChatResumeLifecycleOperations()
+        operations.botRoster = { _ in
+            await gate.pass()
+            return BotRosterSnapshot(bots: [bot("atlas"), bot("kai", hidden: true)], supportsBotProtocol: true)
+        }
+        let state = AppState(defaults: defaults, loadSavedConnection: false,
+                             dashboardRegistry: SavedDashboardRegistry(activeDashboardID: home.id, dashboards: [home, work]),
+                             clearSessionPresentationCache: {}, chatResumeLifecycleOperations: operations)
+        state.client = HermesClient(connection: HermesConnection(baseUrl: "https://one.example", ticket: "ticket"),
+                                    profile: "default")
+        state.isConnected = true
+        // Before the bot list is read, the bot picked can't be confirmed:
+        // Do it waits for it rather than starting a new chat in its place.
+        state.setNotifierPluginStateForTesting(.reported(version: "0.164.0", capabilities: [
+            PulseClient.feedCapability, PulseClient.actedCapability, PulseClient.actedChatCapability
+        ]))
+        let page = try XCTUnwrap(PulseFeedPage(json: json("""
+        {"home_chat_id": "pulse_chat", "cards": [
+          {"id": 1, "kind": "noticed", "topic": "date", "level": "screen", "news": "Dentist Friday", "chat_id": "pulse_chat"},
+          {"id": 2, "kind": "noticed", "topic": "fact", "level": "screen", "news": "Deploy is flaky", "chat_id": "work"}
+        ]}
+        """)))
+        state.applyPulseFeed(page)
+        let date = page.cards[0], fact = page.cards[1]
+        state.setPulseDoItBot("atlas")
+        XCTAssertEqual(state.pulseDoItBotUnconfirmed, "atlas")
+        // While the first read is out, a tap is asked to try again in a
+        // moment; a read that failed says it couldn't open (issue 2215).
+        gate.holds = true
+        let reading = Task { await state.refreshBotRoster() }
+        for _ in 0..<200 where state.botModePhase != .loading { await Task.yield() }
+        XCTAssertEqual(state.botModePhase, .loading)
+        XCTAssertEqual(state.pulseNewChatRefusal(for: date),
+                       AppLocalization.string("atlas's Bot Chat is still loading. Try again in a moment."))
+        gate.release()
+        await reading.value
+        XCTAssertNil(state.pulseDoItBotUnconfirmed)
+        state.setPulseDoItBot(nil)
+        let older: Set<String> = [PulseClient.feedCapability, PulseClient.doneCapability, PulseClient.actedCapability,
+                     PulseClient.foundActionsCapability]
+        state.setNotifierPluginStateForTesting(.reported(version: "0.163.2", capabilities: older))
+        // A plugin that doesn't read the chat Do it names: no bots offered, a new chat as before.
+        state.setPulseDoItBot("atlas")
+        XCTAssertTrue(state.pulseDoItBotChoices.isEmpty)
+        XCTAssertNil(state.pulseDoItBot(for: date))
+        state.setNotifierPluginStateForTesting(.reported(version: "0.164.0",
+                                                         capabilities: older.union([PulseClient.actedChatCapability])))
+        // Every bot the Bots list shows; a hidden one isn't a choice.
+        XCTAssertEqual(state.pulseDoItBotChoices.map(\.name), ["atlas"])
+        XCTAssertEqual(state.pulseDoItBot(for: date)?.name, "atlas")
+        XCTAssertNil(state.pulseDoItBot(for: fact), "a card from a chat opens that chat")
+        XCTAssertNil(state.pulseDoItBot(for: date, in: .newChat), "a long press's New chat, this once")
+        XCTAssertNil(state.pulseDoItBot(for: date, in: .bot("kai")))
+        // A long press's pick that's gone since says so, never a new chat.
+        XCTAssertEqual(state.pulseNewChatRefusal(for: date, in: .bot("kai")),
+                       AppLocalization.string("Could not open kai's Bot Chat."))
+        // Offline, the Bot Chat's own words say so.
+        state.isConnected = false
+        XCTAssertEqual(state.pulseNewChatRefusal(for: date), AppLocalization.string("Connect to Hermes to chat with bots."))
+        XCTAssertEqual(state.pulseNewChatRefusal(for: date, in: .newChat),
+                       AppLocalization.string("Couldn't start a new chat. Check your connection and try again."))
+        state.isConnected = true
+        // Acted names the Bot Chat open, by its id; a new chat names none.
+        state.activeSessionId = "atlas-tip"
+        XCTAssertEqual(state.pulseActedChat(in: state.pulseDoItBot(for: date)), PulseActedChat(profile: "atlas", id: "atlas-tip"))
+        XCTAssertNil(state.pulseActedChat(in: nil))
+        // A bot the list read says is gone, or hidden, leaves Do it on a new chat.
+        state.setPulseDoItBot("kai")
+        XCTAssertNil(state.pulseDoItBot)
+        XCTAssertNil(state.pulseDoItBotUnconfirmed)
+        XCTAssertTrue(state.pulseDoItBotSaved, "Settings keeps its row, so New chat can clear it")
+        XCTAssertEqual(state.pulseDoItBotSavedName, "kai", "and shows it there, not New chat, while it stays saved")
+        XCTAssertNil(state.pulseNewChatRefusal(for: date))
+        // Per dashboard, kept across a launch, and gone with its dashboard.
+        state.setPulseDoItBot("atlas")
+        XCTAssertEqual(defaults.dictionary(forKey: AppState.pulseDoItBotsKey) as? [String: String], [home.id.uuidString: "atlas"])
+        state.forgetPulseHome(of: home.id)
+        XCTAssertNil(state.pulseDoItBot)
+        XCTAssertEqual(defaults.dictionary(forKey: AppState.pulseDoItBotsKey) as? [String: String], [:])
     }
 
     func testReportItemsAreTheirOwnRatableCards() throws {
@@ -484,10 +730,28 @@ final class PulseFeedTests: XCTestCase {
           {"id": 6, "kind": "noticed", "topic": "watch", "level": "screen", "news": "The deploy is still flaky", "chat_id": "work"},
           {"id": 7, "kind": "noticed", "topic": "interest", "level": "screen", "news": "A new Swift release is out", "chat_id": "work"},
           {"id": 8, "kind": "noticed", "topic": "fact", "level": "screen", "news": "", "title": "Your sister is Ana", "chat_id": "work"},
-          {"id": 9, "kind": "noticed", "topic": "", "level": "screen", "news": "Something else", "chat_id": "work"}
+          {"id": 9, "kind": "noticed", "topic": "", "level": "screen", "news": "Something else", "chat_id": "work"},
+          {"id": 10, "kind": "noticed", "topic": "watch", "level": "screen", "news": "The deploy keeps failing", "chat_id": "work",
+           "look": {"shape": "status", "facts": {"label": "Deploy", "state": "fail"}, "line": "The deploy keeps failing", "detail": "", "actions": []}},
+          {"id": 11, "kind": "noticed", "topic": "other", "level": "screen", "news": "The audit failed again", "chat_id": "work",
+           "look": {"shape": "runs", "facts": {"job": "Audit", "results": ["ok", "fail"]}, "line": "The audit failed again", "detail": "", "actions": []}},
+          {"id": 12, "kind": "noticed", "topic": "watch", "level": "screen", "news": "The audit is back to normal", "chat_id": "work",
+           "look": {"shape": "runs", "facts": {"job": "Audit", "results": ["fail", "ok"]}, "line": "The audit is back to normal", "detail": "", "actions": []}},
+          {"id": 13, "kind": "noticed", "topic": "watch", "level": "screen", "news": "The disk is nearly full", "chat_id": "work",
+           "look": {"shape": "status", "facts": {"label": "Disk", "state": "warn"}, "line": "The disk is nearly full", "detail": "", "actions": []}},
+          {"id": 14, "kind": "noticed", "topic": "watch", "level": "screen", "news": "The backup is fine", "chat_id": "work",
+           "look": {"shape": "status", "facts": {"label": "Backup", "state": "ok"}, "line": "The backup is fine", "detail": "", "actions": []}}
         ]}
         """)))
         let message = Dictionary(uniqueKeysWithValues: page.cards.map { ($0.id, $0.actionMessage) })
+        // Something that went wrong asks for a fix, whatever its topic (issue 2082);
+        // a job back to normal is a watch like any other.
+        XCTAssertEqual(message[10], "Pulse brought this up: The deploy keeps failing\n\nFind out what's wrong and fix it.")
+        XCTAssertEqual(message[11], "Pulse brought this up: The audit failed again\n\nFind out what's wrong and fix it.")
+        XCTAssertEqual(message[12], "Pulse brought this up: The audit is back to normal\n\nWhere does that stand now?")
+        // A warning is a problem too; an OK status keeps the topic's ask.
+        XCTAssertEqual(message[13], "Pulse brought this up: The disk is nearly full\n\nFind out what's wrong and fix it.")
+        XCTAssertEqual(message[14], "Pulse brought this up: The backup is fine\n\nWhere does that stand now?")
         // What Hermes said it would do gets a go-ahead, whether the card is a
         // follow-up or a remembered promise.
         XCTAssertEqual(message[1], "Pulse reminded me: The backup is still on the server\n\nGo ahead with it now.")
@@ -597,12 +861,48 @@ final class PulseFeedTests: XCTestCase {
         // The chat its New Chat made gets the reminder, uncovered.
         state.showSidebar = true
         state.widgetSessionCreatorOverride = { _, _ in ("fresh", "fresh", "default") }
-        let opened = await state.actOnPulseCard(date)
-        XCTAssertTrue(opened)
+        let opened = await state.doPulseCard(date)
+        XCTAssertNotNil(opened)
+        XCTAssertNil(opened?.chat, "a new chat: acted names none, Pulse finds it by its subject")
         XCTAssertEqual(state.activeSessionId, "fresh")
         XCTAssertFalse(state.showSidebar)
         XCTAssertEqual(state.composerPrefillText, date.actionMessage)
         XCTAssertEqual(state.composerPrefillDraftKey, ComposerBar.composerDraftKey(for: "fresh", profile: "default"))
+    }
+
+    func testDoItsCallCheckGoesByTheProfilePulseRunsIn() throws {
+        // Issue 1681: Pulse in a named profile; Do it's new chat is made there.
+        let suite = "PulseFeedTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        addTeardownBlock { defaults.removePersistentDomain(forName: suite) }
+        let dashboard = SavedDashboard(id: UUID(), label: "Home", normalizedURL: "http://127.0.0.1:1")
+        let state = AppState(defaults: defaults, loadSavedConnection: false,
+                             dashboardRegistry: SavedDashboardRegistry(activeDashboardID: dashboard.id,
+                                                                       dashboards: [dashboard]),
+                             clearSessionPresentationCache: {})
+        let page = try XCTUnwrap(PulseFeedPage(json: json("""
+        {"home_chat_id": "pulse_chat", "profile": "rei-ii", "cards": [
+          {"id": 1, "kind": "noticed", "topic": "date", "level": "screen", "news": "Dentist Friday", "chat_id": "pulse_chat"}
+        ]}
+        """)))
+        state.setNotifierPluginStateForTesting(.reported(version: "0.126.2", capabilities: [
+            PulseClient.feedCapability, PulseClient.doneCapability, PulseClient.actedCapability,
+            PulseClient.foundActionsCapability
+        ]))
+        state.applyPulseFeed(page)
+        let date = try XCTUnwrap(page.cards.first)
+        XCTAssertEqual(state.pulseHomeProfile, "rei-ii")
+        state.isConnected = true
+        state.client = HermesClient(connection: HermesConnection(baseUrl: "https://one.example", ticket: "ticket"),
+                                    profile: "rei-ii")
+        state.isNativeHermesCallActive = true
+        // From the default profile, Do it has to switch, which a call stops.
+        XCTAssertEqual(state.pulseNewChatRefusal(for: date),
+                       AppLocalization.string("End the call to open a chat in another profile."))
+        // With Pulse's own profile open, it needs no switch.
+        state.setActiveProfileForTesting("rei-ii")
+        XCTAssertNotEqual(state.pulseNewChatRefusal(for: date),
+                          AppLocalization.string("End the call to open a chat in another profile."))
     }
 
     func testACardFromAKanbanWorkerShowsItsTaskAndDoItStartsANewChatAboutIt() async throws {
@@ -705,6 +1005,44 @@ final class PulseFeedTests: XCTestCase {
         XCTAssertEqual(creates, 0, "an item found in a chat starts no new one")
         XCTAssertEqual(state.pendingArtifactReveal?.messageID, 42)
         XCTAssertEqual(state.composerPrefillText, fact.actionMessage)
+        XCTAssertEqual(state.composerPrefillDraftKey, ComposerBar.composerDraftKey(for: "work", profile: "default"))
+    }
+
+    func testADueWithNoTimeIsDueByTheEndOfItsDay() throws {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = try XCTUnwrap(TimeZone(identifier: "Europe/Paris"))
+        let found = try XCTUnwrap(PulseLook.day("2026-11-20", calendar: calendar))
+        XCTAssertFalse(found.hasTime)
+        let end = PulseLook.endOfDay(found.date, calendar: calendar)
+        XCTAssertEqual(calendar.startOfDay(for: end), found.date)
+        XCTAssertEqual(end.timeIntervalSince(found.date), 86_399)
+    }
+
+    func testAskFillsTheChatWithItsWordsAndNeedsAnAsk() async throws {
+        let state = try appState()
+        let page = try XCTUnwrap(PulseFeedPage(json: json("""
+        {"home_chat_id": "pulse_chat", "cards": [
+          {"id": 2, "kind": "noticed", "topic": "other", "level": "screen", "news": "The audit failed", "chat_id": "work",
+           "message_id": 42, "look": {"shape": "plain", "facts": {},
+           "actions": [{"label": "Retry", "does": "ask", "say": "Run the audit again"}]}},
+          {"id": 3, "kind": "noticed", "topic": "other", "level": "screen", "news": "No buttons", "chat_id": "work"}
+        ]}
+        """)))
+        state.setNotifierPluginStateForTesting(.reported(version: "0.150.0", capabilities: [
+            PulseClient.feedCapability, PulseClient.doneCapability, PulseClient.actedCapability,
+            PulseClient.foundActionsCapability
+        ]))
+        state.applyPulseFeed(page)
+        let asking = try XCTUnwrap(page.cards.first { $0.id == 2 })
+        let plain = try XCTUnwrap(page.cards.first { $0.id == 3 })
+        XCTAssertFalse(state.canAskFromPulseCard(plain))
+        let refused = await state.actOnPulseCard(plain, words: "Something else")
+        XCTAssertFalse(refused, "a card with no ask takes no words")
+        XCTAssertTrue(state.canAskFromPulseCard(asking))
+        state.activeSessionId = "work"
+        let opened = await state.actOnPulseCard(asking, words: "Run the audit again")
+        XCTAssertTrue(opened)
+        XCTAssertEqual(state.composerPrefillText, "Run the audit again", "the ask's words, not the card's reminder")
         XCTAssertEqual(state.composerPrefillDraftKey, ComposerBar.composerDraftKey(for: "work", profile: "default"))
     }
 
@@ -1627,5 +1965,390 @@ final class PulseFeedTests: XCTestCase {
             XCTAssertNotNil(PulseCardKind.lookedSource(label), label)
         }
         XCTAssertEqual(PulseCardKind.lookedSource("location"), AppLocalization.string("where you are"))
+    }
+
+    // MARK: Looks (0.150.0)
+
+    func testACardBringsItsLookAndAnOlderOneHasNone() throws {
+        let page = try XCTUnwrap(PulseFeedPage(json: json("""
+        {"cards": [
+          {"id": 7, "kind": "noticed", "level": "screen", "news": "Audit failed again", "created_at": 100,
+           "updated_at": 400, "subject": "job:default:41", "card_ref": "pc_7",
+           "look": {"shape": "runs", "line": "Audit failed again", "detail": "",
+                    "facts": {"job": "audit", "results": ["ok", "fail", "fail"]},
+                    "actions": [{"label": "Restart it", "does": "ask", "say": "Restart the audit job"},
+                                {"label": "Logs", "does": "open", "url": "https://example.com/logs"},
+                                {"label": "Again", "does": "ask", "say": "x"}]}},
+          {"id": 6, "kind": "noticed", "level": "screen", "news": "Kwan's birthday", "created_at": 90,
+           "look": {"shape": "date", "facts": {"day": "2026-11-13", "what": "birthday", "whose": "Kwan"},
+                    "actions": [{"label": "Bad", "does": "open", "url": "http://example.com"}]}},
+          {"id": 5, "kind": "followup", "level": "push", "news": "Old card", "created_at": 80}
+        ]}
+        """)))
+        let runs = page.cards[0]
+        XCTAssertEqual(runs.look?.body, .runs(job: "audit", results: [true, false, false]))
+        XCTAssertEqual(runs.look?.actions.map(\.does), [.ask, .open])  // one each, at most two
+        XCTAssertEqual(runs.look?.ask?.value, "Restart the audit job")
+        XCTAssertEqual(runs.look?.extraActions.map(\.label), ["Logs"])
+        XCTAssertEqual(runs.subject, "job:default:41")
+        XCTAssertTrue(runs.wasUpdated)
+        let date = try XCTUnwrap(page.cards[1].look)
+        guard case let .date(day, what, whose) = date.body else { return XCTFail("not a date") }
+        XCTAssertEqual(PulseLook.wireCalendar.dateComponents([.year, .month, .day], from: day),
+                       DateComponents(year: 2026, month: 11, day: 13))
+        XCTAssertEqual([what, whose], ["birthday", "Kwan"])
+        XCTAssertTrue(date.actions.isEmpty)  // a plain http link never opens
+        XCTAssertFalse(page.cards[1].wasUpdated)
+        XCTAssertNil(page.cards[2].look)
+        XCTAssertEqual(page.cards[2].subject, "")
+    }
+
+    func testAPromiseAndDraftLaterAndDoneActionsDecode() throws {
+        let look = try XCTUnwrap(PulseLook(json: try JSONSerialization.jsonObject(with: Data("""
+        {"shape": "promise", "facts": {"person": "Mara", "said": "I'll send the deck", "where": "Work", "when": "Fri"},
+         "actions": [{"label": "Draft a note", "does": "draft", "text": "Here's the deck"}, {"does": "later"}]}
+        """.utf8))))
+        XCTAssertEqual(look.body, .promise(said: "I'll send the deck", person: "Mara", place: "Work", when: "Fri"))
+        XCTAssertEqual(look.actions.map(\.does), [.draft, .later])
+        XCTAssertEqual(look.actions.first?.value, "Here's the deck")
+        XCTAssertTrue(look.offersLater)  // a Later with no label still offers Not now
+        XCTAssertNotNil(PulseLook.Action(json: ["does": "done"]))
+        XCTAssertNil(PulseLook.Action(json: ["does": "draft", "label": "Draft"]))  // a draft needs its words
+        XCTAssertNil(PulseLook.Action(json: ["does": "ask", "say": "x"]))  // an ask needs its label
+    }
+
+    func testAnOpenActionTakesTheLinksAChatCardOpens() {
+        // Issue 2125: the plugin's pick check allows the chat cards' open
+        // schemes, so a Call or Maps button survives on the phone too.
+        for url in ["tel:+15551234567", "maps:https://maps.apple.com/?q=coffee", "mailto:mara@example.com",
+                    "sms:+15551234567", "calshow:800000000", "x-apple-reminderkit://REMCDReminder/1", "https://example.com"] {
+            let action = PulseLook.Action(json: ["label": "Go", "does": "open", "url": url])
+            XCTAssertNotNil(action?.url, url)
+        }
+        for url in ["http://example.com", "javascript:alert(1)", "file:///etc/hosts", "tel:+1 555"] {
+            XCTAssertNil(PulseLook.Action(json: ["label": "Go", "does": "open", "url": url]), url)
+        }
+    }
+
+    func testADrawnBodyDrawsItsCardAndOneThatDoesntHoldUpDrawsPlain() throws {
+        func look(_ body: Any) -> PulseLook? {
+            PulseLook(json: ["shape": "drawn", "facts": ["body": body]])
+        }
+        guard case .drawn = look(["type": "place", "places": [["name": "Gare du Nord"]]])?.body else {
+            return XCTFail("a place card should draw")
+        }
+        XCTAssertEqual(look(["type": "weather", "places": [["name": "X"]]])?.body, .plain)
+    }
+
+    func testEachCardTypeHasItsOwnPlaceAndColour() throws {
+        func style(_ text: String) throws -> PulseLookStyle {
+            let look = try XCTUnwrap(PulseLook(json: try JSONSerialization.jsonObject(with: Data(text.utf8))))
+            return PulseLookStyle(look.body)
+        }
+        XCTAssertEqual(try style(#"{"shape": "runs", "facts": {"job": "Backup", "results": ["ok", "ok"]}}"#).place, .band)
+        XCTAssertEqual(try style(#"{"shape": "runs", "facts": {"job": "Backup", "results": ["ok", "ok"]}}"#).tint, .green)
+        XCTAssertEqual(try style(#"{"shape": "runs", "facts": {"job": "Backup", "results": ["ok", "fail"]}}"#).tint, .red)
+        XCTAssertEqual(try style(#"{"shape": "status", "facts": {"label": "Relay", "state": "warn"}}"#).place, .lead)
+        XCTAssertEqual(try style(#"{"shape": "status", "facts": {"label": "Relay", "state": "warn"}}"#).tint, .orange)
+        XCTAssertEqual(try style(#"{"shape": "steps", "facts": {"names": ["Ordered", "Shipped"], "at": 1}}"#).place, .under)
+        XCTAssertEqual(try style(#"{"shape": "sparkle", "facts": {}}"#).place, PulseLookStyle.Place.none)
+        // Only a status card is tinted whole.
+        XCTAssertTrue(PulseLookStyle.washes(.status(label: "Relay", state: .fail)))
+        XCTAssertFalse(PulseLookStyle.washes(.plain))
+        // Something due by a day isn't late on that day, and is after it.
+        let calendar = PulseLook.wireCalendar
+        let noon = try XCTUnwrap(calendar.date(from: DateComponents(year: 2026, month: 11, day: 9, hour: 12)))
+        let today = calendar.startOfDay(for: noon)
+        XCTAssertEqual(PulseLookStyle(.due(due: today, hasTime: false, noticed: nil), now: noon).tint, .orange)
+        XCTAssertEqual(PulseLookStyle(.due(due: today, hasTime: false, noticed: nil), now: noon.addingTimeInterval(86_400)).tint, .red)
+        // What fits no card type says so in What Pulse left out (0.157.7).
+        let left = try XCTUnwrap(PulseLeftOut(json: ["id": 1, "text": "Idle fact", "decision": "skipped", "skip": "shapeless"]))
+        XCTAssertEqual(left.reason, AppLocalization.string("Didn't fit a card type"))
+    }
+
+    func testFactsThatDontHoldUpDrawPlain() throws {
+        func look(_ text: String) throws -> PulseLook? {
+            PulseLook(json: try JSONSerialization.jsonObject(with: Data(text.utf8)))
+        }
+        XCTAssertEqual(try look(#"{"shape": "due", "facts": {"due": "next week"}}"#)?.body, .plain)
+        XCTAssertEqual(try look(#"{"shape": "steps", "facts": {"names": ["a", "b"], "at": 5}}"#)?.body, .plain)
+        XCTAssertEqual(try look(#"{"shape": "sparkle", "facts": {}}"#)?.body, .plain)
+        XCTAssertEqual(try look(#"{"shape": "runs", "facts": {"job": "a", "results": ["ok", null, "fail"]}}"#)?.body, .plain)
+        // An empty name would shift "at" onto the wrong step.
+        XCTAssertEqual(try look(#"{"shape": "steps", "facts": {"names": ["", "Shipped", "Delivered"], "at": 1}}"#)?.body, .plain)
+        // A day with no time reads in whole days, never hours.
+        let calendar = PulseLook.wireCalendar
+        let noon = try XCTUnwrap(calendar.date(from: DateComponents(year: 2026, month: 11, day: 9, hour: 12)))
+        let today = calendar.startOfDay(for: noon)
+        XCTAssertEqual(PulseLook.relativeDay(today, now: noon), PulseLook.relativeDay(noon, now: noon))
+        XCTAssertNotEqual(PulseLook.relativeDay(today, now: noon),
+                          PulseLook.relativeDay(today.addingTimeInterval(86_400), now: noon))
+        XCTAssertEqual(try look(#"{"shape": "status", "facts": {"label": "Relay", "state": "ok"}}"#)?.body,
+                       .status(label: "Relay", state: .ok))
+        XCTAssertEqual(try look(#"{"shape": "steps", "facts": {"names": ["Ordered", "Shipped", "Delivered"], "at": 1}}"#)?.body,
+                       .steps(names: ["Ordered", "Shipped", "Delivered"], at: 1))
+        let due = try XCTUnwrap(try look(#"{"shape": "due", "facts": {"due": "2026-11-20T15:30", "noticed": "2026-10-28"}}"#))
+        guard case let .due(_, hasTime, noticed) = due.body else { return XCTFail("not due") }
+        XCTAssertTrue(hasTime)
+        XCTAssertNotNil(noticed)
+        XCTAssertNil(PulseLook.day("2026-02-30"))
+        XCTAssertNil(PulseLook.day("2026-11-20T25:00"))
+        XCTAssertNil(PulseLook.day("2026-11-junk-20"))
+        XCTAssertNil(PulseLook.day("2026-11-20T15:junk:30"))
+        XCTAssertNil(PulseLook.day("2026-11-20T"))
+        XCTAssertNil(try look(#"{"facts": {}}"#))
+    }
+
+    func testTheBriefComesInItsParts() throws {
+        let page = try XCTUnwrap(PulseFeedPage(json: json("""
+        {"cards": [{"id": 9, "kind": "brief", "level": "push", "news": "A light day.\\n- Dentist at 3", "created_at": 200,
+          "look": {"shape": "brief", "line": "A light day.", "actions": [],
+                   "facts": {"summary": "A light day.", "counts": {"today": 1, "open": 2, "held": 3},
+                             "today": ["Dentist at 3"], "open": ["Send Mara the deck", "Renew the passport"]}}}]}
+        """)))
+        let parts = try XCTUnwrap(page.cards[0].look?.briefParts)
+        XCTAssertEqual(parts.summary, "A light day.")
+        XCTAssertEqual(parts.today, ["Dentist at 3"])
+        XCTAssertEqual(parts.open, ["Send Mara the deck", "Renew the passport"])
+        XCTAssertEqual(parts.held, 3)
+    }
+
+    func testTheFeedAsksForLooksOnlyWhenThePluginHasThem() async throws {
+        var paths: [String] = []
+        let client = PulseClient { path, _, _ in
+            paths.append(path)
+            return ["ok": true, "cards": [Any](), "unseen": 0]
+        }
+        _ = try await client.feed(proposals: true, looks: true)
+        _ = try await client.feed(looks: true)
+        _ = try await client.feed()
+        XCTAssertEqual(paths, ["\(PulseClient.path)/feed?proposals=1&looks=1", "\(PulseClient.path)/feed?looks=1",
+                               "\(PulseClient.path)/feed"])
+        let state = try appState()
+        state.setNotifierPluginStateForTesting(.reported(version: "0.148.0", capabilities: [PulseClient.feedCapability]))
+        XCTAssertFalse(state.pulseLooks)
+        state.setNotifierPluginStateForTesting(.reported(version: "0.150.0", capabilities: [
+            PulseClient.feedCapability, PulseClient.looksCapability
+        ]))
+        XCTAssertTrue(state.pulseLooks)
+        XCTAssertTrue(PresentedScreensSync.features.contains("pulse-looks"))
+    }
+
+    /// Eric, 2026-11-11: a value that moved, someone the user is waiting on
+    /// and what a watch found get card types of their own; facts that don't
+    /// hold up draw plain.
+    func testANumberAWaitingOnAndAFoundDecodeAndDrawPlainWithoutTheirFacts() throws {
+        func look(_ text: String) throws -> PulseLook {
+            try XCTUnwrap(PulseLook(json: try JSONSerialization.jsonObject(with: Data(text.utf8))))
+        }
+        XCTAssertEqual(try look("""
+        {"shape": "number", "facts": {"label": "Disk on nas-01", "value": 91, "unit": "%", "was": 78, "limit": 90, "better": "down"}}
+        """).body, .number(label: "Disk on nas-01", value: 91, unit: "%", was: 78, limit: 90, better: .down))
+        XCTAssertEqual(try look("""
+        {"shape": "number", "facts": {"label": "Rent", "value": 1204.5, "better": "sideways", "was": true}}
+        """).body, .number(label: "Rent", value: 1204.5, unit: "", was: nil, limit: nil, better: nil))
+        XCTAssertEqual(try look(#"{"shape": "number", "facts": {"label": "Rent", "value": "a lot"}}"#).body, .plain)
+        XCTAssertEqual(try look(#"{"shape": "number", "facts": {"label": "", "value": 3}}"#).body, .plain)
+        let waiting = try look("""
+        {"shape": "waiting", "facts": {"person": "Dana", "what": "the signed lease", "since": "2026-11-04"}}
+        """)
+        guard case let .waiting(person, what, since) = waiting.body else { return XCTFail("not waiting") }
+        XCTAssertEqual([person, what], ["Dana", "the signed lease"])
+        XCTAssertEqual(PulseLook.wireCalendar.dateComponents([.year, .month, .day], from: try XCTUnwrap(since)),
+                       DateComponents(year: 2026, month: 11, day: 4))
+        XCTAssertEqual(try look(#"{"shape": "waiting", "facts": {"person": "Dana", "what": "a reply", "since": "soon"}}"#).body,
+                       .waiting(person: "Dana", what: "a reply", since: nil))
+        XCTAssertEqual(try look(#"{"shape": "waiting", "facts": {"person": "Dana"}}"#).body, .plain)
+        XCTAssertEqual(try look("""
+        {"shape": "found", "facts": {"asked": "tickets for the show", "answer": "On sale Friday at 10am", "where": "Ticketmaster"}}
+        """).body, .found(asked: "tickets for the show", answer: "On sale Friday at 10am", place: "Ticketmaster"))
+        XCTAssertEqual(try look(#"{"shape": "found", "facts": {"asked": "tickets", "answer": "On sale Friday"}}"#).body, .plain)
+        XCTAssertEqual(PulseLookStyle(.found(asked: "x", answer: "y", place: "z")).place, .lead)
+        XCTAssertEqual(PulseLookBody.amount(91, "%"), 91.formatted(.number.locale(AppLocalization.formattingLocale)) + "%")
+        XCTAssertTrue(PulseLookBody.amount(3, "GB").hasSuffix(" GB"))
+        XCTAssertEqual(PulseLookStyle(.number(label: "x", value: 1, unit: "", was: nil, limit: nil, better: nil)).place, .lead)
+        XCTAssertEqual(PulseLookStyle(.waiting(person: "x", what: "y", since: nil)).place, .lead)
+        // Which way a number moved, and whether it's past its limit, is
+        // judged in one place; VoiceOver hears what the arrow's colour shows.
+        XCTAssertEqual(PulseLookStyle.move(value: 91, was: 78, better: .down), .bad)
+        XCTAssertEqual(PulseLookStyle.move(value: 329.99, was: 399.99, better: .down), .good)
+        XCTAssertEqual(PulseLookStyle.move(value: 5, was: 3, better: .up), .good)
+        XCTAssertEqual(PulseLookStyle.move(value: 5, was: 3, better: nil), .unsaid)
+        XCTAssertNil(PulseLookStyle.move(value: 5, was: 5, better: .up))
+        XCTAssertNil(PulseLookStyle.move(value: 5, was: nil, better: .up))
+        XCTAssertTrue(PulseLookStyle.pastLimit(value: 91, limit: 90, better: .down))
+        XCTAssertFalse(PulseLookStyle.pastLimit(value: 89, limit: 90, better: .down))
+        XCTAssertTrue(PulseLookStyle.pastLimit(value: 3, limit: 5, better: .up))
+        XCTAssertFalse(PulseLookStyle.pastLimit(value: 91, limit: 90, better: nil))
+        XCTAssertFalse(PulseLookStyle.pastLimit(value: 91, limit: nil, better: .down))
+        let was = PulseLookBody.amount(78, "%")
+        XCTAssertEqual(PulseLookBody.spokenChange(value: 91, was: 78, unit: "%", move: .bad),
+                       AppLocalization.string("Up from \(was), worse"))
+        XCTAssertEqual(PulseLookBody.spokenChange(value: 60, was: 78, unit: "%", move: .good),
+                       AppLocalization.string("Down from \(was), better"))
+        XCTAssertEqual(PulseLookBody.spokenChange(value: 60, was: 78, unit: "%", move: .unsaid),
+                       AppLocalization.string("Down from \(was)"))
+        XCTAssertEqual(PulseLookBody.spokenLimit(90, unit: "%", past: true),
+                       AppLocalization.string("Past the limit of \(PulseLookBody.amount(90, "%"))"))
+        // The plugin offers them only to a Conduit that says it draws them.
+        XCTAssertTrue(PresentedScreensSync.features.contains("pulse-more-shapes"))
+    }
+
+    func testAskNeedsAnAskAndAnOpenCard() throws {
+        let page = try XCTUnwrap(PulseFeedPage(json: json("""
+        {"cards": [
+          {"id": 3, "kind": "noticed", "level": "screen", "news": "Audit failed", "created_at": 100,
+           "look": {"shape": "plain", "facts": {}, "actions": [{"label": "Restart it", "does": "ask", "say": "Restart it"}]}},
+          {"id": 2, "kind": "noticed", "level": "screen", "news": "Audit failed", "created_at": 100, "done_at": 200,
+           "look": {"shape": "plain", "facts": {}, "actions": [{"label": "Restart it", "does": "ask", "say": "Restart it"}]}},
+          {"id": 1, "kind": "noticed", "level": "screen", "news": "Audit failed", "created_at": 100}
+        ]}
+        """)))
+        let state = try appState()
+        XCTAssertTrue(state.canAskFromPulseCard(page.cards[0]))
+        XCTAssertFalse(state.canAskFromPulseCard(page.cards[1]))
+        XCTAssertFalse(state.canAskFromPulseCard(page.cards[2]))
+    }
+
+    // MARK: The Pulse widget (issue 2190)
+
+    /// The widget reads the feed itself (PulseWidgetFeed): it lists the cards
+    /// the screen lists open, with the buttons the screen offers them.
+    func testPulseWidgetListsAndOffersWhatTheScreenDoes() throws {
+        let state = try appState()
+        let text = """
+        {"home_chat_id": "pulse_chat", "cards": [
+          {"id": 1, "kind": "followup", "level": "push", "title": "Draft the email", "news": "", "chat_id": "work",
+           "item_id": 9, "created_at": 100},
+          {"id": 2, "kind": "noticed", "topic": "deadline", "level": "screen", "news": "Insurance due", "item_id": 3,
+           "created_at": 300},
+          {"id": 3, "kind": "noticed", "topic": "fact", "level": "screen", "news": "The repo moved", "chat_id": "work",
+           "created_at": 200},
+          {"id": 4, "kind": "noticed", "topic": "date", "level": "brief", "news": "Held", "created_at": 400},
+          {"id": 5, "kind": "noticed", "topic": "promise", "level": "screen", "news": "Done one", "item_id": 1,
+           "done_at": 500, "created_at": 50},
+          {"id": 6, "kind": "noticed", "topic": "watch", "level": "screen", "news": "Put off", "item_id": 2,
+           "dismissed_at": 500, "rest_until": 900, "created_at": 60},
+          {"id": 7, "kind": "report", "level": "screen", "news": "Here's your report.", "created_at": 700},
+          {"id": 8, "kind": "noticed", "topic": "promise", "level": "screen", "news": "Ask instead", "item_id": 5,
+           "chat_id": "work", "created_at": 150,
+           "look": {"shape": "plain", "line": "**Ask** about it", "detail": "One more line",
+                    "actions": [{"does": "ask", "label": "Ask", "say": "How's it going?"}]}}
+        ]}
+        """
+        let feed = try json(text)
+        let page = try XCTUnwrap(PulseFeedPage(json: feed))
+        let dashboard = UUID()
+        let pass = LocationHostPass(dashboardID: dashboard, baseURL: "https://host", headers: [:], expiresAt: nil, savedAt: Date())
+        for capabilities in [
+            [PulseClient.feedCapability, PulseClient.doneCapability, PulseClient.dismissCapability],
+            [PulseClient.feedCapability, PulseClient.doneCapability, PulseClient.foundActionsCapability,
+             PulseClient.dismissCapability, PulseClient.restCapability, PulseClient.looksCapability],
+            [PulseClient.feedCapability],
+        ] {
+            state.setNotifierPluginStateForTesting(.reported(version: "0.162.0", capabilities: Set(capabilities)))
+            state.applyPulseFeed(page)
+            let access = PulseWidgetAccess(dashboardID: dashboard, pass: pass,
+                                           capabilities: PulseWidgetAccess.widgetCapabilities.filter(capabilities.contains).sorted())
+            let snapshot = try XCTUnwrap(PulseWidgetFeed.snapshot(from: feed, access: access, appLanguage: "en") { kind, topic in
+                PulseWidgetFeed.headingKey(kind: kind, topic: topic)
+            })
+            // Newest first; not done, put off, held for the brief, or a whole report.
+            XCTAssertEqual(snapshot.cards.map(\.id), [2, 3, 8, 1])
+            for row in snapshot.cards {
+                let card = try XCTUnwrap(page.cards.first { $0.id == row.id })
+                XCTAssertFalse(card.isCleared || card.isHeld || card.isProposal)
+                XCTAssertEqual(row.heading, card.heading, "card \(row.id)")
+                XCTAssertEqual(row.offersDone, state.canMarkPulseCardDone(card), "card \(row.id), \(capabilities)")
+                XCTAssertEqual(row.offersDoIt, state.canActOnPulseCard(card) && !state.canAskFromPulseCard(card),
+                               "card \(row.id), \(capabilities)")
+                XCTAssertEqual(row.offersLater, capabilities.contains(PulseClient.dismissCapability))
+            }
+        }
+        // A pick's headline and sentence, as plain words; else the card's words.
+        let rows = try XCTUnwrap(PulseWidgetFeed.snapshot(from: feed, access: PulseWidgetAccess(
+            dashboardID: dashboard, pass: pass, capabilities: []), appLanguage: "en") { _, _ in "" }).cards
+        XCTAssertEqual(rows.first { $0.id == 8 }?.headline, "Ask about it")
+        XCTAssertEqual(rows.first { $0.id == 8 }?.sentence, "One more line")
+        XCTAssertEqual(rows.first { $0.id == 1 }?.headline, "Draft the email")
+        XCTAssertEqual(rows.first { $0.id == 1 }?.sentence, "")
+    }
+
+    /// The widget's capability names are the plugin's, as the app reads them.
+    func testPulseWidgetCapabilitiesMatchTheApps() {
+        XCTAssertEqual(PulseWidgetAccess.looksCapability, PulseClient.looksCapability)
+        XCTAssertEqual(PulseWidgetAccess.doneCapability, PulseClient.doneCapability)
+        XCTAssertEqual(PulseWidgetAccess.foundActionsCapability, PulseClient.foundActionsCapability)
+        XCTAssertEqual(PulseWidgetAccess.dismissCapability, PulseClient.dismissCapability)
+        XCTAssertEqual(PulseWidgetAccess.restCapability, PulseClient.restCapability)
+        XCTAssertEqual(PulseWidgetFeed.base, PulseClient.path)
+        XCTAssertEqual(PulseWidgetKeychain.accessGroup, NotificationE2E.appGroup)
+        XCTAssertEqual(PulseNotifications.widgetKind, ConduitWidgetKind.pulse)
+    }
+
+    /// The widget's Do it sends once per card and dashboard at a time, and never on a row already sent.
+    func testPulseWidgetDoItRunsOncePerCardAndDashboard() throws {
+        let state = try appState()
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = PulseWidgetStore(directory: directory)
+        state.pulseWidgetStoreOverride = store
+        let dashboard = UUID(), other = UUID()
+        let sent = PulseWidgetCard(id: 4, heading: "Promise", headline: "Sent", sentence: "", offersDone: true,
+                                   offersDoIt: true, offersLater: true, sentAt: Date())
+        try store.write(PulseWidgetSnapshot(dashboardID: dashboard, appLanguage: "en", cards: [sent], openCount: 1,
+                                            nextLookAt: nil, quietUntil: nil))
+        // A row the widget shows as sent sends nothing; on another dashboard that card id is another card.
+        XCTAssertFalse(state.beginPulseWidgetDoIt(card: 4, dashboardID: dashboard))
+        XCTAssertTrue(state.beginPulseWidgetDoIt(card: 4, dashboardID: other))
+        // A second press while the first sends is refused, on that dashboard only.
+        XCTAssertTrue(state.beginPulseWidgetDoIt(card: 5, dashboardID: dashboard))
+        XCTAssertFalse(state.beginPulseWidgetDoIt(card: 5, dashboardID: dashboard))
+        XCTAssertTrue(state.beginPulseWidgetDoIt(card: 5, dashboardID: other))
+        state.pulseWidgetDoItsRunning.remove(PulseWidgetLink(dashboardID: dashboard, card: 5))
+        XCTAssertTrue(state.beginPulseWidgetDoIt(card: 5, dashboardID: dashboard))
+    }
+
+    /// A Do it from no chat starts a chat named for the card, not "Shortcut: …".
+    func testShortcutSendNamesANewChatAsAsked() async throws {
+        var created: String?
+        let backend = ShortcutSendBackend(
+            connect: { _ in true },
+            activeProfile: { "default" },
+            createChat: { profile, title in
+                created = title
+                return VoiceThreadTarget(runtimeSessionID: "r1", storedSessionID: "s1", title: title, profile: profile)
+            },
+            resumeChat: { $0.runtimeSessionID },
+            reopenChat: { $0.runtimeSessionID },
+            submit: { _, _, _ in .accepted },
+            liveSessions: { _ in [] },
+            latestReply: { _ in nil }
+        )
+        var request = ShortcutSendRequest(text: "Pulse reminded me: renew it", chatName: nil, profile: "default",
+                                          waitsForAnswer: false)
+        request.newChatTitle = "Renew the insurance"
+        let outcome = try await ShortcutSender(backend: backend).send(request, deadline: Date().addingTimeInterval(20))
+        XCTAssertEqual(outcome, .sent)
+        XCTAssertEqual(created, "Renew the insurance")
+    }
+}
+
+/// Holds a bot list read until the test lets it go.
+@MainActor
+private final class PulseRosterGate {
+    var holds = false
+    private var waiting: [CheckedContinuation<Void, Never>] = []
+
+    func pass() async {
+        guard holds else { return }
+        await withCheckedContinuation { waiting.append($0) }
+    }
+
+    func release() {
+        holds = false
+        let pending = waiting
+        waiting.removeAll()
+        pending.forEach { $0.resume() }
     }
 }

@@ -41,6 +41,12 @@ struct ComposerBar: View, Equatable {
     @State private var showCamera = false
     @State private var isFocused = false
     @State private var isShowingSlashSuggestions = false
+    /// The suggestion row a hardware keyboard's arrows highlighted, in the
+    /// list that shows (slash commands, else mentions). Typing clears it.
+    @State private var suggestionHighlight: Int?
+    /// The draft whose mention list Escape closed; it stays closed until
+    /// the draft changes.
+    @State private var mentionsDismissedFor: String?
     @State private var composerErrorMessage: String?
     /// NOT view state: the store is owned by AppState because it must
     /// outlive this view's unmount (the room surface swap destroys the
@@ -97,6 +103,9 @@ struct ComposerBar: View, Equatable {
     @State private var focusesAfterFullEditor = false
     /// V2's conversation: rest as a slim bar until the composer is used.
     @Environment(\.v2ComposerRests) private var restsWhenIdle
+    /// A hidden tab's chat, or one split Settings covers, keeps its field
+    /// (and its focus): Return and ⌘Return don't send from it.
+    @Environment(\.v2Shell) private var shell
     /// A Mac, or an iPad with the room: V2's composer keeps its controls
     /// showing, the big voice button beside it (#1483).
     @Environment(\.composerStaysExpanded) private var staysExpanded
@@ -352,9 +361,61 @@ struct ComposerBar: View, Equatable {
         }
     }
 
-    /// Roster bots matching a trailing `@query`, while the editor has focus.
+    private var showsSlashSuggestionList: Bool {
+        isShowingSlashSuggestions && !filteredSlashCommands.isEmpty
+    }
+
+    // A pick, by click, tap or key, puts the cursor after what it put in,
+    // so the next word follows it instead of landing inside it (issue 2048).
+    private func pickSlashSuggestion(_ command: SlashCommand) {
+        replaceComposerText("/\(command.name) ", cursorAtEnd: true)
+        isShowingSlashSuggestions = false
+    }
+
+    private func pickMentionSuggestion(_ candidate: MentionAutocomplete.Candidate) {
+        replaceComposerText(MentionAutocomplete.completing(text, with: candidate), cursorAtEnd: true)
+    }
+
+    /// What the field's arrows, Tab, Escape and a highlighted Return act
+    /// on, while a list shows (ComposerSuggestionKeys).
+    private var suggestionKeys: ComposerSuggestionKeys? {
+        let count = showsSlashSuggestionList ? filteredSlashCommands.count : mentionCandidates.count
+        guard count > 0 else { return nil }
+        return ComposerSuggestionKeys(hasHighlight: (suggestionHighlight ?? count) < count) { key in
+            handleSuggestionKey(key)
+        }
+    }
+
+    private func handleSuggestionKey(_ key: ComposerSuggestionKey) {
+        let slash = showsSlashSuggestionList ? filteredSlashCommands : []
+        let mentions = slash.isEmpty ? mentionCandidates : []
+        let count = slash.isEmpty ? mentions.count : slash.count
+        switch key {
+        case .up, .down:
+            suggestionHighlight = ComposerSuggestionHighlight.moved(suggestionHighlight, by: key, count: count)
+        case .dismiss:
+            suggestionHighlight = nil
+            if !slash.isEmpty {
+                isShowingSlashSuggestions = false
+            } else {
+                mentionsDismissedFor = text
+            }
+        case .choose, .chooseFirst:
+            guard let index = ComposerSuggestionHighlight.picked(suggestionHighlight, by: key, count: count) else { return }
+            suggestionHighlight = nil
+            Haptics.selection()
+            if !slash.isEmpty {
+                pickSlashSuggestion(slash[index])
+            } else {
+                pickMentionSuggestion(mentions[index])
+            }
+        }
+    }
+
+    /// Roster bots matching a trailing `@query`, while the field has focus and takes text.
     private var mentionCandidates: [MentionAutocomplete.Candidate] {
-        guard isFocused, let query = MentionAutocomplete.activeQuery(in: text) else { return [] }
+        guard isTyping, mentionsDismissedFor != text,
+              let query = MentionAutocomplete.activeQuery(in: text) else { return [] }
         return MentionAutocomplete.filter(appState.composerMentionCandidates, query: query)
     }
 
@@ -382,6 +443,12 @@ struct ComposerBar: View, Equatable {
 
     private var stopOnly: Bool {
         action == .stop
+    }
+
+    /// Return and ⌘Return send only from the chat on screen: not a hidden
+    /// tab's, one split Settings covers, or one a Bot Chat on its way covers.
+    private var returnKeysReachChat: Bool {
+        shell.chatTakesKeys && !updates.inputs.botChatComing
     }
 
     private var actionSymbol: String {
@@ -470,7 +537,7 @@ struct ComposerBar: View, Equatable {
         .preference(key: V2ComposerExpandedKey.self, value: restsWhenIdle && !keepsVoiceButtonBeside && !rests)
         .preference(key: V2ComposerTypingKey.self, value: Self.hidesMinimisedCallBar(
             restsWhenIdle: restsWhenIdle,
-            isFocused: isFocused,
+            isFocused: isTyping,
             hasText: hasText,
             keepsFocusAfterSend: ComposerLayout.keepsFocusAfterSend()
         ))
@@ -488,9 +555,16 @@ struct ComposerBar: View, Equatable {
             matching: .any(of: [.images, .videos])
         )
         .conduitOutOfProcessAccentTint()
+        // A card's send and tap buttons wait while something is staged, since
+        // the message they send would take it along.
+        .onChange(of: attachments.isEmpty && pendingScreenshot == nil, initial: true) { _, nothingStaged in
+            appState.predictive.stagedAttachmentsChanged(!nothingStaged)
+        }
         .onChange(of: text) { _, newValue in
             let isProgrammaticDraftRestore = suppressNextTextChangeSuggestions
             suppressNextTextChangeSuggestions = false
+            suggestionHighlight = nil
+            if mentionsDismissedFor != newValue { mentionsDismissedFor = nil }
             composerErrorMessage = nil
             if newValue.isEmpty {
                 composerTextHeight = restingTextHeight
@@ -687,22 +761,20 @@ struct ComposerBar: View, Equatable {
                 attachmentStrip
             }
 
-            if isShowingSlashSuggestions && !filteredSlashCommands.isEmpty {
+            if showsSlashSuggestionList {
                 SlashSuggestionsOverlay(
                     commands: filteredSlashCommands,
-                    onSelected: { cmd in
-                        replaceComposerText("/\(cmd.name) ")
-                        isShowingSlashSuggestions = false
-                    }
+                    highlighted: suggestionHighlight,
+                    onSelected: { cmd in pickSlashSuggestion(cmd) }
                 )
                 .padding(.horizontal, 10)
                 .padding(.top, 8)
                 .transition(.move(edge: .bottom).combined(with: .opacity))
             }
 
-            if (!isShowingSlashSuggestions || filteredSlashCommands.isEmpty) && !mentionCandidates.isEmpty {
-                MentionSuggestionList(candidates: mentionCandidates) { candidate in
-                    replaceComposerText(MentionAutocomplete.completing(text, with: candidate))
+            if !showsSlashSuggestionList && !mentionCandidates.isEmpty {
+                MentionSuggestionList(candidates: mentionCandidates, highlighted: suggestionHighlight) { candidate in
+                    pickMentionSuggestion(candidate)
                 }
                 .padding(.horizontal, 10)
                 .padding(.top, 8)
@@ -805,10 +877,12 @@ struct ComposerBar: View, Equatable {
                     handlePastedImageError(message, editorIdentity: currentEditorIdentity)
                 },
                 editorIdentity: editorIdentity,
-                onDroppedFiles: { providers in
+                // A locked composer takes no drop, as its Attach menu is
+                // off then (the chat around it doesn't either).
+                onDroppedFiles: appState.composerIsEnabled ? { providers in
                     guard currentEditorIdentity == editorIdentity else { return }
                     handleDroppedFiles(providers)
-                },
+                } : nil,
                 onLongTextPaste: { pasted in
                     guard currentEditorIdentity == editorIdentity else { return false }
                     return attachLongPaste(pasted)
@@ -819,8 +893,9 @@ struct ComposerBar: View, Equatable {
                 // May lag one render behind fast typing; the safe
                 // failure mode is newline insertion, and
                 // submitFromReturnKey() re-checks the live gate.
-                canSubmitFromReturn: ComposerReturnKey.canSubmit(action: action) || dictationHoldsSendSlot,
+                canSubmitFromReturn: returnKeysReachChat && (ComposerReturnKey.canSubmit(action: action) || dictationHoldsSendSlot),
                 onSubmitFromReturn: { submitFromReturnKey() },
+                suggestionKeys: suggestionKeys,
                 onUserEdit: {
                     // Typed here: no later change matching dictation's last
                     // write is dictation's.
@@ -931,11 +1006,19 @@ struct ComposerBar: View, Equatable {
         Self.showsFullEditorButton(measuredHeight: composerTextHeight, restingHeight: restingTextHeight)
     }
 
+    /// The field has focus and takes text. While typing is off (a sync or
+    /// reconnect) the field keeps the wish for focus to take it back
+    /// (issue 2208), but nobody is typing: the call bar shows, mentions
+    /// hide and a resting composer may rest.
+    private var isTyping: Bool {
+        isFocused && appState.composerTakesText
+    }
+
     /// Anything that needs the full composer: focus, a draft, an
     /// attachment, a reply, dictation, steering a running turn, a notice, or
     /// a control's sheet. A running turn's Stop alone fits the resting bar.
     private var composerInUse: Bool {
-        let hasDraft = isFocused || hasText || !attachments.isEmpty || pendingScreenshot != nil
+        let hasDraft = isTyping || hasText || !attachments.isEmpty || pendingScreenshot != nil
             || replyReference != nil || isShowingFullEditor
         let isDictating = dictation.isDictating || dictation.isStarting || dictation.isTranscribing
         let turnControl = Self.turnControlExpandsComposer(action: action, restsWhenIdle: restsWhenIdle)
@@ -967,7 +1050,7 @@ struct ComposerBar: View, Equatable {
     /// The minimised call bar above a V2 composer hides only while someone
     /// types. A running turn, a notice or a draft left unfocused keeps it,
     /// so a call minimised in a chat can always be brought back (#695).
-    /// Where the field keeps focus after a send (a Mac, a hardware
+    /// Where the field keeps focus after a send (a Mac, an iPad's
     /// keyboard: `ComposerLayout.keepsFocusAfterSend`), focus alone isn't
     /// typing: the bar hides only while the field holds words.
     static func hidesMinimisedCallBar(
@@ -1094,11 +1177,19 @@ struct ComposerBar: View, Equatable {
 
     /// Why the composer is locked. While the chat on screen is on its way
     /// the composer takes a message anyway, so the line about syncing
-    /// stays away; an error or a repair still shows.
+    /// stays away; an error or a repair still shows. An unlocked composer
+    /// shows an error too: a send that failed says why, rather than its
+    /// words coming back with nothing said (issue 2095).
     private var showsStateNotice: Bool {
-        guard !appState.composerIsEnabled else { return false }
+        let hasError = !(appState.errorMessage ?? "").isEmpty
+        guard !appState.composerIsEnabled else { return hasError }
         guard appState.composerWaitsForChat else { return true }
-        return !(appState.errorMessage ?? "").isEmpty || showsRepairConnection
+        return hasError || showsRepairConnection
+    }
+
+    /// The syncing line, only while the composer is locked for it.
+    private var showsSyncingLine: Bool {
+        !appState.composerIsEnabled && !appState.composerWaitsForChat
     }
 
     private var showsRepairConnection: Bool {
@@ -1108,7 +1199,7 @@ struct ComposerBar: View, Equatable {
     @ViewBuilder
     private var stateNotice: some View {
         VStack(alignment: .leading, spacing: 4) {
-            if !appState.composerWaitsForChat {
+            if showsSyncingLine {
                 HStack(spacing: 8) {
                 if appState.turnState != .unsupportedGateway {
                     ProgressView()
@@ -1236,10 +1327,13 @@ struct ComposerBar: View, Equatable {
     }
 
     /// The chat is Conduit's now: send the refused draft again, exactly as
-    /// the Send button would. When that can't happen here (another chat is
-    /// open, the composer isn't offering Send, or its draft isn't the refused
-    /// message, as after a refused voice turn), the ready notice stays and
-    /// asks the user to send again.
+    /// the Send button would. After a takeover the user tapped, or one
+    /// whose kept message Conduit couldn't send itself (another chat was
+    /// open, or the composer was locked), so its words came back here. When
+    /// that can't happen here (another chat is open, the composer isn't
+    /// offering Send, or its draft isn't the refused message, as after a
+    /// refused voice turn), the ready notice stays and asks the user to send
+    /// again.
     private func resendAfterChatTakeover() {
         guard let takeover = appState.activeChatTakeover, takeover.phase == .ready,
               case .send = action else { return }
@@ -1304,7 +1398,7 @@ struct ComposerBar: View, Equatable {
             if message == Self.cameraAccessMessage {
                 Button("Open Settings") {
                     composerErrorMessage = nil
-                    PrivacySettingsLink.open(.camera)
+                    SystemSettings.open(.camera)
                 }
                 .scaledFont(.caption.weight(.semibold))
             }
@@ -1522,7 +1616,7 @@ struct ComposerBar: View, Equatable {
             endInput(keepingFocus: isFocused || isShowingFullEditor, fromFullEditor: isShowingFullEditor)
             isShowingFullEditor = false
             Haptics.warning()
-            Task { await appState.cancelCurrent() }
+            Task { await appState.cancelCurrent(stopsWorkstream: true) }
         } else {
             submit()
         }
@@ -1675,6 +1769,9 @@ struct ComposerBar: View, Equatable {
     /// newline behavior instead of being swallowed.
     @discardableResult
     private func submitFromReturnKey() -> Bool {
+        // A Bot Chat on its way covers this chat: the field's gate refreshes
+        // a turn later, so check the live state too, and take the key.
+        guard appState.botChatComingOverAnother == nil else { return true }
         // Return stands for Send, which is dictation's Stop while it runs.
         if dictationHoldsSendSlot {
             dictation.tapSlot()
@@ -1803,8 +1900,15 @@ struct ComposerBar: View, Equatable {
     /// otherwise into their chat's stored draft.
     private func applyComposerRestoreRequests() {
         guard let loadedDraftKey else { return }
+        var restoredIntoField = false
         for request in appState.composerRestoreRequests where request.dashboardID == appState.activeDashboardID {
             if restoreRequest(request, belongsTo: loadedDraftKey) {
+                // Only a send's own words can be the refused message: a
+                // shared draft, a dictation retry or a waiting message's
+                // Edit is never sent on its own.
+                if request.sharedDraftID == nil, request.dictationClipID == nil, !request.focuses {
+                    restoredIntoField = true
+                }
                 let restored = ComposerDraft(text: text, attachments: attachments, replyReference: replyReference)
                     .restoring(request.draft)
                 // Put back, not typed: a "/cmd" draft opens no suggestions.
@@ -1825,6 +1929,10 @@ struct ComposerBar: View, Equatable {
             }
             appState.consumeComposerRestoreRequest(request.id)
         }
+        // A refused message can come back in the same update its takeover
+        // finished in, after the ready token's change found the field empty:
+        // it goes now that it's here (issue 2140).
+        if restoredIntoField { resendAfterChatTakeover() }
     }
 
     private func restoreRequest(_ request: ComposerRestoreRequest, belongsTo key: ComposerDraftKey) -> Bool {
@@ -2090,7 +2198,7 @@ struct ComposerBar: View, Equatable {
     /// Waiting for the gateway RPC leaves the side controls aligned to the old
     /// multiline field while the keyboard's safe area is already animating.
     /// `keepingFocus`: the user was typing (in the field or the full
-    /// editor), which on a Mac or with a hardware keyboard carries on.
+    /// editor), which on a Mac or an iPad's keyboard carries on.
     private func collapseSubmittedDraft(clearingReply: Bool, keepingFocus: Bool, fromFullEditor: Bool) {
         endInput(keepingFocus: keepingFocus, fromFullEditor: fromFullEditor)
         let updates = {
@@ -2346,7 +2454,7 @@ struct ComposerBar: View, Equatable {
         isShowingSlashSuggestions = false
     }
 
-    /// A send or Stop: on a Mac or with a hardware keyboard the field keeps
+    /// A send or Stop: on a Mac or an iPad's keyboard the field keeps
     /// focus for the next message, as a desktop client's does, when the
     /// user was typing; otherwise the keyboard goes (`dismissComposer`).
     private func endInput(keepingFocus wasTyping: Bool, fromFullEditor: Bool = false) {
@@ -2976,10 +3084,13 @@ struct ContextRingView: View {
 
 private struct SlashSuggestionsOverlay: View {
     let commands: [SlashCommand]
+    /// The row a hardware keyboard's arrows highlighted.
+    var highlighted: Int? = nil
     let onSelected: (SlashCommand) -> Void
     @ScaledMetric(relativeTo: .caption2) private var categoryBadgeSize: CGFloat = 9
 
     var body: some View {
+        ScrollViewReader { reader in
         ScrollView {
             VStack(spacing: 0) {
                 ForEach(Array(commands.enumerated()), id: \.element.id) { index, cmd in
@@ -3024,6 +3135,8 @@ private struct SlashSuggestionsOverlay: View {
                         .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
+                    .background(index == highlighted ? Color.conduitAccent.opacity(0.14) : Color.clear)
+                    .accessibilityAddTraits(index == highlighted ? .isSelected : [])
 
                     if index < commands.count - 1 {
                         Divider()
@@ -3031,6 +3144,11 @@ private struct SlashSuggestionsOverlay: View {
                     }
                 }
             }
+        }
+        .onChange(of: highlighted) { _, index in
+            guard let index, commands.indices.contains(index) else { return }
+            reader.scrollTo(commands[index].id)
+        }
         }
         .frame(maxHeight: 280)
         .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
