@@ -11,16 +11,33 @@
 
 #if targetEnvironment(macCatalyst)
 import Foundation
+import Darwin
 import Security
 import XCTest
 @testable import Conduit
 
 extension DashboardRequestAuthorizerTests {
-    /// A credentials file in a folder of its own, removed after the test.
+    /// A credentials file in a folder of its own under the sandbox's
+    /// Application Support, matching the real store's backup domain. The
+    /// system temporary directory has different backup policy on macOS.
     private func credentialsURL() -> URL {
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let support = KeychainHelper.FileBackend.defaultURL.deletingLastPathComponent().deletingLastPathComponent()
+        let directory = support.appendingPathComponent("FileBackendTests-" + UUID().uuidString, isDirectory: true)
         addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
         return directory.appendingPathComponent("Credentials").appendingPathComponent("credentials.plist")
+    }
+
+    /// Assertion context contains no paths or credential data.
+    private func backupFlagReadback(_ url: URL) -> String {
+        let fresh = NSURL(fileURLWithPath: url.path, isDirectory: true)
+        let values = try? fresh.resourceValues(forKeys: [.isExcludedFromBackupKey])
+        let marked = (values?[.isExcludedFromBackupKey] as? NSNumber)?.boolValue
+        let marker = url.path.withCString { path in
+            "com.apple.metadata:com_apple_backup_excludeItem".withCString { name in
+                getxattr(path, name, nil, 0, 0, 0) > 0
+            }
+        }
+        return "NSURL flag: \(String(describing: marked)); backup exclusion marker: \(marker)"
     }
 
     private func scoped(_ account: String, service: String = "com.milim.conduit") -> [String: Any] {
@@ -93,7 +110,8 @@ extension DashboardRequestAuthorizerTests {
         // Resource values are cached per URL; read the actual folder
         // through a fresh URL, as the backup-exclusion tests elsewhere do.
         let fresh = URL(fileURLWithPath: folder.path, isDirectory: true)
-        XCTAssertEqual(try fresh.resourceValues(forKeys: [.isExcludedFromBackupKey]).isExcludedFromBackup, true)
+        XCTAssertEqual(try fresh.resourceValues(forKeys: [.isExcludedFromBackupKey]).isExcludedFromBackup, true,
+                       backupFlagReadback(fresh))
     }
 
     func testFileBackendReappliesBackupExclusionToAnExistingFolder() throws {
@@ -104,13 +122,15 @@ extension DashboardRequestAuthorizerTests {
         let backend = KeychainHelper.FileBackend(url: url)
         XCTAssertEqual(backend.add(adding(Data("one".utf8), to: scoped("a"))), errSecSuccess)
         var fresh = URL(fileURLWithPath: folder.path, isDirectory: true)
-        XCTAssertEqual(try fresh.resourceValues(forKeys: [.isExcludedFromBackupKey]).isExcludedFromBackup, true)
+        XCTAssertEqual(try fresh.resourceValues(forKeys: [.isExcludedFromBackupKey]).isExcludedFromBackup, true,
+                       backupFlagReadback(fresh))
 
         // A restore or another writer may remove the flag between saves.
         try (fresh as NSURL).setResourceValue(false, forKey: .isExcludedFromBackupKey)
         XCTAssertEqual(backend.update(Data("two".utf8), for: scoped("a")), errSecSuccess)
         fresh = URL(fileURLWithPath: folder.path, isDirectory: true)
-        XCTAssertEqual(try fresh.resourceValues(forKeys: [.isExcludedFromBackupKey]).isExcludedFromBackup, true)
+        XCTAssertEqual(try fresh.resourceValues(forKeys: [.isExcludedFromBackupKey]).isExcludedFromBackup, true,
+                       backupFlagReadback(fresh))
         XCTAssertEqual(backend.data(for: scoped("a")), Data("two".utf8))
     }
 
