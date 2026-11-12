@@ -27,17 +27,26 @@ extension DashboardRequestAuthorizerTests {
         return directory.appendingPathComponent("Credentials").appendingPathComponent("credentials.plist")
     }
 
-    /// Assertion context contains no paths or credential data.
-    private func backupFlagReadback(_ url: URL) -> String {
-        let fresh = NSURL(fileURLWithPath: url.path, isDirectory: true)
-        let values = try? fresh.resourceValues(forKeys: [.isExcludedFromBackupKey])
-        let marked = (values?[.isExcludedFromBackupKey] as? NSNumber)?.boolValue
-        let marker = url.path.withCString { path in
-            "com.apple.metadata:com_apple_backup_excludeItem".withCString { name in
-                getxattr(path, name, nil, 0, 0, 0) > 0
+    /// Read the persisted macOS exclusion, not Foundation's cached or
+    /// platform-dependent Boolean. On the hosted Mac that Boolean is
+    /// false even when Foundation wrote the Time Machine marker.
+    private func backupExclusionMarker(_ url: URL) throws -> String? {
+        try url.path.withCString { path in
+            try "com.apple.metadata:com_apple_backup_excludeItem".withCString { name in
+                let size = getxattr(path, name, nil, 0, 0, 0)
+                if size < 0 {
+                    if errno == ENOATTR { return nil }
+                    throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+                }
+                guard size > 0, size <= 1024 else { throw CocoaError(.fileReadCorruptFile) }
+                var data = Data(count: size)
+                let copied = data.withUnsafeMutableBytes { bytes in
+                    getxattr(path, name, bytes.baseAddress, bytes.count, 0, 0)
+                }
+                guard copied == size else { throw CocoaError(.fileReadCorruptFile) }
+                return try PropertyListSerialization.propertyList(from: data, format: nil) as? String
             }
         }
-        return "NSURL flag: \(String(describing: marked)); backup exclusion marker: \(marker)"
     }
 
     private func scoped(_ account: String, service: String = "com.milim.conduit") -> [String: Any] {
@@ -107,11 +116,8 @@ extension DashboardRequestAuthorizerTests {
         let folder = url.deletingLastPathComponent()
         let folderMode = try XCTUnwrap(FileManager.default.attributesOfItem(atPath: folder.path)[.posixPermissions] as? NSNumber)
         XCTAssertEqual(folderMode.intValue & 0o777, 0o700)
-        // Resource values are cached per URL; read the actual folder
-        // through a fresh URL, as the backup-exclusion tests elsewhere do.
-        let fresh = URL(fileURLWithPath: folder.path, isDirectory: true)
-        XCTAssertEqual(try fresh.resourceValues(forKeys: [.isExcludedFromBackupKey]).isExcludedFromBackup, true,
-                       backupFlagReadback(fresh))
+        // Check the exact sticky Time Machine marker Foundation persists.
+        XCTAssertEqual(try backupExclusionMarker(folder), "com.apple.backupd")
     }
 
     func testFileBackendReappliesBackupExclusionToAnExistingFolder() throws {
@@ -119,18 +125,16 @@ extension DashboardRequestAuthorizerTests {
         let folder = url.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         try (folder as NSURL).setResourceValue(false, forKey: .isExcludedFromBackupKey)
+        XCTAssertNil(try backupExclusionMarker(folder))
         let backend = KeychainHelper.FileBackend(url: url)
         XCTAssertEqual(backend.add(adding(Data("one".utf8), to: scoped("a"))), errSecSuccess)
-        var fresh = URL(fileURLWithPath: folder.path, isDirectory: true)
-        XCTAssertEqual(try fresh.resourceValues(forKeys: [.isExcludedFromBackupKey]).isExcludedFromBackup, true,
-                       backupFlagReadback(fresh))
+        XCTAssertEqual(try backupExclusionMarker(folder), "com.apple.backupd")
 
         // A restore or another writer may remove the flag between saves.
-        try (fresh as NSURL).setResourceValue(false, forKey: .isExcludedFromBackupKey)
+        try (folder as NSURL).setResourceValue(false, forKey: .isExcludedFromBackupKey)
+        XCTAssertNil(try backupExclusionMarker(folder))
         XCTAssertEqual(backend.update(Data("two".utf8), for: scoped("a")), errSecSuccess)
-        fresh = URL(fileURLWithPath: folder.path, isDirectory: true)
-        XCTAssertEqual(try fresh.resourceValues(forKeys: [.isExcludedFromBackupKey]).isExcludedFromBackup, true,
-                       backupFlagReadback(fresh))
+        XCTAssertEqual(try backupExclusionMarker(folder), "com.apple.backupd")
         XCTAssertEqual(backend.data(for: scoped("a")), Data("two".utf8))
     }
 

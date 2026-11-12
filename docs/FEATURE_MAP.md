@@ -8188,7 +8188,7 @@ The Mac fork keeps its desktop behavior while taking changes from upstream.
 - Procedure and CI: `docs/UPDATING_MAC_PORT.md`, `README.md`, `.github/workflows/mac-catalyst.yml`.
 
 **Rulings**
-- The credentials directory is owner-only and excluded from backups on every save, including when it already exists. A failure to set the backup exclusion refuses the write; tests read the flag through a fresh URL in an isolated Application Support folder matching the real store, rather than the system temporary directory.
+- The credentials directory is owner-only and excluded from backups on every save, including when it already exists. A failure to set the backup exclusion refuses the write; Catalyst tests verify the exact persisted Time Machine exclusion marker, and its removal and reapplication, in an isolated Application Support folder. The hosted Mac reports Foundation's resource Boolean as false even with that marker present.
 - Preserve the existing Catalyst port and the upstream behavior of iOS, iPadOS and watchOS. Desktop detection includes both Catalyst and an iPad app running on a Mac.
 - Keep Release limited to the current architecture, remove unused code, and strip executable symbols while keeping the dSYM. Do not restore the reconnect and upload path on each Cmd-Tab.
 - Debug uses its own bundle ID and data container. Builds and tests never replace the installed Release app as part of an update PR.
