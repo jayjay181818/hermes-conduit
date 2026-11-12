@@ -10,7 +10,7 @@ import Foundation
 /// The attributes stay on the phone (the chat's title never reaches the
 /// relay). `ContentState` is what pushes carry: its JSON keys are the
 /// relay's `content-state` keys, so keep them in step.
-struct HermesTurnAttributes: ActivityAttributes {
+struct HermesTurnAttributes: Codable {
     struct ContentState: Codable, Hashable {
         /// A `HermesTurnPhase` raw value; unknown values read as thinking.
         var phase: String
@@ -67,6 +67,12 @@ struct HermesTurnAttributes: ActivityAttributes {
         return (Double((value >> 16) & 0xff) / 255, Double((value >> 8) & 0xff) / 255, Double(value & 0xff) / 255)
     }
 }
+
+// Mac Catalyst has no Live Activities (`ActivityAttributes` is unavailable
+// there); the Mac build keeps the type for the code that reads it.
+#if !targetEnvironment(macCatalyst)
+extension HermesTurnAttributes: ActivityAttributes {}
+#endif
 
 enum HermesTurnPhase: String, Codable, CaseIterable {
     case thinking

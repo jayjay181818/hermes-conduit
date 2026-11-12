@@ -26,6 +26,13 @@ final class CarPlaySceneManifestTests: XCTestCase {
         Bundle.main.infoDictionary?["UIApplicationSceneManifest"] as? [String: Any] ?? [:]
     }
 
+    override func setUpWithError() throws {
+        try super.setUpWithError()
+        // Conduit for Mac's manifest has one window and no CarPlay scene
+        // (scripts/mac-catalyst/project.yml).
+        try XCTSkipIf(ProcessInfo.processInfo.isMacCatalystApp, "No CarPlay scene on a Mac")
+    }
+
     func testSupportsMultipleScenesEnabledForPhoneAndCarPlayCoexistence() {
         // UIKit creates the phone UIWindow scene AND the connected
         // CPTemplateApplicationScene concurrently, so multiple-scene support

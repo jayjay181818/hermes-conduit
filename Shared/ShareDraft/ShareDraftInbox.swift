@@ -51,10 +51,16 @@ struct ShareDraftInbox {
     }
 
     static var production: ShareDraftInbox? {
+        #if targetEnvironment(macCatalyst)
+        // The Mac build (scripts/mac-catalyst) has no share extension or
+        // App Group.
+        return nil
+        #else
         guard let container = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroup) else {
             return nil
         }
         return ShareDraftInbox(directory: container.appendingPathComponent(folderName, isDirectory: true))
+        #endif
     }
 
     // MARK: Writing (the share extension)

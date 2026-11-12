@@ -23,7 +23,7 @@ private struct KeyboardDoneButton: ViewModifier {
     let action: () -> Void
 
     func body(content: Content) -> some View {
-        if ProcessInfo.processInfo.isiOSAppOnMac {
+        if ProcessInfo.processInfo.runsOnMac {
             content
         } else {
             content.toolbar {

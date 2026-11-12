@@ -21,7 +21,7 @@ enum ComposerReturnKey {
     /// Hermes Desktop, Messages and Slack, with Shift-Return for a new line.
     /// On iPhone and iPad it stays off, so a hardware keyboard keeps the
     /// newline it always had.
-    static var sendsByDefault: Bool { sendsByDefault(onMac: ProcessInfo.processInfo.isiOSAppOnMac) }
+    static var sendsByDefault: Bool { sendsByDefault(onMac: ProcessInfo.processInfo.runsOnMac) }
 
     static func sendsByDefault(onMac: Bool) -> Bool { onMac }
 

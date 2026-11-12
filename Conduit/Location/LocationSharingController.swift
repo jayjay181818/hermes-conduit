@@ -116,7 +116,7 @@ final class LocationSharingController: ObservableObject {
     private var activated = false
 
     init(engine: LocationSyncEngine? = nil, config: LocationSharedConfig? = nil, unsent: LocationUnsent? = nil) {
-        self.engine = engine ?? LocationSyncEngine(deviceName: { UIDevice.current.name })
+        self.engine = engine ?? LocationSyncEngine(deviceName: { UIDevice.current.conduitName })
         if let config {
             self.config = config
         } else {

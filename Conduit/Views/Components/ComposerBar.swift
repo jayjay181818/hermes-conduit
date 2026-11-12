@@ -1304,8 +1304,7 @@ struct ComposerBar: View, Equatable {
             if message == Self.cameraAccessMessage {
                 Button("Open Settings") {
                     composerErrorMessage = nil
-                    guard let url = URL(string: UIApplication.openSettingsURLString) else { return }
-                    UIApplication.shared.open(url)
+                    PrivacySettingsLink.open(.camera)
                 }
                 .scaledFont(.caption.weight(.semibold))
             }

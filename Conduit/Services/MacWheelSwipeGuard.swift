@@ -27,7 +27,7 @@ struct MacWheelSwipeGuardProbe: UIViewRepresentable {
     final class ProbeView: UIView {
         override func didMoveToWindow() {
             super.didMoveToWindow()
-            guard ProcessInfo.processInfo.isiOSAppOnMac, let window,
+            guard ProcessInfo.processInfo.runsOnMac, let window,
                   !(window.gestureRecognizers ?? []).contains(where: { $0 is MacWheelSwipeGuardRecognizer })
             else { return }
             window.addGestureRecognizer(MacWheelSwipeGuardRecognizer())
@@ -127,7 +127,7 @@ extension View {
     /// on a Mac, where the wheel guard keeps a trackpad from swiping it.
     @ViewBuilder
     func macSwipeActionsMenu<Menu: View>(@ViewBuilder _ menu: () -> Menu) -> some View {
-        if ProcessInfo.processInfo.isiOSAppOnMac {
+        if ProcessInfo.processInfo.runsOnMac {
             contextMenu { menu() }
         } else {
             self

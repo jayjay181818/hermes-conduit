@@ -1895,7 +1895,7 @@ private struct ComposerReturnKeySettings: View {
     @AppStorage(ComposerReturnKey.preferenceKey) private var returnKeySends = ComposerReturnKey.sendsByDefault
     /// A Mac has no on-screen keyboard to mention, and starts with the
     /// preference on.
-    private let onMac = ProcessInfo.processInfo.isiOSAppOnMac
+    private let onMac = ProcessInfo.processInfo.runsOnMac
 
     var body: some View {
         ConduitSettingsSection(
@@ -3578,6 +3578,8 @@ private struct AppearanceSettingsDetail: View {
                     }
                 }
             }
+            // The Mac build keeps one icon: Mac Catalyst can't change it.
+            #if !targetEnvironment(macCatalyst)
             ConduitSettingsSection(title: AppLocalization.string("App icon"), symbol: "app.badge", tint: .conduitAura) {
                 Text("Choose the icon shown on your Home Screen.")
                     .scaledFont(.footnote)
@@ -3624,6 +3626,7 @@ private struct AppearanceSettingsDetail: View {
                     }
                 }
             }
+            #endif
 
             // The gold button beside V2's tabs: voice, or New chat for
             // people who'd rather not talk. A chat keeps its voice button.
@@ -3916,6 +3919,19 @@ private struct NotificationsSettingsDetail: View {
 
     var body: some View {
         SettingsDetailContainer {
+            #if targetEnvironment(macCatalyst)
+            // Conduit for Mac posts its own notifications (MacAttention):
+            // no relay to pair or check, only when they come and what they say.
+            ConduitSettingsSection(title: AppLocalization.string("Notify me when"), symbol: "slider.horizontal.3", tint: .conduitAccent) {
+                if notifications.authorizationStatus == .denied {
+                    Label(AppLocalization.string("Notifications denied"), systemImage: "bell.slash")
+                        .scaledFont(.footnote)
+                        .foregroundStyle(.red)
+                }
+                notifyMeWhenToggles
+                notificationDetailPicker
+            }
+            #else
             ConduitSettingsSection(title: AppLocalization.string("This iPhone"), symbol: "bell.badge", tint: .conduitAura) {
                 SettingsMetricRow(
                     label: AppLocalization.string("Status"),
@@ -3993,13 +4009,7 @@ private struct NotificationsSettingsDetail: View {
                             .scaledFont(.footnote)
                             .foregroundStyle(.secondary)
                     }
-                    notificationToggle(AppLocalization.string("Approval needed"), detail: AppLocalization.string("A tool is waiting for approval"), keyPath: \.approvalNeeded)
-                    notificationToggle(AppLocalization.string("Input needed"), detail: AppLocalization.string("Hermes needs your answer"), keyPath: \.inputNeeded)
-                    notificationToggle(AppLocalization.string("Response ready"), detail: AppLocalization.string("An active turn finishes"), keyPath: \.responseReady)
-                    notificationToggle(AppLocalization.string("Turn failed"), detail: AppLocalization.string("A turn stops with an error"), keyPath: \.turnFailed)
-                    notificationToggle(AppLocalization.string("Background task finished"), detail: AppLocalization.string("A delegated agent completes"), keyPath: \.backgroundTaskFinished)
-                    notificationToggle(AppLocalization.string("Approval & input sound"), detail: AppLocalization.string("Play a sound when Hermes is waiting on you"), keyPath: \.attentionSound)
-                    notificationToggle(AppLocalization.string("Completion sound"), detail: AppLocalization.string("Play a sound when a turn or task finishes"), keyPath: \.completionSound)
+                    notifyMeWhenToggles
                     notificationDetailPicker
                     notificationToggle(AppLocalization.string("Approval cards in pushes"), detail: AppLocalization.string("Include approval details so cards work from notifications. Disable for maximum privacy."), keyPath: \.decisionCards)
                 }
@@ -4256,12 +4266,27 @@ private struct NotificationsSettingsDetail: View {
                         .foregroundStyle(.secondary)
                 }
             }
+            #endif
         }
         .navigationTitle("Notifications")
         .task {
             await notifications.refresh()
+            #if !targetEnvironment(macCatalyst)
             await notifications.refreshMeta()
+            #endif
         }
+    }
+
+    /// Which events notify, and their sounds.
+    @ViewBuilder
+    private var notifyMeWhenToggles: some View {
+        notificationToggle(AppLocalization.string("Approval needed"), detail: AppLocalization.string("A tool is waiting for approval"), keyPath: \.approvalNeeded)
+        notificationToggle(AppLocalization.string("Input needed"), detail: AppLocalization.string("Hermes needs your answer"), keyPath: \.inputNeeded)
+        notificationToggle(AppLocalization.string("Response ready"), detail: AppLocalization.string("An active turn finishes"), keyPath: \.responseReady)
+        notificationToggle(AppLocalization.string("Turn failed"), detail: AppLocalization.string("A turn stops with an error"), keyPath: \.turnFailed)
+        notificationToggle(AppLocalization.string("Background task finished"), detail: AppLocalization.string("A delegated agent completes"), keyPath: \.backgroundTaskFinished)
+        notificationToggle(AppLocalization.string("Approval & input sound"), detail: AppLocalization.string("Play a sound when Hermes is waiting on you"), keyPath: \.attentionSound)
+        notificationToggle(AppLocalization.string("Completion sound"), detail: AppLocalization.string("Play a sound when a turn or task finishes"), keyPath: \.completionSound)
     }
 
     /// A row that opens Settings > Conduit plugin.
@@ -4503,11 +4528,13 @@ private struct NotificationsSettingsDetail: View {
             Text(detail.caption)
                 .scaledFont(.caption)
                 .foregroundStyle(.secondary)
+            #if !targetEnvironment(macCatalyst)
             if detail != .generic {
                 Text(AppLocalization.string("To keep them off the Lock Screen, set Show Previews to When Unlocked in iOS Settings > Notifications > Conduit."))
                     .scaledFont(.caption)
                     .foregroundStyle(.secondary)
             }
+            #endif
         }
     }
 

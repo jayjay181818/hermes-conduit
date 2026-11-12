@@ -1,0 +1,97 @@
+# Conduit for Mac: the iPhone and iPad app built for macOS with Mac Catalyst
+# (scripts/mac-catalyst-build.sh). It is signed to run locally (identity "-",
+# no team or provisioning profile), so it carries only App Sandbox
+# entitlements (ConduitMac.entitlements) and embeds no extensions or Watch
+# app: no push notifications, Live Activities, widgets, share extension,
+# CarPlay, HealthKit or location push. Mac Catalyst can't reach the keychain
+# without a provisioning profile, so its credentials live in a file in its
+# sandbox container (Conduit/Services/KeychainFileBackend.swift). Its own
+# bundle id keeps it apart from any other Conduit on the Mac; it keeps the
+# conduit:// scheme, so Hermes' sign-in links open it. A Debug build is
+# com.milim.relay.catalyst.debug with conduit-debug://.
+name: ConduitMac
+include:
+  # Relative to the repo root: generate with --project-root . (the script does).
+  - path: project.yml
+targets:
+  Conduit:
+    settings:
+      base:
+        SUPPORTS_MACCATALYST: YES
+        SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: NO
+        DERIVE_MACCATALYST_PRODUCT_BUNDLE_IDENTIFIER: NO
+        # Mac Catalyst 17.0, the iOS deployment target.
+        MACOSX_DEPLOYMENT_TARGET: "14.0"
+        PRODUCT_BUNDLE_IDENTIFIER: com.milim.relay.catalyst
+        PRODUCT_NAME: Conduit
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGN_IDENTITY: "-"
+        DEVELOPMENT_TEAM: ""
+        PROVISIONING_PROFILE_SPECIFIER: ""
+        CODE_SIGN_ENTITLEMENTS: scripts/mac-catalyst/ConduitMac.entitlements
+      configs:
+        # Debug runs, and the unit tests that run inside one, keep their own
+        # container (sign-in, settings, files) and link scheme, apart from
+        # the installed Conduit for Mac.
+        Debug:
+          PRODUCT_BUNDLE_IDENTIFIER: com.milim.relay.catalyst.debug
+          CONDUIT_URL_SCHEME: conduit-debug
+        # Signed to run locally, Xcode would add get-task-allow (debugger
+        # attach) to Release too.
+        Release:
+          CODE_SIGN_INJECT_BASE_ENTITLEMENTS: NO
+          # Build only the current architecture, strip symbols from the
+          # executable (retaining the dSYM), and remove unused code.
+          ONLY_ACTIVE_ARCH: YES
+          DEPLOYMENT_POSTPROCESSING: YES
+          DEAD_CODE_STRIPPING: YES
+    dependencies:REPLACE:
+      - package: WebRTC
+    postBuildScripts:
+      # One window. The manifest allows several scenes for CarPlay, which
+      # the Mac has none of, and on a Mac that adds File > New Window: a
+      # second Conduit window that closes itself (RootView's first-window
+      # guard).
+      - name: Single window on Mac
+        basedOnDependencyAnalysis: false
+        script: |
+          plist="$TARGET_BUILD_DIR/$INFOPLIST_PATH"
+          /usr/libexec/PlistBuddy -c "Set :UIApplicationSceneManifest:UIApplicationSupportsMultipleScenes false" "$plist"
+          /usr/libexec/PlistBuddy -c "Delete :UIApplicationSceneManifest:UISceneConfigurations" "$plist" 2>/dev/null || true
+      # Calls from Hermes don't ring through CallKit (HermesNativeCalls
+      # ringingBuilt): a Mac build has no PushKit entitlement for the relay
+      # to ring it with.
+      - name: No ringing calls on Mac
+        basedOnDependencyAnalysis: false
+        script: |
+          /usr/libexec/PlistBuddy -c "Set :ConduitHermesCallsRing false" "$TARGET_BUILD_DIR/$INFOPLIST_PATH"
+  # Unit tests on Mac Catalyst, hosted by Conduit for Mac (scheme
+  # ConduitMac below).
+  ConduitTests:
+    settings:
+      base:
+        SUPPORTS_MACCATALYST: YES
+        SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: NO
+        DERIVE_MACCATALYST_PRODUCT_BUNDLE_IDENTIFIER: NO
+        MACOSX_DEPLOYMENT_TARGET: "14.0"
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGN_IDENTITY: "-"
+        DEVELOPMENT_TEAM: ""
+        PROVISIONING_PROFILE_SPECIFIER: ""
+# Conduit for Mac and its unit tests, without the iOS UI test bundles, which
+# would ask for a signing team:
+#   xcodebuild test -project ConduitMac.xcodeproj -scheme ConduitMac
+#     -destination 'platform=macOS,variant=Mac Catalyst'
+schemes:
+  ConduitMac:
+    build:
+      targets:
+        Conduit: all
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - ConduitTests
+    archive:
+      config: Release

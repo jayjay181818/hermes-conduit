@@ -151,6 +151,11 @@ final class LocationBackgroundMonitor: NSObject, CLLocationManagerDelegate {
         pushesReported = true
         pushesOn = on
         if on {
+            #if targetEnvironment(macCatalyst)
+            // A Mac has no Location Push Service Extension, so the host
+            // can't wake Conduit there to locate it: no token.
+            locationPushToken?(nil)
+            #else
             manager.startMonitoringLocationPushes { [weak self] token, error in
                 let hex = token.map { $0.map { String(format: "%02x", $0) }.joined() }
                 let failed = hex == nil && error != nil
@@ -168,8 +173,11 @@ final class LocationBackgroundMonitor: NSObject, CLLocationManagerDelegate {
                     self.locationPushToken?(hex)
                 }
             }
+            #endif
         } else {
+            #if !targetEnvironment(macCatalyst)
             manager.stopMonitoringLocationPushes()
+            #endif
             locationPushToken?(nil)
         }
     }

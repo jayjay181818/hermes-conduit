@@ -267,6 +267,13 @@ extension HermesVoiceGatewayTimeoutTests {
     func testExternalLinkSchemeIsRegistered() throws {
         let types = try XCTUnwrap(Bundle(for: AppState.self).object(forInfoDictionaryKey: "CFBundleURLTypes") as? [[String: Any]])
         let schemes = types.flatMap { $0["CFBundleURLSchemes"] as? [String] ?? [] }
+        #if targetEnvironment(macCatalyst) && DEBUG
+        // Conduit for Mac's Debug build (scripts/mac-catalyst/project.yml)
+        // registers its own, so conduit:// links keep opening the installed
+        // Conduit for Mac.
+        XCTAssertTrue(schemes.contains("conduit-debug"))
+        #else
         XCTAssertTrue(schemes.contains(ConduitAppLink.scheme))
+        #endif
     }
 }

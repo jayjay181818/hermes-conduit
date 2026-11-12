@@ -21,10 +21,13 @@ struct V2FinishSetupCard: View {
     private var status: FinishSetupStatus {
         FinishSetupStatus(
             plugin: FinishSetupStatus.plugin(appState.notifierPlugin, updating: appState.activeNotifierPluginUpdate.isInProgress),
-            notifications: FinishSetupStatus.notifications(
-                enabled: notifications.isEnabled,
-                authorization: notifications.authorizationStatus
-            ),
+            // Nothing to turn on where relay pushes can't arrive (a Mac).
+            notifications: PushNotificationService.relayPushesAvailable
+                ? FinishSetupStatus.notifications(
+                    enabled: notifications.isEnabled,
+                    authorization: notifications.authorizationStatus
+                )
+                : .done,
             voiceReady: appState.canStartPhoneVoiceConversation
         )
     }
@@ -35,8 +38,10 @@ struct V2FinishSetupCard: View {
             header
             VStack(spacing: 0) {
                 pluginRow(status.plugin)
-                notificationsRow(status.notifications)
-                    .overlay(alignment: .top) { V2RowDivider(leadingInset: 56) }
+                if PushNotificationService.relayPushesAvailable {
+                    notificationsRow(status.notifications)
+                        .overlay(alignment: .top) { V2RowDivider(leadingInset: 56) }
+                }
                 voiceRow(ready: status.voiceReady)
                     .overlay(alignment: .top) { V2RowDivider(leadingInset: 56) }
             }

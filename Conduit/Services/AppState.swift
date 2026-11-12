@@ -856,7 +856,7 @@ final class AppState: ObservableObject {
     var newChatLaunchStartedInApp = false
     /// A Mac has a keyboard at hand, so the app's own New Chat opens ready
     /// to type. Tests stand in for a Mac.
-    var newChatFocusesComposer = ProcessInfo.processInfo.isiOSAppOnMac
+    var newChatFocusesComposer = ProcessInfo.processInfo.runsOnMac
     /// A widget action waits out the return-to-app refresh: that refresh
     /// can drop a socket that died in the background and restore the last
     /// chat, which would fail a new chat or take over the screen it opened.
@@ -19962,6 +19962,10 @@ final class AppState: ObservableObject {
                 liveSessionStatusProfile = profile
             }
         }
+        #if targetEnvironment(macCatalyst)
+        // Conduit for Mac's notifications for chats run from elsewhere.
+        MacAttention.shared.registrySnapshot(rows, profile: profile)
+        #endif
         // Lock Screen progress of a turn that ended unseen (#605).
         if liveTurnActivitiesRegistrySnapshot(Self.liveTurnSessionIDs(rows), profile, activeDashboardID?.uuidString) {
             scheduleLiveTurnRegistryRecheck()
@@ -25990,11 +25994,11 @@ final class AppState: ObservableObject {
     /// Apple Health sharing with one Hermes profile.
     /// Off until the user turns it on in Settings > Health.
     @Published var healthSyncPreferences = HealthSyncPreferences.load()
-    lazy var healthSync = HealthSyncEngine(source: HealthKitDataSource(), deviceName: { UIDevice.current.name })
+    lazy var healthSync = HealthSyncEngine(source: HealthKitDataSource(), deviceName: { UIDevice.current.conduitName })
     /// Calendar, Reminders, Focus and phone status shared with one Hermes
     /// profile, and the calendar changes Hermes asks for (AppState+PhoneSync).
     lazy var phoneSync = PhoneSyncEngine(calendarSource: EventKitPhoneSource(), statusSource: DevicePhoneStatusSource(),
-                                         deviceName: { UIDevice.current.name })
+                                         deviceName: { UIDevice.current.conduitName })
 
     /// The dashboard|version update notices the user closed with Not now
     /// (AppState+NotifierPluginUpdate.swift).
@@ -33648,6 +33652,10 @@ final class AppState: ObservableObject {
         // Voice background jobs are not the active conversation, so they
         // observe every event before the active-session filter below.
         voiceBackgroundJobSupervisor.observe(event)
+        #if targetEnvironment(macCatalyst)
+        // Conduit for Mac's own notifications, for any chat on this socket.
+        MacAttention.shared.streamEvent(event, sessionID: sessionID(for: event))
+        #endif
         // A Local Live call's reply streams back to the speech server.
         if isLocalLiveActive { localLiveTurns.observe(event) }
         notePresentedCardEvent(event)
@@ -37898,7 +37906,12 @@ enum KeychainHelper {
         }
     }
 
+    #if targetEnvironment(macCatalyst)
+    /// The Mac build has no keychain it can reach (KeychainFileBackend.swift).
+    nonisolated(unsafe) private(set) static var backend: Backend = FileBackend.shared
+    #else
     nonisolated(unsafe) private(set) static var backend: Backend = SystemKeychainBackend()
+    #endif
 
     /// Swaps the backend (tests). Not thread-safe by design: XCTest suites
     /// run serially within a simulator, and the swap is restored in teardown.

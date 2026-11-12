@@ -18,6 +18,10 @@
 //  Files are readable after first unlock (background wakes and the
 //  extension run on a locked phone) and excluded from backups.
 //
+//  The Mac build (scripts/mac-catalyst) has no App Group or extension: it
+//  keeps the files in its own container and the two items in KeychainHelper's
+//  store (KeychainFileBackend.swift).
+//
 
 import Foundation
 import OSLog
@@ -26,8 +30,13 @@ import Security
 enum LocationSharedStore {
     private static let log = Logger(subsystem: "com.milim.relay", category: "location")
     static var folder: URL? {
+        #if targetEnvironment(macCatalyst)
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first?
+            .appendingPathComponent("Location", isDirectory: true)
+        #else
         FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: NotificationE2E.appGroup)?
             .appendingPathComponent("Location", isDirectory: true)
+        #endif
     }
 
     // MARK: Config
@@ -232,6 +241,41 @@ enum LocationKeychain {
 
     static func clearHostPass() { delete(account: hostPassAccount) }
 
+    #if targetEnvironment(macCatalyst)
+    // The Mac build can't reach a keychain (KeychainFileBackend.swift): its
+    // items go where KeychainHelper keeps the app's own.
+    private static func query(account: String) -> [String: Any] {
+        [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+        ]
+    }
+
+    private static func load(account: String) -> Data? {
+        KeychainHelper.backend.data(for: query(account: account))
+    }
+
+    private static func save(_ data: Data, account: String) -> Bool {
+        let query = query(account: account)
+        var status = KeychainHelper.backend.update(data, for: query)
+        if status == errSecItemNotFound {
+            var insert = query
+            insert[kSecValueData as String] = data
+            insert[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+            status = KeychainHelper.backend.add(insert)
+        }
+        guard status == errSecSuccess else {
+            log.error("Location Keychain save for \(account, privacy: .public) failed: \(status, privacy: .public)")
+            return false
+        }
+        return true
+    }
+
+    private static func delete(account: String) {
+        KeychainHelper.backend.delete(query(account: account))
+    }
+    #else
     private static func query(account: String) -> [String: Any] {
         [
             kSecClass as String: kSecClassGenericPassword,
@@ -269,4 +313,5 @@ enum LocationKeychain {
     private static func delete(account: String) {
         SecItemDelete(query(account: account) as CFDictionary)
     }
+    #endif
 }

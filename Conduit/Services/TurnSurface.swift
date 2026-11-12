@@ -46,7 +46,7 @@ struct TurnSurface: Equatable {
 
     /// The device this app runs on.
     @MainActor static var device: Place {
-        if ProcessInfo.processInfo.isiOSAppOnMac { return .mac }
+        if ProcessInfo.processInfo.runsOnMac { return .mac }
         switch UIDevice.current.userInterfaceIdiom {
         case .pad: return .ipad
         case .vision: return .vision

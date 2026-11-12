@@ -172,6 +172,7 @@ enum LiveTurnProgress {
     }
 }
 
+#if !targetEnvironment(macCatalyst)
 /// The Live Activities of turns Conduit sent (#605): started when a prompt
 /// is accepted, updated from the chat's stream while Conduit runs, and kept
 /// current by the notifier plugin through the relay once Conduit is in the
@@ -180,9 +181,6 @@ enum LiveTurnProgress {
 @MainActor
 final class LiveTurnActivities {
     static let shared = LiveTurnActivities()
-    /// Settings > Notifications "Progress on the Lock Screen"; on unless
-    /// turned off.
-    nonisolated static let enabledDefaultsKey = "conduit.liveActivities.enabled"
     /// An activity nobody updated for this long reads as out of date.
     static let staleAfter: TimeInterval = 15 * 60
     /// A finished turn stays on the Lock Screen this long.
@@ -210,13 +208,6 @@ final class LiveTurnActivities {
     /// How long after a turn starts an idle `session.busy` / `session.info`
     /// is not taken as its end.
     static let idleSignalGrace: TimeInterval = 5
-    /// How long after a turn starts the live registry's word that its chat
-    /// isn't running is not taken as its end.
-    nonisolated static let registryGrace: TimeInterval = 30
-    /// How long a chat must stay out of the live registry before its turn
-    /// is taken as over: two of the chat list's 4-second poll intervals, so
-    /// the third absent snapshot in a row ends it.
-    nonisolated static let registryAbsenceSpan: TimeInterval = 8
 
     private var running: [String: Running] = [:]
     private var registryAbsences = LiveTurnProgress.RegistryAbsences()
@@ -445,24 +436,6 @@ final class LiveTurnActivities {
         }
     }
 
-    /// Whether `endTurns(ofDashboard:)` ends an activity. Another
-    /// dashboard's activities stay, except one started by a build before
-    /// `dashboardID`: naming no dashboard, it ends whichever dashboard this
-    /// is. That only holds through the upgrade, until the system has ended
-    /// those older activities. With `keepingThoseOnRelay`, one whose token
-    /// the relay installation still in use took stays too.
-    nonisolated static func endsTurn(
-        activityDashboardID: String?,
-        tokenInstallationID: String?,
-        ofDashboard dashboardID: String?,
-        keepingThoseOnRelay: Bool,
-        currentInstallationID: String?
-    ) -> Bool {
-        if let own = activityDashboardID, own != dashboardID { return false }
-        if keepingThoseOnRelay, let tokenInstallationID, tokenInstallationID == currentInstallationID { return false }
-        return true
-    }
-
     /// Lock Screen progress was turned off: every activity goes.
     func endAll() {
         adoptExisting()
@@ -481,17 +454,6 @@ final class LiveTurnActivities {
     /// from an older build): ids from another workspace say nothing here.
     nonisolated static func sessionIDs(linkedTo id: String, profile: String, dashboardID: String?) -> [String] {
         sessionIDs(linkedTo: id, profile: profile, dashboardID: dashboardID, in: Activity<HermesTurnAttributes>.activities.map(\.attributes))
-    }
-
-    nonisolated static func sessionIDs(linkedTo id: String, profile: String, dashboardID: String?, in cards: [HermesTurnAttributes]) -> [String] {
-        guard !id.isEmpty else { return [] }
-        return cards.filter { card in
-            guard case .session(let linked, let own, _)? = ConduitAppLink(url: card.link), linked == id else { return false }
-            if let own, own.trimmingCharacters(in: .whitespacesAndNewlines)
-                .caseInsensitiveCompare(profile.trimmingCharacters(in: .whitespacesAndNewlines)) != .orderedSame { return false }
-            if let owner = card.dashboardID, owner != dashboardID { return false }
-            return true
-        }.flatMap { $0.sessionIDs.filter { $0 != id } }
     }
 
     /// Activities a previous run of Conduit started are taken over, so the
@@ -601,12 +563,6 @@ final class LiveTurnActivities {
         running[id]?.tokenInstallationID = installationID
     }
 
-    /// Whether an activity's token still has to reach the relay: it has
-    /// one, and no relay installation took it yet.
-    nonisolated static func needsRegistration(pushToken: String?, tokenInstallationID: String?) -> Bool {
-        pushToken != nil && tokenInstallationID == nil
-    }
-
     /// Conduit is back on screen: an activity whose registration didn't
     /// reach the relay (no network, or Conduit was suspended first) tries
     /// again. One whose turn ended meanwhile is ended by the relay at once.
@@ -642,5 +598,82 @@ final class LiveTurnActivities {
                 await PushNotificationService.shared.unregisterLiveActivity(token: token)
             }
         }
+    }
+}
+#else
+/// Mac Catalyst has no Live Activities (ActivityKit's `Activity` is
+/// unavailable there), so the Mac build keeps the calls the chat makes and
+/// does nothing with them.
+@MainActor
+final class LiveTurnActivities {
+    static let shared = LiveTurnActivities()
+
+    private init() {}
+
+    func turnSubmitting(sessionIDs: Set<String>) {}
+
+    func turnStarted(sessionIDs: Set<String>, primaryID: String, linkID: String? = nil, title: String, profile: String?, profileName: String? = nil, glowHex: String? = nil, dashboardID: String? = nil) {}
+
+    func observe(_ event: StreamEvent, sessionID: String) {}
+
+    @discardableResult
+    func reconcile(liveSessionIDs: Set<String>, profile: String, dashboardID: String?, now: Date = Date()) -> Bool { false }
+
+    func endTurns(ofDashboard dashboardID: String?, keepingThoseOnRelay: Bool = false) {}
+
+    func endAll() {}
+
+    func adoptExisting() {}
+
+    /// No cards on a Mac link to anything.
+    nonisolated static func sessionIDs(linkedTo id: String, profile: String, dashboardID: String?) -> [String] { [] }
+}
+#endif
+
+extension LiveTurnActivities {
+    /// Settings > Notifications "Progress on the Lock Screen"; on unless
+    /// turned off.
+    nonisolated static let enabledDefaultsKey = "conduit.liveActivities.enabled"
+    /// How long after a turn starts the live registry's word that its chat
+    /// isn't running is not taken as its end.
+    nonisolated static let registryGrace: TimeInterval = 30
+    /// How long a chat must stay out of the live registry before its turn
+    /// is taken as over: two of the chat list's 4-second poll intervals, so
+    /// the third absent snapshot in a row ends it.
+    nonisolated static let registryAbsenceSpan: TimeInterval = 8
+
+    /// Whether `endTurns(ofDashboard:)` ends an activity. Another
+    /// dashboard's activities stay, except one started by a build before
+    /// `dashboardID`: naming no dashboard, it ends whichever dashboard this
+    /// is. That only holds through the upgrade, until the system has ended
+    /// those older activities. With `keepingThoseOnRelay`, one whose token
+    /// the relay installation still in use took stays too.
+    nonisolated static func endsTurn(
+        activityDashboardID: String?,
+        tokenInstallationID: String?,
+        ofDashboard dashboardID: String?,
+        keepingThoseOnRelay: Bool,
+        currentInstallationID: String?
+    ) -> Bool {
+        if let own = activityDashboardID, own != dashboardID { return false }
+        if keepingThoseOnRelay, let tokenInstallationID, tokenInstallationID == currentInstallationID { return false }
+        return true
+    }
+
+    nonisolated static func sessionIDs(linkedTo id: String, profile: String, dashboardID: String?, in cards: [HermesTurnAttributes]) -> [String] {
+        guard !id.isEmpty else { return [] }
+        return cards.filter { card in
+            guard case .session(let linked, let own, _)? = ConduitAppLink(url: card.link), linked == id else { return false }
+            if let own, own.trimmingCharacters(in: .whitespacesAndNewlines)
+                .caseInsensitiveCompare(profile.trimmingCharacters(in: .whitespacesAndNewlines)) != .orderedSame { return false }
+            if let owner = card.dashboardID, owner != dashboardID { return false }
+            return true
+        }.flatMap { $0.sessionIDs.filter { $0 != id } }
+    }
+
+    /// Whether an activity's token still has to reach the relay: it has
+    /// one, and no relay installation took it yet.
+    nonisolated static func needsRegistration(pushToken: String?, tokenInstallationID: String?) -> Bool {
+        pushToken != nil && tokenInstallationID == nil
     }
 }

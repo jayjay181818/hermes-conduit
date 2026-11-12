@@ -14,8 +14,13 @@ struct WidgetSnapshotStore {
     }
 
     static var production: WidgetSnapshotStore? {
+        #if targetEnvironment(macCatalyst)
+        // The Mac build (scripts/mac-catalyst) has no widgets or App Group.
+        return nil
+        #else
         guard let directory = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroup) else { return nil }
         return WidgetSnapshotStore(directory: directory)
+        #endif
     }
 
     func read() -> WidgetSnapshot? {

@@ -375,5 +375,5 @@ final class SyncedPreferencesController: ObservableObject {
     }
 
     /// The name and id the host shows next to each value.
-    static var deviceName: String { UIDevice.current.name }
+    static var deviceName: String { UIDevice.current.conduitName }
 }

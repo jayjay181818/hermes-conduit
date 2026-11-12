@@ -175,7 +175,7 @@ struct BotCapabilitiesView: View {
             }
             Spacer(minLength: 8)
             if mcpBusy == entry.name {
-                ProgressView()
+                busyIndicator
             } else {
                 Button(AppLocalization.string("Add")) {
                     if entry.requires.isEmpty {
@@ -191,6 +191,19 @@ struct BotCapabilitiesView: View {
         }
     }
 
+    /// Working on a server. On a Mac its sign-in page is in the browser,
+    /// with no Done here to give it up: Cancel does.
+    @ViewBuilder
+    private var busyIndicator: some View {
+        ProgressView()
+        #if targetEnvironment(macCatalyst)
+        if signInTask != nil {
+            Button(AppLocalization.string("Cancel")) { signInTask?.cancel() }
+                .buttonStyle(.borderless)
+        }
+        #endif
+    }
+
     private func signInRow(_ name: String) -> some View {
         HStack {
             Text(AppLocalization.string("Needs a sign-in to connect."))
@@ -198,7 +211,7 @@ struct BotCapabilitiesView: View {
                 .foregroundStyle(.secondary)
             Spacer(minLength: 8)
             if mcpBusy == name {
-                ProgressView()
+                busyIndicator
             } else {
                 Button(AppLocalization.string("Sign In")) { signIn(name) }
                     .buttonStyle(.borderless)
@@ -244,7 +257,15 @@ struct BotCapabilitiesView: View {
         mcpNotice = nil
         signInTask = Task {
             let outcome = await appState.signInBotMcpServer(profile: mcpProfile, name: name) { url in
+                #if targetEnvironment(macCatalyst)
+                // Safari's view on a Mac hands the page to the default
+                // browser and closes at once, which would give the sign-in
+                // up: the browser opens it, and the flow waits for its
+                // callback to this Mac.
+                UIApplication.shared.open(url)
+                #else
                 browser = BotMcpBrowserPage(url: url)
+                #endif
             }
             browser = nil
             mcpBusy = nil

@@ -4,7 +4,8 @@ import XCTest
 
 final class SecurityBoundaryTests: XCTestCase {
     func testAppTransportSecurityAllowsLocalNetworkingAndTailscale() throws {
-        let appInfo = try XCTUnwrap(Bundle(identifier: "com.milim.relay")?.infoDictionary)
+        // The app's bundle under any bundle id (Conduit for Mac has its own).
+        let appInfo = try XCTUnwrap(Bundle(for: AppState.self).infoDictionary)
         let appTransportSecurity = try XCTUnwrap(
             appInfo["NSAppTransportSecurity"] as? [String: Any]
         )

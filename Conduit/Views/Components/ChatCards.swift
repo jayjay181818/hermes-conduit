@@ -21,7 +21,7 @@ struct ChatPlanDock: View {
     /// (issue 1510).
     static func keepsToLine(
         composerFocused: Bool,
-        onMac: Bool = ProcessInfo.processInfo.isiOSAppOnMac,
+        onMac: Bool = ProcessInfo.processInfo.runsOnMac,
         hardwareKeyboard: Bool = GCKeyboard.coalesced != nil
     ) -> Bool {
         composerFocused && !onMac && !hardwareKeyboard

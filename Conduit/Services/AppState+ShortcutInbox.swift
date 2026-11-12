@@ -107,7 +107,7 @@ extension AppState {
         let queue = ShortcutInboxQueue.standard(scope)
         guard queue.add(event) else { throw ShortcutLogError.notStored }
         guard let request = shortcutInboxRequest(for: scope, deadline: deadline) else { throw ShortcutLogError.notConnected }
-        let sender = ShortcutInboxSender(queue: queue, keys: keys, deviceName: UIDevice.current.name)
+        let sender = ShortcutInboxSender(queue: queue, keys: keys, deviceName: UIDevice.current.conduitName)
         do {
             return .logged(try await Self.shortcutInboxGate.run { try await sender.send(request: request) })
         } catch DashboardTicketBridgeError.http(let status, _) where status == 404 {
@@ -134,7 +134,7 @@ extension AppState {
               let request = shortcutInboxRequest(for: scope, deadline: deadline) else { return }
         let queue = ShortcutInboxQueue.standard(scope)
         guard !queue.pending().isEmpty else { return }
-        let sender = ShortcutInboxSender(queue: queue, keys: .keychain(scope), deviceName: UIDevice.current.name)
+        let sender = ShortcutInboxSender(queue: queue, keys: .keychain(scope), deviceName: UIDevice.current.conduitName)
         do {
             let sent = try await Self.shortcutInboxGate.run { try await sender.send(request: request) }
             Self.shortcutInboxLog.info("Log to Hermes sent \(sent) waiting events on connect")

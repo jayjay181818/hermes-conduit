@@ -79,6 +79,7 @@ struct DashboardCodeScannerSheet: View {
                 ProgressView()
                     .tint(.white)
             case .allowed:
+                #if !targetEnvironment(macCatalyst)
                 DashboardCodeScanner { text in
                     if onScan(text) { return }
                     showsUnreadable = true
@@ -91,6 +92,7 @@ struct DashboardCodeScannerSheet: View {
                 .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
                 .accessibilityLabel(AppLocalization.string("Scan Code"))
                 .accessibilityHint(AppLocalization.string("Point the camera at the code Hermes shows. For an address shown as text, tap it."))
+                #endif
             case .denied:
                 cameraNotice(
                     AppLocalization.string("Scanning a code needs camera access. You can allow it in Settings."),
@@ -144,6 +146,10 @@ struct DashboardCodeScannerSheet: View {
     /// Asks for the camera first when it hasn't been decided, so the
     /// scanner never opens on a black screen.
     private func checkAccess() async {
+        #if targetEnvironment(macCatalyst)
+        // VisionKit's live scanner is unavailable on a Mac.
+        access = .unsupported
+        #else
         guard DataScannerViewController.isSupported else {
             access = .unsupported
             return
@@ -157,9 +163,11 @@ struct DashboardCodeScannerSheet: View {
         default:
             access = .denied
         }
+        #endif
     }
 }
 
+#if !targetEnvironment(macCatalyst)
 /// VisionKit's live scanner: a QR code is taken as soon as it is seen; a
 /// URL in text waits for a tap, so a half-read line is never used.
 struct DashboardCodeScanner: UIViewControllerRepresentable {
@@ -238,3 +246,4 @@ struct DashboardCodeScanner: UIViewControllerRepresentable {
         }
     }
 }
+#endif

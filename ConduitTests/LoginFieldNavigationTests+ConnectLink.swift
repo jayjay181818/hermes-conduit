@@ -62,12 +62,18 @@ extension LoginFieldNavigationTests {
     }
 
     func testOnlyLoopbackAddressesAreRefusedAsHermesOwn() {
-        XCTAssertTrue(LoginAddress.isOnlyOnHermesComputer("localhost:9119"))
-        XCTAssertTrue(LoginAddress.isOnlyOnHermesComputer("http://127.0.0.1:9119"))
-        XCTAssertTrue(LoginAddress.isOnlyOnHermesComputer("127.0.1.1:9119"))
-        XCTAssertFalse(LoginAddress.isOnlyOnHermesComputer("mac.tailnet.ts.net:9119"))
-        XCTAssertFalse(LoginAddress.isOnlyOnHermesComputer("192.168.1.28:9119"))
-        XCTAssertFalse(LoginAddress.isOnlyOnHermesComputer("https://hermes.example"))
+        XCTAssertTrue(LoginAddress.isOnlyOnHermesComputer("localhost:9119", onMac: false))
+        XCTAssertTrue(LoginAddress.isOnlyOnHermesComputer("http://127.0.0.1:9119", onMac: false))
+        XCTAssertTrue(LoginAddress.isOnlyOnHermesComputer("127.0.1.1:9119", onMac: false))
+        XCTAssertFalse(LoginAddress.isOnlyOnHermesComputer("mac.tailnet.ts.net:9119", onMac: false))
+        XCTAssertFalse(LoginAddress.isOnlyOnHermesComputer("192.168.1.28:9119", onMac: false))
+        XCTAssertFalse(LoginAddress.isOnlyOnHermesComputer("https://hermes.example", onMac: false))
+    }
+
+    func testAMacSignsInToLoopbackAddresses() {
+        // Conduit on a Mac may be on Hermes' own computer.
+        XCTAssertFalse(LoginAddress.isOnlyOnHermesComputer("localhost:9119", onMac: true))
+        XCTAssertFalse(LoginAddress.isOnlyOnHermesComputer("http://127.0.0.1:9119", onMac: true))
     }
 
     func testSignInCodePromptDescribesTheLink() {

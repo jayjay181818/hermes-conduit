@@ -59,6 +59,10 @@ final class ConduitAppDelegate: NSObject, UIApplicationDelegate, UNUserNotificat
             // Lock Screen progress of a turn sent before a relaunch (#605):
             // the chat's stream can still update and end it.
             LiveTurnActivities.shared.adoptExisting()
+            #if targetEnvironment(macCatalyst)
+            // No pushes on a Mac: Conduit posts its own while it runs.
+            MacAttention.shared.start(appState: AppStateRuntimeRegistry.shared.appState)
+            #endif
             // Hermes dictations whose words never came, from this run's
             // predecessor too: offered in the composer for Retry.
             Task { await DictationClipInbox.shared.load() }
@@ -194,6 +198,16 @@ final class ConduitAppDelegate: NSObject, UIApplicationDelegate, UNUserNotificat
             }
             return
         }
+        #if targetEnvironment(macCatalyst)
+        // One Conduit for Mac posted itself (MacAttention): open its chat.
+        if let target = MacAttention.target(from: request) {
+            Task { @MainActor in
+                PushNotificationService.shared.routeChatLink(target)
+                completionHandler()
+            }
+            return
+        }
+        #endif
         Task { @MainActor in
             if AppState.isPhoneChangesPush(request.content.userInfo) {
                 // A calendar change Hermes asked for: its card shows once fetched.
@@ -257,6 +271,14 @@ final class ConduitAppDelegate: NSObject, UIApplicationDelegate, UNUserNotificat
             completionHandler([.banner, .list, .sound])
             return
         }
+        #if targetEnvironment(macCatalyst)
+        // Conduit for Mac posts these only while it isn't the app in use.
+        if notification.request.identifier.hasPrefix(MacAttention.identifierPrefix),
+           !(notification.request.trigger is UNPushNotificationTrigger) {
+            completionHandler([.banner, .list, .sound])
+            return
+        }
+        #endif
         completionHandler([])
     }
 }

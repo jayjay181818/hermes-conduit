@@ -59,7 +59,7 @@ func modelSearchHighlight(_ index: Int, moving step: Int, count: Int) -> Int {
 /// with a hardware keyboard, where typing comes first. A touch-only phone
 /// keeps its keyboard down, since the sheet is often opened for reasoning.
 func modelSearchFocusesOnOpen(
-    onMac: Bool = ProcessInfo.processInfo.isiOSAppOnMac,
+    onMac: Bool = ProcessInfo.processInfo.runsOnMac,
     hardwareKeyboard: Bool = GCKeyboard.coalesced != nil
 ) -> Bool {
     onMac || hardwareKeyboard

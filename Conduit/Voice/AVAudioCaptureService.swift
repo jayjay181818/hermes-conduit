@@ -4,6 +4,11 @@
 //
 
 import AVFAudio
+// UnsafeMutableAudioBufferListPointer: AVFAudio brings CoreAudio's Swift
+// overlay along on iOS, not on Mac Catalyst.
+#if targetEnvironment(macCatalyst)
+import CoreAudio
+#endif
 import Foundation
 import OSLog
 import os

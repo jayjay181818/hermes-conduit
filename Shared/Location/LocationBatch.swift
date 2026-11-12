@@ -183,7 +183,13 @@ struct LocationBatch {
     var spotEntries: [LocationSpotEntry]?
     var spotsRoom: Int?
 
+    #if targetEnvironment(macCatalyst)
+    /// The Mac build has no Location Push extension to answer the host's
+    /// maps requests with.
+    static let phoneFeatures: [String] = []
+    #else
     static let phoneFeatures = ["maps"]
+    #endif
 
     func json() -> [String: Any] {
         let formatter = LocationTime.formatter(timeZone: timeZone)

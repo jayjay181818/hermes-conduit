@@ -1089,9 +1089,15 @@ extension NotificationE2ETests {
         var settings = LocationSharingSettings()
         settings.background = true
         XCTAssertTrue(settings.mapsHost, "the host may look up maps unless the user keeps them on the iPhone")
+        #if targetEnvironment(macCatalyst)
+        // Conduit for Mac has no Location Push extension to answer them.
+        let answers: [String]? = nil
+        #else
+        let answers: [String]? = ["maps"]
+        #endif
         let batch = LocationBatch(sentAt: LocationFixtures.at, settings: settings)
         var sharing = try XCTUnwrap(batch.json()["sharing"] as? [String: Any])
-        XCTAssertEqual(sharing["features"] as? [String], ["maps"])
+        XCTAssertEqual(sharing["features"] as? [String], answers)
         XCTAssertEqual(sharing["maps_host"] as? Bool, true)
         settings.mapsHost = false
         sharing = try XCTUnwrap(LocationBatch(sentAt: LocationFixtures.at, settings: settings).json()["sharing"] as? [String: Any])
@@ -1116,7 +1122,7 @@ extension NotificationE2ETests {
         var current = old32
         current.mapsRequestKey = Data(count: 32)
         current.mapsAnswerKey = Data(count: 32)
-        XCTAssertEqual(try sealedSharing(current)["features"] as? [String], ["maps"])
+        XCTAssertEqual(try sealedSharing(current)["features"] as? [String], answers)
     }
 
     func testAKeyFromBeforeMapsIsSetUpAgainOnceWhileSharingInTheBackground() async throws {

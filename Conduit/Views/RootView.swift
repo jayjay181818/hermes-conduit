@@ -13,6 +13,10 @@ struct RootView: View {
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.dismissWindow) private var dismissWindow
     @State private var isPrimaryWindow = false
+    #if targetEnvironment(macCatalyst)
+    /// The scene phase last handed to AppState (see onChange(of: scenePhase)).
+    @State private var macHandledPhase: ScenePhase?
+    #endif
 
     var body: some View {
         ZStack {
@@ -80,7 +84,21 @@ struct RootView: View {
             // Only the primary window drives the process-wide lifecycle: a
             // transient duplicate window's .background must never suspend a
             // conversation the primary window still presents.
+            #if targetEnvironment(macCatalyst)
+            // On a Mac the window stays on screen, and in use, while another
+            // app is in front: that .inactive isn't a dip under a system
+            // overlay (which pauses reconnects and freezes the viewport), so
+            // Conduit stays active until the window is hidden or minimized.
+            if newPhase == .inactive { return }
+            // Back from another app: Conduit never left .active, so the
+            // return to the app (health check, catch-up reads) doesn't run
+            // again on every Cmd-Tab.
+            if newPhase == .active, macHandledPhase == .active { return }
+            #endif
             if isPrimaryWindow {
+                #if targetEnvironment(macCatalyst)
+                macHandledPhase = newPhase
+                #endif
                 appState.handleScenePhase(newPhase)
             }
         }

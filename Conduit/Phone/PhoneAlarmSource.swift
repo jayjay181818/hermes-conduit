@@ -13,7 +13,9 @@
 
 import Foundation
 import SwiftUI
-#if canImport(AlarmKit)
+// AlarmKit's module is in the Mac Catalyst SDK, but its types are
+// unavailable there: the Mac build sets no alarms.
+#if canImport(AlarmKit) && !targetEnvironment(macCatalyst)
 import AlarmKit
 #endif
 
@@ -85,7 +87,7 @@ enum PhoneAlarmSources {
         defaults: UserDefaults = .standard,
         hasAlarmKit: Bool? = nil
     ) -> PhoneAlarmSource {
-        #if canImport(AlarmKit)
+        #if canImport(AlarmKit) && !targetEnvironment(macCatalyst)
         if #available(iOS 26.0, *), hasAlarmKit ?? alarmKitLoaded {
             return AlarmKitPhoneSource(defaults: defaults)
         }
@@ -126,7 +128,7 @@ final class UnsupportedPhoneAlarmSource: PhoneAlarmSource {
     func cancel(id: String) throws { throw PhoneAlarmError.unsupported }
 }
 
-#if canImport(AlarmKit)
+#if canImport(AlarmKit) && !targetEnvironment(macCatalyst)
 /// AlarmKit needs a metadata type; Conduit's alarms carry none.
 @available(iOS 26.0, *)
 struct ConduitAlarmMetadata: AlarmMetadata {}

@@ -310,7 +310,7 @@ final class AgentSettingsSync: ObservableObject {
         let answers = results(for: scope)
         let body: [String: Any] = [
             "installation_id": installationID,
-            "device": UIDevice.current.name,
+            "device": UIDevice.current.conduitName,
             "app_version": Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "",
             "mode": mode.rawValue,
             "settings": catalog.map { $0.payload() },

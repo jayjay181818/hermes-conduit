@@ -84,8 +84,10 @@ struct DashboardConnectLink: Identifiable, CustomStringConvertible, CustomDebugS
 extension LoginAddress {
     /// Whether an address names the computer it is typed on (localhost,
     /// 127.x, ::1). In a code Hermes made, that is Hermes' own computer,
-    /// which the phone can't reach that way.
-    static func isOnlyOnHermesComputer(_ typed: String) -> Bool {
+    /// which the phone can't reach that way. Conduit on a Mac can: it may be
+    /// that computer, and an address it can't reach fails as any other.
+    static func isOnlyOnHermesComputer(_ typed: String, onMac: Bool = ProcessInfo.processInfo.runsOnMac) -> Bool {
+        guard !onMac else { return false }
         guard let host = URLComponents(string: bestGuess(typed))?.host?.lowercased()
             .trimmingCharacters(in: CharacterSet(charactersIn: "[]")) else { return false }
         return host == "localhost" || host.hasSuffix(".localhost") || host == "::1" || host == "0.0.0.0"

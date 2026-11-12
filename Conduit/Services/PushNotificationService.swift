@@ -569,7 +569,12 @@ final class PushNotificationService: ObservableObject {
     @Published var preferences = ConduitNotificationPreferences() {
         // The Notification Service Extension decides whether a decrypted
         // push shows its real text; it reads this from the App Group.
-        didSet { NotificationSharedSettings.mirror(preferences) }
+        didSet {
+            NotificationSharedSettings.mirror(preferences)
+            #if targetEnvironment(macCatalyst)
+            Self.saveMacPreferences(preferences, in: keptTaps)
+            #endif
+        }
     }
     /// Relay gateways this iPhone holds an end-to-end encryption key for
     /// (#431). Settings > Notifications marks those pairings encrypted.
@@ -881,12 +886,41 @@ final class PushNotificationService: ObservableObject {
             preferences = saved.preferences
             if needsRelayStamp { persistRegistration() }
         }
+        #if targetEnvironment(macCatalyst)
+        if let saved = Self.loadMacPreferences(from: keptTaps) { preferences = saved }
+        #endif
         NotificationSharedSettings.mirror(preferences)
         NotificationSharedSettings.appLanguage = AppLanguage.current.rawValue
         refreshEncryptionState()
         restoreWaitingTap()
         restoreWaitingPulseQuiet()
     }
+
+    /// False on the Mac build (scripts/mac-catalyst): it is signed to run
+    /// locally, without the push entitlement, so APNs never gives it a
+    /// device token and no relay can reach it. Finish setting up leaves
+    /// notifications out, and Settings > Notifications keeps only what
+    /// Conduit for Mac's own notifications follow (MacAttention).
+    #if targetEnvironment(macCatalyst)
+    static let relayPushesAvailable = false
+
+    /// Conduit for Mac's preferences: with no relay registration to keep
+    /// them in, they are saved on their own, in the app's store (`keptTaps`,
+    /// none in tests).
+    static let macPreferencesKey = "conduit.mac.notificationPreferences"
+
+    private static func loadMacPreferences(from defaults: UserDefaults?) -> ConduitNotificationPreferences? {
+        defaults?.data(forKey: macPreferencesKey)
+            .flatMap { try? JSONDecoder().decode(ConduitNotificationPreferences.self, from: $0) }
+    }
+
+    private static func saveMacPreferences(_ preferences: ConduitNotificationPreferences, in defaults: UserDefaults?) {
+        guard let defaults, let data = try? JSONEncoder().encode(preferences) else { return }
+        defaults.set(data, forKey: macPreferencesKey)
+    }
+    #else
+    static let relayPushesAvailable = true
+    #endif
 
     // MARK: End-to-end encryption (#431)
 

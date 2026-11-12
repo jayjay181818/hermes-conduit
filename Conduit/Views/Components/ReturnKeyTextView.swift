@@ -20,12 +20,12 @@ class ReturnKeyTextView: UITextView {
 
     override init(frame: CGRect, textContainer: NSTextContainer?) {
         super.init(frame: frame, textContainer: textContainer)
-        inlinePredictionType = Self.inlinePredictionType(onMac: ProcessInfo.processInfo.isiOSAppOnMac)
+        inlinePredictionType = Self.inlinePredictionType(onMac: ProcessInfo.processInfo.runsOnMac)
     }
 
     required init?(coder: NSCoder) {
         super.init(coder: coder)
-        inlinePredictionType = Self.inlinePredictionType(onMac: ProcessInfo.processInfo.isiOSAppOnMac)
+        inlinePredictionType = Self.inlinePredictionType(onMac: ProcessInfo.processInfo.runsOnMac)
     }
 
     /// On a Mac, macOS shows an inline prediction in a correction panel that

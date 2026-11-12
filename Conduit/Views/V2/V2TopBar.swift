@@ -129,12 +129,12 @@ extension View {
 }
 
 /// Whether bars use the system's scroll edge (iOS 26's `safeAreaBar`).
-/// Not when the iPad app runs on a Mac (`isiOSAppOnMac`; Conduit ships no
-/// Catalyst build): there, at some window sizes, a chat's composer bar drew
-/// a hard edge well above the composer and hid the transcript under it
-/// (#1357), so bars keep Conduit's own inset and fade.
+/// Not on a Mac (`runsOnMac`: the iPad app there or the Mac Catalyst
+/// build, both UIKit on macOS): there, at some window sizes, a chat's
+/// composer bar drew a hard edge well above the composer and hid the
+/// transcript under it (#1357), so bars keep Conduit's own inset and fade.
 enum V2SystemScrollEdge {
-    static let isUsed = !ProcessInfo.processInfo.isiOSAppOnMac
+    static let isUsed = !ProcessInfo.processInfo.runsOnMac
 }
 
 /// Before iOS 26, and on a Mac, a bar over the content's edge, with the

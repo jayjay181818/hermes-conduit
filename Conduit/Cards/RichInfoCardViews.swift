@@ -896,7 +896,13 @@ final class RichStepsMemory: ObservableObject {
                 let center = UNUserNotificationCenter.current()
                 switch await center.notificationSettings().authorizationStatus {
                 case .notDetermined:
+                    #if targetEnvironment(macCatalyst)
+                    // Conduit for Mac's only prompt may be this one: it
+                    // covers its Dock badge too (MacAttention).
+                    return (try? await center.requestAuthorization(options: [.alert, .sound, .badge])) ?? false
+                    #else
                     return (try? await center.requestAuthorization(options: [.alert, .sound])) ?? false
+                    #endif
                 case .authorized, .provisional, .ephemeral:
                     return true
                 default:

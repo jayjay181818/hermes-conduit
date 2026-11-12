@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Conduit for Mac (scripts/mac-catalyst-build.sh). Signed to run locally, so
+  only App Sandbox entitlements, which need no team or provisioning profile.
+  The sandbox gives Conduit its own container, as on iOS: its caches, saved
+  chats and credentials (KeychainFileBackend.swift) stay out of ~/Documents
+  and ~/Library.
+-->
+<plist version="1.0">
+<dict>
+    <key>com.apple.security.app-sandbox</key>
+    <true/>
+    <!-- The hardened runtime only loads libraries signed by the app's own
+         team, and a build signed to run locally has none: without this the
+         embedded WebRTC.framework (signed the same way) is refused at launch.
+         The runtime's other protections stay on. -->
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+    <!-- The Hermes dashboard, its WebSocket, voice providers. -->
+    <key>com.apple.security.network.client</key>
+    <true/>
+    <!-- Native OAuth's loopback redirect listens on 127.0.0.1 (NativeOAuth.swift). -->
+    <key>com.apple.security.network.server</key>
+    <true/>
+    <!-- Voice calls, dictation, wake phrases. -->
+    <key>com.apple.security.device.audio-input</key>
+    <true/>
+    <!-- The composer's Camera: a photo for a chat (CameraCapture.swift). -->
+    <key>com.apple.security.device.camera</key>
+    <true/>
+    <!-- Attachments picked, dropped or saved by the user. -->
+    <key>com.apple.security.files.user-selected.read-write</key>
+    <true/>
+    <!-- Opt-in sharing with Hermes, each still behind its macOS prompt. -->
+    <key>com.apple.security.personal-information.location</key>
+    <true/>
+    <key>com.apple.security.personal-information.calendars</key>
+    <true/>
+    <key>com.apple.security.personal-information.addressbook</key>
+    <true/>
+</dict>
+</plist>

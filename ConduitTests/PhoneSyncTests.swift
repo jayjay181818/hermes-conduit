@@ -937,10 +937,15 @@ extension HermesVoiceGatewayTimeoutTests {
         XCTAssertEqual(source.alarms(now: Date(), calendar: .current)?.count, 0)
         // The symbol check finds AlarmKit where it is, or alarms would be
         // off everywhere.
+        #if targetEnvironment(macCatalyst)
+        // Conduit for Mac leaves AlarmKit out: its types are unavailable.
+        XCTAssertFalse(PhoneAlarmSources.system().isSupported)
+        #else
         if #available(iOS 26.0, *) {
             XCTAssertTrue(PhoneAlarmSources.alarmKitLoaded)
             XCTAssertTrue(PhoneAlarmSources.system().isSupported)
         }
+        #endif
     }
 
     func testPhoneAlarmsAndPeopleSyncAndApply() async throws {

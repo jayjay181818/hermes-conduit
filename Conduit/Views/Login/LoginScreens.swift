@@ -154,6 +154,8 @@ struct LoginAddressStep: View {
                 .tint(.conduitAccent)
                 .accessibilityIdentifier("\(prefix).paste")
                 // A sign-in code from Hermes, or an address on another screen.
+                // Not on a Mac: VisionKit's live scanner is unavailable there.
+                #if !targetEnvironment(macCatalyst)
                 Button {
                     Haptics.selection()
                     focusedField = nil
@@ -166,6 +168,7 @@ struct LoginAddressStep: View {
                 .tint(.conduitAccent)
                 .disabled(flow.isWorking)
                 .accessibilityIdentifier("\(prefix).scan")
+                #endif
             }
             .padding(.top, 2)
         }

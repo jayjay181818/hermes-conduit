@@ -373,8 +373,11 @@ struct VoiceSettingsView: View {
                             AgentSettingsModeSection(onChange: agentSettingsChanged)
                         }
                         wakeSection
+                        // No CarPlay or Apple Watch app in the Mac build.
+                        #if !targetEnvironment(macCatalyst)
                         CarPlaySettingsSection()
                         WatchSettingsSection()
+                        #endif
                         readAloudSection
                         DictationSettingsSection()
                         advancedSection
@@ -525,7 +528,7 @@ struct VoiceSettingsView: View {
                 AppLocalization.string("Microphone"),
                 detail: AppLocalization.string("Not allowed. Allow the microphone for Conduit in iPhone Settings."),
                 state: .attention,
-                fix: (label: AppLocalization.string("Open Settings"), action: openSystemSettings)
+                fix: (label: AppLocalization.string("Open Settings"), action: { PrivacySettingsLink.open(.microphone) })
             )
         default:
             return setupStep(AppLocalization.string("Microphone"), detail: AppLocalization.string("iOS asks the first time you talk."), state: .pending)
@@ -550,7 +553,7 @@ struct VoiceSettingsView: View {
                     title,
                     detail: AppLocalization.string("Speech Recognition isn't allowed. Allow it for Conduit in iPhone Settings, or choose a Hermes provider under Speech to text below."),
                     state: .attention,
-                    fix: (label: AppLocalization.string("Open Settings"), action: openSystemSettings)
+                    fix: (label: AppLocalization.string("Open Settings"), action: { PrivacySettingsLink.open(.speechRecognition) })
                 )
             case .unsupported:
                 return setupStep(
@@ -1756,11 +1759,6 @@ struct VoiceSettingsView: View {
         if let descriptor = providers.first(where: { $0.descriptor.id == id })?.descriptor { return descriptor.displayName }
         if let descriptor = VoiceConfigurationParser.catalogDescriptor(id: id, kind: kind) { return descriptor.displayName }
         return id.isEmpty ? AppLocalization.string("Not chosen") : id.replacingOccurrences(of: "_", with: " ").capitalized
-    }
-
-    private func openSystemSettings() {
-        guard let url = URL(string: UIApplication.openSettingsURLString) else { return }
-        UIApplication.shared.open(url)
     }
 
     private func load() async {

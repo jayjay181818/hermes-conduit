@@ -20,7 +20,7 @@ enum ComposerLayout {
     static func staysExpanded(
         width: CGFloat,
         idiom: UIUserInterfaceIdiom = UIDevice.current.userInterfaceIdiom,
-        onMac: Bool = ProcessInfo.processInfo.isiOSAppOnMac
+        onMac: Bool = ProcessInfo.processInfo.runsOnMac
     ) -> Bool {
         if onMac { return true }
         guard idiom != .phone else { return false }
@@ -32,7 +32,7 @@ enum ComposerLayout {
     /// hardware keyboard. With only the on-screen keyboard it goes down, so
     /// the reply has the screen.
     static func keepsFocusAfterSend(
-        onMac: Bool = ProcessInfo.processInfo.isiOSAppOnMac,
+        onMac: Bool = ProcessInfo.processInfo.runsOnMac,
         hardwareKeyboard: Bool = GCKeyboard.coalesced != nil
     ) -> Bool {
         onMac || hardwareKeyboard

@@ -127,7 +127,10 @@ struct LocationSettingsPage: View {
                 placesSection
                 if settings.isOn { pauseSection }
                 retentionSection
+                // A Mac answers no maps lookups (LocationBatch.phoneFeatures).
+                #if !targetEnvironment(macCatalyst)
                 mapsSection
+                #endif
                 if settings.isOn, controller.binding != nil, pluginSharesProfiles || settings.otherProfiles { profilesSection }
             }
             // Kept while a mode is allowed, even on an older plugin, so it can
@@ -305,8 +308,7 @@ struct LocationSettingsPage: View {
 
     private var openSettingsButton: some View {
         Button(AppLocalization.string("Open Settings")) {
-            guard let url = URL(string: UIApplication.openSettingsURLString) else { return }
-            UIApplication.shared.open(url)
+            PrivacySettingsLink.open(.location)
         }
         .scaledFont(.subheadline)
     }
