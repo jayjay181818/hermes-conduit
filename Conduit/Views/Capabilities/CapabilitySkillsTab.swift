@@ -65,7 +65,7 @@ struct CapabilitySkillsTab: View {
         }) {
             if installed.isEmpty && available.isEmpty && !store.officialSkillsLoading && !store.officialSkillsFailed {
                 CapabilityEmptyState(
-                    title: query.isEmpty ? AppLocalization.string("No skills yet") : AppLocalization.string("No matching skills"),
+                    title: query.isEmpty ? AppLocalization.string("No skills yet", table: .bots) : AppLocalization.string("No matching skills"),
                     symbol: "puzzlepiece.extension",
                     message: query.isEmpty ? nil : AppLocalization.string("Nothing matches “\(query)”.")
                 )
@@ -98,15 +98,20 @@ struct CapabilitySkillsTab: View {
                     }
                 }
             }
+            if let updates = store.hubSkillUpdates {
+                HubSkillUpdatesCard(state: updates, updating: store.skillsUpdate == .running, canUpdate: appState.canChangeCapabilities) {
+                    updateHubSkills()
+                }
+            }
             if case .failed(let reason) = store.skillsUpdate {
-                Text(verbatim: AppLocalization.string("Updating hub skills failed: \(reason)"))
+                Text(verbatim: AppLocalization.string("Updating hub skills failed: \(reason)", table: .bots))
                     .scaledFont(.caption)
                     .foregroundStyle(.red)
                     .frame(maxWidth: .infinity)
             }
             if available.isEmpty, store.officialSkillsLoading || store.officialSkillsFailed {
                 CapabilitySection(
-                    title: AppLocalization.string("Available to install"),
+                    title: AppLocalization.string("Available to install", table: .bots),
                     symbol: "arrow.down.circle",
                     tint: .conduitAura
                 ) {
@@ -125,10 +130,10 @@ struct CapabilitySkillsTab: View {
                 let chosen = availableCategory
                 let groups = CapabilitySkillOrdering.grouped(available, category: chosen)
                 CapabilitySection(
-                    title: AppLocalization.string("Available to install"),
+                    title: AppLocalization.string("Available to install", table: .bots),
                     symbol: "arrow.down.circle",
                     tint: .conduitAura,
-                    footer: AppLocalization.string("From Hermes' official skills catalog. Hermes scans each skill before it installs.")
+                    footer: AppLocalization.string("From Hermes' official skills catalog. Hermes scans each skill before it installs.", table: .bots)
                 ) {
                     if categories.count > 1 || chosen != nil {
                         categoryMenu(categories, chosen: chosen)
@@ -204,9 +209,16 @@ struct CapabilitySkillsTab: View {
             }
             if appState.skills.contains(where: { $0.provenance == "hub" }) {
                 Button {
+                    Haptics.selection()
+                    Task { await store.checkHubSkillUpdates() }
+                } label: {
+                    Label(AppLocalization.string("Check for Updates"), systemImage: "arrow.down.circle")
+                }
+                .disabled(store.hubSkillUpdates == .checking)
+                Button {
                     updateHubSkills()
                 } label: {
-                    Label(AppLocalization.string("Update Hub Skills"), systemImage: "arrow.triangle.2.circlepath")
+                    Label(AppLocalization.string("Update Hub Skills", table: .bots), systemImage: "arrow.triangle.2.circlepath")
                 }
                 .disabled(store.skillsUpdate == .running || !appState.canChangeCapabilities)
             }
@@ -217,17 +229,17 @@ struct CapabilitySkillsTab: View {
                 Button {
                     setAll(appState.skills, enabled: true)
                 } label: {
-                    Label(AppLocalization.string("Turn All On"), systemImage: "checkmark.circle")
+                    Label(AppLocalization.string("Turn All On", table: .bots), systemImage: "checkmark.circle")
                 }
                 Button {
                     setAll(appState.skills, enabled: false)
                 } label: {
-                    Label(AppLocalization.string("Turn All Off"), systemImage: "circle")
+                    Label(AppLocalization.string("Turn All Off", table: .bots), systemImage: "circle")
                 }
                 Button {
                     setAll(appState.skills.filter { ($0.usage ?? 0) == 0 }, enabled: false)
                 } label: {
-                    Label(AppLocalization.string("Turn Off Unused"), systemImage: "moon.zzz")
+                    Label(AppLocalization.string("Turn Off Unused", table: .bots), systemImage: "moon.zzz")
                 }
             }
             .disabled(appState.capabilitiesAreKept || !appState.canChangeCapabilities)
@@ -271,6 +283,52 @@ struct CapabilitySkillsTab: View {
     }
 }
 
+/// Check for Updates' answer under the installed skills: which hub skills
+/// have a newer version, with Update Hub Skills, or that every one is
+/// current.
+private struct HubSkillUpdatesCard: View {
+    @ObservedObject var appLanguage = AppLanguageStore.shared
+    let state: HubSkillUpdatesState
+    let updating: Bool
+    let canUpdate: Bool
+    let update: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            switch state {
+            case .checking:
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text(AppLocalization.string("Checking the hub for updates…", table: .bots))
+                        .scaledFont(.footnote).foregroundStyle(.secondary)
+                }
+            case .found(let updates) where updates.isEmpty:
+                Label(AppLocalization.string("Hub skills are up to date.", table: .bots), systemImage: "checkmark.circle")
+                    .scaledFont(.footnote).foregroundStyle(.secondary)
+            case .found(let updates):
+                Text(AppLocalization.string("Updates available: \(updates.map(\.name).joined(separator: ", "))", table: .bots))
+                    .scaledFont(.footnote)
+                Button {
+                    update()
+                } label: {
+                    if updating {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Label(AppLocalization.string("Update Hub Skills", table: .bots), systemImage: "arrow.triangle.2.circlepath")
+                    }
+                }
+                .buttonStyle(.settingsPrimary)
+                .disabled(updating || !canUpdate)
+            case .failed(let reason):
+                Text(verbatim: AppLocalization.string("Couldn't check for updates: \(reason)", table: .bots))
+                    .scaledFont(.caption).foregroundStyle(.red)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 4)
+    }
+}
+
 enum CapabilitySkillStyle {
     static func symbol(_ provenance: String?) -> String {
         switch provenance {
@@ -285,8 +343,8 @@ enum CapabilitySkillStyle {
     /// carry nothing, as on Desktop.
     static func provenancePill(_ provenance: String?) -> CapabilityPillModel? {
         switch provenance {
-        case "agent": return CapabilityPillModel(text: AppLocalization.string("Learned"), tint: .green)
-        case "hub": return CapabilityPillModel(text: AppLocalization.string("Hub"))
+        case "agent": return CapabilityPillModel(text: AppLocalization.string("Learned", table: .bots), tint: .green)
+        case "hub": return CapabilityPillModel(text: AppLocalization.string("Hub", table: .bots))
         default: return nil
         }
     }
@@ -474,13 +532,13 @@ struct CapabilitySkillDetailPage: View {
                     Text("Removing…")
                 }
             } else {
-                Label(AppLocalization.string("Remove Skill"), systemImage: "trash")
+                Label(AppLocalization.string("Remove Skill", table: .bots), systemImage: "trash")
             }
         }
         .scaledFont(.subheadline)
         .disabled(state == .running || !appState.canChangeCapabilities)
         .confirmationDialog(Text("Remove \(name)?"), isPresented: $confirmsRemove, titleVisibility: .visible) {
-            Button(AppLocalization.string("Remove Skill"), role: .destructive) { remove() }
+            Button(AppLocalization.string("Remove Skill", table: .bots), role: .destructive) { remove() }
         } message: {
             Text("This deletes the skill from your host. You can install it again from the Skill Hub.")
         }
@@ -568,7 +626,7 @@ struct OfficialSkillDetailPage: View {
                         }
                     } label: {
                         Label(
-                            state == .running ? AppLocalization.string("Installing…") : AppLocalization.string("Install"),
+                            state == .running ? AppLocalization.string("Installing…", table: .bots) : AppLocalization.string("Install"),
                             systemImage: "arrow.down.circle"
                         )
                         .frame(maxWidth: .infinity)
@@ -685,7 +743,7 @@ struct CapabilitySkillDocument: View {
                 }
             }
             if !document.body.isEmpty {
-                ConduitSettingsSection(title: AppLocalization.string("Instructions"), symbol: "doc.text", tint: .conduitAccent) {
+                ConduitSettingsSection(title: AppLocalization.string("Instructions", table: .bots), symbol: "doc.text", tint: .conduitAccent) {
                     Text(verbatim: document.body)
                         .scaledFont(.caption.monospaced())
                         .textSelection(.enabled)

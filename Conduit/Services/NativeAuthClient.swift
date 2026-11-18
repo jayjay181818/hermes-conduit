@@ -39,30 +39,30 @@ enum AuthClientError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .invalidURL:
-            return AppLocalization.string("Invalid dashboard URL.")
+            return AppLocalization.string("Invalid dashboard URL.", table: .connection)
         case .loginFailed(let status, _):
             // Never expose a bare "HTTP 401" as the credential-rejection
             // message; other statuses keep the status for diagnosis (the
             // presentation layer owns user-facing copy). 429 must not read
             // as a credentials problem wherever this string surfaces.
             if status == 429 {
-                return AppLocalization.string("Too many login attempts. Try again shortly.")
+                return AppLocalization.string("Too many login attempts. Try again shortly.", table: .connection)
             }
             guard let status else {
                 // No HTTP response arrived; the credentials were never
                 // evaluated and must not be blamed.
-                return AppLocalization.string("Login failed: no response from the dashboard.")
+                return AppLocalization.string("Login failed: no response from the dashboard.", table: .connection)
             }
             if !(401...403).contains(status) {
-                return AppLocalization.string("Login failed: HTTP \(String(status))")
+                return AppLocalization.string("Login failed: HTTP \(String(status))", table: .connection)
             }
-            return AppLocalization.string("Login failed. Check your dashboard credentials and try again.")
+            return AppLocalization.string("Login failed. Check your dashboard credentials and try again.", table: .connection)
         case .ticketFailed(_, let detail):
-            return AppLocalization.string("Could not start the Hermes session: \(detail)")
+            return AppLocalization.string("Could not start the Hermes session: \(detail)", table: .connection)
         case .providerDiscoveryFailed(_, let detail):
-            return AppLocalization.string("Could not check dashboard sign-in options: \(detail)")
+            return AppLocalization.string("Could not check dashboard sign-in options: \(detail)", table: .connection)
         case .cloudflareServiceTokenRejected:
-            return AppLocalization.string("Cloudflare Access did not accept the configured service token. Verify the Client ID / Secret and that the token is allowed by a Service Auth policy for this Access application, or turn off \"Use Cloudflare Access service token\" to sign in interactively.")
+            return AppLocalization.string("Cloudflare Access did not accept the configured service token. Verify the Client ID / Secret and that the token is allowed by a Service Auth policy for this Access application, or turn off \"Use Cloudflare Access service token\" to sign in interactively.", table: .connection)
         }
     }
 }
@@ -109,8 +109,9 @@ extension NativeAuthConnection {
 enum AuthProviderDiscoveryResult {
     /// The dashboard answered `/api/auth/providers` with recognizable Hermes
     /// provider JSON. The array may name non-password providers only, or be
-    /// empty (Hermes itself answers 503 when no provider is registered, so
-    /// an empty list names no sign-in method). `authFlows` is the answer's
+    /// empty: a Hermes set up with only its session token lists none, and
+    /// its status says it takes the token (`supportsSessionToken`); with no
+    /// token on offer an empty list names no sign-in method. `authFlows` is the answer's
     /// top-level `auth_flows` (the sign-in flows the dashboard advertises,
     /// `native_pkce` being native sign-in), or nil when the answer carries
     /// none as a list of strings; stock Hermes advertises them only on
@@ -191,6 +192,12 @@ enum HermesProviderCheck {
     static func advertisesNativeSignIn(_ flows: [String]) -> Bool {
         flows.contains("native_pkce")
     }
+
+    /// Whether the status body's `auth_providers` name Hermes' session-token
+    /// provider.
+    static func advertisesSessionToken(_ providers: [String]) -> Bool {
+        providers.contains(NativeOAuthTokenSet.sessionTokenProvider)
+    }
 }
 
 /// URLSession-based Hermes dashboard authentication. Automatic URLSession
@@ -237,7 +244,7 @@ final class NativeAuthClient {
         let request = try request(path: "/api/auth/providers")
         let result = try await perform(request)
         guard let http = result.response as? HTTPURLResponse else {
-            throw AuthClientError.providerDiscoveryFailed(status: nil, detail: AppLocalization.string("No response"))
+            throw AuthClientError.providerDiscoveryFailed(status: nil, detail: AppLocalization.string("No response", table: .connection))
         }
         switch http.statusCode {
         case 301, 302, 303, 307, 308:
@@ -248,7 +255,7 @@ final class NativeAuthClient {
             guard http.value(forHTTPHeaderField: "Location") != nil else {
                 throw AuthClientError.providerDiscoveryFailed(
                     status: http.statusCode,
-                    detail: AppLocalization.string("Redirect without Location")
+                    detail: AppLocalization.string("Redirect without Location", table: .connection)
                 )
             }
             // The SecureRedirectDelegate cancels cross-origin redirects, so
@@ -304,12 +311,43 @@ final class NativeAuthClient {
     /// remain errors: silently treating them as "unsupported" would route a
     /// Google provider back into the prohibited embedded WebView.
     func supportsNativeOAuth() async throws -> Bool {
+        let (json, status) = try await statusBody()
+        guard let rawFlows = json["auth_flows"] else { return false }
+        guard let flows = rawFlows as? [String] else {
+            throw AuthClientError.providerDiscoveryFailed(
+                status: status,
+                detail: AppLocalization.string("Unexpected response", table: .connection)
+            )
+        }
+        return HermesProviderCheck.advertisesNativeSignIn(flows)
+    }
+
+    /// Whether Hermes takes its session token as a sign-in
+    /// (`HERMES_DASHBOARD_SESSION_TOKEN`, issue 2442): the status body names
+    /// the provider in `auth_providers`, which the provider list leaves out.
+    /// An older Hermes that names none answers false; a status that can't
+    /// be read, or names them as anything but a list of strings, is an
+    /// error, as for `supportsNativeOAuth`.
+    func supportsSessionToken() async throws -> Bool {
+        let (json, status) = try await statusBody()
+        guard let rawProviders = json["auth_providers"] else { return false }
+        guard let providers = rawProviders as? [String] else {
+            throw AuthClientError.providerDiscoveryFailed(
+                status: status,
+                detail: AppLocalization.string("Unexpected response", table: .connection)
+            )
+        }
+        return HermesProviderCheck.advertisesSessionToken(providers)
+    }
+
+    /// The public status body and its HTTP status.
+    private func statusBody() async throws -> ([String: Any], Int) {
         let request = try request(path: "/api/status")
         let result = try await perform(request)
         guard let http = result.response as? HTTPURLResponse else {
             throw AuthClientError.providerDiscoveryFailed(
                 status: nil,
-                detail: AppLocalization.string("No response")
+                detail: AppLocalization.string("No response", table: .connection)
             )
         }
         guard (200...299).contains(http.statusCode) else {
@@ -321,17 +359,10 @@ final class NativeAuthClient {
         guard let json = try? JSONSerialization.jsonObject(with: result.data) as? [String: Any] else {
             throw AuthClientError.providerDiscoveryFailed(
                 status: http.statusCode,
-                detail: AppLocalization.string("Unexpected response")
+                detail: AppLocalization.string("Unexpected response", table: .connection)
             )
         }
-        guard let rawFlows = json["auth_flows"] else { return false }
-        guard let flows = rawFlows as? [String] else {
-            throw AuthClientError.providerDiscoveryFailed(
-                status: http.statusCode,
-                detail: AppLocalization.string("Unexpected response")
-            )
-        }
-        return HermesProviderCheck.advertisesNativeSignIn(flows)
+        return (json, http.statusCode)
     }
 
     func login(username: String, password: String) async throws -> [HTTPCookie] {
@@ -346,7 +377,7 @@ final class NativeAuthClient {
 
         let result = try await perform(request)
         guard let http = result.response as? HTTPURLResponse else {
-            throw AuthClientError.loginFailed(status: nil, detail: AppLocalization.string("No response"))
+            throw AuthClientError.loginFailed(status: nil, detail: AppLocalization.string("No response", table: .connection))
         }
         guard (200...299).contains(http.statusCode) else {
             throw AuthClientError.loginFailed(
@@ -355,7 +386,7 @@ final class NativeAuthClient {
             )
         }
         guard http.url != nil else {
-            throw AuthClientError.loginFailed(status: http.statusCode, detail: AppLocalization.string("Response URL missing"))
+            throw AuthClientError.loginFailed(status: http.statusCode, detail: AppLocalization.string("Response URL missing", table: .connection))
         }
 
         // Redirect responses may set the session before the final JSON landing.
@@ -382,7 +413,7 @@ final class NativeAuthClient {
 
         let result = try await perform(request)
         guard let http = result.response as? HTTPURLResponse else {
-            throw AuthClientError.ticketFailed(status: nil, detail: AppLocalization.string("No response"))
+            throw AuthClientError.ticketFailed(status: nil, detail: AppLocalization.string("No response", table: .connection))
         }
         guard (200...299).contains(http.statusCode) else {
             throw AuthClientError.ticketFailed(
@@ -393,7 +424,7 @@ final class NativeAuthClient {
         guard let json = try? JSONSerialization.jsonObject(with: result.data) as? [String: Any],
               let ticket = json["ticket"] as? String,
               !ticket.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            throw AuthClientError.ticketFailed(status: http.statusCode, detail: AppLocalization.string("No ticket in response"))
+            throw AuthClientError.ticketFailed(status: http.statusCode, detail: AppLocalization.string("No ticket in response", table: .connection))
         }
 
         // A deployment may rotate its session while minting the ticket. Keep
@@ -415,7 +446,7 @@ final class NativeAuthClient {
             // indistinguishable ticket 401 downstream.
             throw AuthClientError.ticketFailed(
                 status: nil,
-                detail: AppLocalization.string("Login succeeded but no host-scoped session cookie was accepted")
+                detail: AppLocalization.string("Login succeeded but no host-scoped session cookie was accepted", table: .connection)
             )
         }
         return try await mintWsTicket(authenticatedCookies: authenticatedCookies)

@@ -589,7 +589,10 @@ final class BotModeTests: XCTestCase {
         XCTAssertEqual(boIdentity.name, "Bo")
         XCTAssertEqual(boIdentity.botFace?.name, "bo")
         XCTAssertNil(boIdentity.botFace?.image)
-        XCTAssertNil(boIdentity.botFace?.colorString)
+        // No color in Hermes: its starter face's, the second one (by name,
+        // after atlas-2).
+        XCTAssertEqual(boIdentity.botFace?.starterFace, 1)
+        XCTAssertEqual(boIdentity.botFace?.colorString, StarterFaces.set[1].hex)
     }
 
     /// A resume that rotates the Bot Chat's runtime id carries the captured
@@ -1280,6 +1283,12 @@ final class BotModeTests: XCTestCase {
     }
 
     func testServerSwitchCancelsInFlightBotOpen() async {
+        // The switch lands while the flight is held in its resume, not after
+        // a fixed 60 ms: on a loaded runner the open finished navigating
+        // instead of being abandoned (hosted Smoke on Xcode 27, 2026-11-13,
+        // #2326). The resume waits for the test to release it.
+        let (resumingStream, resumingSignal) = AsyncStream<Void>.makeStream()
+        let (releaseStream, releaseResume) = AsyncStream<Void>.makeStream()
         let harness = makeBotHarness(
             configureDefaults: { defaults in
                 defaults.set(
@@ -1290,7 +1299,8 @@ final class BotModeTests: XCTestCase {
             lifecycleOperations: ChatResumeLifecycleOperations(
                 openSessionWithProfile: { _, id, _, _ in
                     // The flight is mid-resume when the server switches.
-                    try? await Task.sleep(nanoseconds: 250_000_000)
+                    resumingSignal.yield()
+                    for await _ in releaseStream { break }
                     return SessionResumeResult(
                         sessionId: id,
                         storedSessionId: "stored-1",
@@ -1311,11 +1321,26 @@ final class BotModeTests: XCTestCase {
         let bot = makeBot(name: "atlas")
 
         async let opened: Bool = harness.appState.openBotChat(for: bot)
-        try? await Task.sleep(nanoseconds: 60_000_000)
+        // Bounded: an open that never reaches its resume fails here instead
+        // of hanging the run.
+        let watchdog = Task {
+            try? await Task.sleep(nanoseconds: 10_000_000_000)
+            resumingSignal.finish()
+        }
+        var resuming = resumingStream.makeAsyncIterator()
+        let reachedResume = await resuming.next() != nil
+        watchdog.cancel()
+        guard reachedResume else {
+            releaseResume.finish()
+            XCTFail("the open must reach its resume before the server switch")
+            _ = await opened
+            return
+        }
         _ = harness.appState.prepareChatResumeForConnection(
             to: "https://elsewhere.example",
             dashboardID: UUID()
         )
+        releaseResume.finish()
         let result = await opened
 
         XCTAssertFalse(result, "a server switch must abandon the in-flight bot open")
@@ -3372,7 +3397,9 @@ final class BotModeTests: XCTestCase {
     /// Bot evidence must exist BEFORE the sync that decides which conversation
     /// the workspace was in: the reserved-title rule covers a cold launch, but
     /// the registry rule (and reference healing) needs the roster, so the
-    /// roster load leads the connect sequence.
+    /// roster load leads the connect sequence. (With bots on hand, kept from
+    /// the dashboard's last read, the saved chat may go out beside it:
+    /// AppStateChatResumeTests' testSavedChatResumesBeforeTheConnectionsBotsLand.)
     func testConnectLoadsBotRosterBeforeTheResumeDecision() async {
         var events: [String] = []
         let harness = makeBotHarness(lifecycleOperations: ChatResumeLifecycleOperations(
@@ -3532,9 +3559,30 @@ final class BotModeTests: XCTestCase {
     /// the notification already holds Hermes' own card for the question, so
     /// the notification's copy is not added beside it.
     func testClarifyPushedFromBotChatDoesNotDoubleHermesCard() async {
+        await assertClarifyPushFromBotChat(hermesCardStatus: .pending, restoresCopy: false)
+    }
+
+    /// Hermes' card with a failed answer still holds the question (it can
+    /// be retried), so the tapped push's copy stays out too.
+    func testClarifyPushedFromBotChatDoesNotDoubleAnErroredHermesCard() async {
+        await assertClarifyPushFromBotChat(hermesCardStatus: .error, restoresCopy: false)
+    }
+
+    /// An older answered card that asked the same thing doesn't hold the
+    /// question asked again: the tapped push restores its card (issue 2556).
+    func testClarifyPushedFromBotChatRestoresPastAnAnsweredHermesCard() async {
+        await assertClarifyPushFromBotChat(hermesCardStatus: .answered, restoresCopy: true)
+    }
+
+    private func assertClarifyPushFromBotChat(
+        hermesCardStatus: ClarifyQuestion.Status,
+        restoresCopy: Bool,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async {
         let cacheSuite = "BotModeTests.clarify-double-\(UUID().uuidString)"
         guard let cacheDefaults = UserDefaults(suiteName: cacheSuite) else {
-            XCTFail("Could not create isolated UserDefaults suite")
+            XCTFail("Could not create isolated UserDefaults suite", file: file, line: line)
             return
         }
         let cache = SessionPresentationCache(defaults: cacheDefaults)
@@ -3562,7 +3610,9 @@ final class BotModeTests: XCTestCase {
                                         id: "q0",
                                         question: "Which color?",
                                         choices: [ClarifyChoice(label: "Red", value: "Red"),
-                                                  ClarifyChoice(label: "Blue", value: "Blue")]
+                                                  ClarifyChoice(label: "Blue", value: "Blue")],
+                                        status: hermesCardStatus,
+                                        answer: hermesCardStatus == .answered ? "Red" : nil
                                     )]
                                 )
                             )
@@ -3600,19 +3650,26 @@ final class BotModeTests: XCTestCase {
             )
         )
 
-        XCTAssertTrue(routed)
-        XCTAssertEqual(harness.appState.activeBotChatProfile, "atlas")
+        XCTAssertTrue(routed, file: file, line: line)
+        XCTAssertEqual(harness.appState.activeBotChatProfile, "atlas", file: file, line: line)
         let cards = harness.appState.messages.filter { $0.role == .clarify }
-        XCTAssertEqual(cards.map { $0.clarify?.requestId }, ["gateway-rid-1"])
+        XCTAssertEqual(
+            Set(cards.compactMap { $0.clarify?.requestId }),
+            restoresCopy ? ["gateway-rid-1", "conduit-push-bot1"] : ["gateway-rid-1"],
+            file: file, line: line
+        )
+        XCTAssertEqual(cards.count, restoresCopy ? 2 : 1, file: file, line: line)
         let cached = cache.merge(
             [],
             profile: "atlas",
             sessionIDs: ["stored-1", "runtime-1"],
             includePendingClarifications: true
         )
-        XCTAssertFalse(
+        XCTAssertEqual(
             cached.contains { $0.clarify?.requestId == "conduit-push-bot1" },
-            "The copy is not kept for a later open either"
+            restoresCopy,
+            "The copy is kept for a later open only when it was drawn",
+            file: file, line: line
         )
     }
 
@@ -4599,6 +4656,78 @@ final class BotModeTests: XCTestCase {
         XCTAssertEqual(resumedIDs, ["default-tip"], "the Bot Chat's tip opens, not a workspace row")
         XCTAssertEqual(resumeProfiles, ["default"], "under the bot's own profile")
         XCTAssertEqual(harness.appState.activeBotChatProfile, "default")
+    }
+
+    /// The chats a client knew were a bot's go with it to the next client on
+    /// the same dashboard, through a reconnect (connect(with:), as a silent
+    /// re-auth makes) and a profile switch; another dashboard's client
+    /// starts without them (issue 2277).
+    func testAReconnectAndAProfileSwitchKeepTheBotChatProfileMap() async {
+        var connected: [HermesClient] = []
+        let harness = makeBotHarness(lifecycleOperations: ChatResumeLifecycleOperations(
+            connectClient: { client in connected.append(client) },
+            loadCatalog: { _, _ in [] },
+            mintTicket: { _ in "ticket-2" },
+            openSession: { _, id, _ in
+                SessionResumeResult(sessionId: id, messages: [], snapshot: SessionRuntimeSnapshot(object: [:]))
+            },
+            refreshContext: { _, _ in }
+        ))
+        let appState = harness.appState
+        let connection = HermesConnection(baseUrl: "https://127.0.0.1:1", ticket: "saved")
+        let first = HermesClient(connection: connection, profile: "default")
+        first.noteSessionProfile("atlas", for: ["bot-chat-1"])
+        appState.connection = connection
+        appState.client = first
+        appState.isConnected = true
+
+        await appState.connect(with: connection, profile: "default")
+        XCTAssertEqual(connected.last?.sessionProfile(for: "bot-chat-1"), "atlas", "a reconnect keeps it")
+        await appState.switchProfile(to: "work")
+        XCTAssertEqual(appState.client?.sessionProfile(for: "bot-chat-1"), "atlas", "so does a profile switch")
+        await appState.connect(with: HermesConnection(baseUrl: "https://127.0.0.2:1", ticket: "other"), profile: "default")
+        XCTAssertNil(connected.last?.sessionProfile(for: "bot-chat-1"), "another dashboard's client starts without it")
+    }
+
+    /// A Bot Chat open a newer chat open overtook neither holds its failure
+    /// for the route's end nor puts back the line: the screen is the newer
+    /// open's (issue 2324).
+    func testASupersededBotChatOpenHoldsNoRouteFailure() async {
+        let harness = makeBotHarness(lifecycleOperations: ChatResumeLifecycleOperations(
+            loadCatalog: { _, _ in [] },
+            openSessionWithProfile: { _, _, _, _ in throw URLError(.timedOut) },
+            refreshContext: { _, _ in },
+            botRoster: { _ in
+                BotRosterSnapshot(
+                    bots: [self.makeBot(name: "default", canonicalID: "default-bot-chat")],
+                    supportsBotProtocol: false
+                )
+            },
+            findBotChat: { _, _ in
+                [BotChatLookupRow(id: "default-bot-chat", resolvedID: "default-tip", title: BotMode.canonicalChatTitle)]
+            }
+        ))
+        let connection = HermesConnection(baseUrl: "https://one.example", ticket: "ticket")
+        harness.appState.client = HermesClient(connection: connection, profile: "default")
+        harness.appState.connection = connection
+        await harness.appState.refreshBotRoster()
+        let appState = harness.appState
+        let attempt = UUID()
+        appState.activeNotificationOpenAttemptID = attempt
+        let generation = appState.beginExplicitChatViewportTransition()
+        // A chat the user opened meanwhile: the open is superseded whether
+        // it fails before or at its session open.
+        appState.beginExplicitChatViewportTransition()
+        let outcome = await appState.routeBotOwnedNotification(
+            ConduitNotificationTarget(profile: "default", sessionId: "default-tip", type: "response"),
+            notifiedProfile: "default",
+            canonicalProfile: "default",
+            attemptID: attempt,
+            transitionGeneration: generation
+        )
+        XCTAssertFalse(appState.botRoster.isEmpty, "the roster names the bot")
+        XCTAssertEqual(outcome, .retry)
+        XCTAssertNil(appState.notificationRouteFailure, "a superseded open holds nothing")
     }
 
     /// A Bot Chat that compacted after the roster was read is known to the

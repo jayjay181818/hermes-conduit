@@ -10,9 +10,26 @@
 
 import SwiftUI
 
+/// Mounts Tasks behind `.equatable()`, equal by AppState identity:
+/// redrawn by its own changes only, while the shell redraws on every
+/// publish. Its own small type with a synthesized `==`, so a new member of
+/// the page doesn't recompile the app (Conduit/Services/EquatableWrappers.swift).
+struct V2TasksViewGate: View, Equatable {
+    @IdentityEquatable var appState: AppState
+
+    var body: some View {
+        V2TasksView(appState: appState)
+    }
+}
+
+/// Tasks, mounted through V2TasksViewGate.
 struct V2TasksView: View {
     @ObservedObject var appLanguage = AppLanguageStore.shared
-    @EnvironmentObject private var appState: AppState
+    /// Followed through `updates`, which holds AppState's changes back
+    /// while another tab is up: a hidden board redrew on every publish, a
+    /// profile switch's dozens included.
+    private let appState: AppState
+    @StateObject private var updates: V2ShownUpdates
     @Environment(\.v2Shell) private var shell
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.layoutDirection) private var layoutDirection
@@ -23,6 +40,11 @@ struct V2TasksView: View {
     enum Segment: String, Hashable {
         case board
         case scheduled
+    }
+
+    init(appState: AppState) {
+        self.appState = appState
+        _updates = StateObject(wrappedValue: V2ShownUpdates(appState))
     }
 
     private var segment: Binding<Segment> {
@@ -48,7 +70,7 @@ struct V2TasksView: View {
                         .padding(.horizontal, 14)
                 }
                 page(.scheduled, selected: selected) {
-                    V2ScheduledList()
+                    V2ScheduledList(isTabShown: shell.isTabActive)
                 }
             }
             .animation(ConduitMotion.ease(reduceMotion: reduceMotion), value: selected)
@@ -57,7 +79,10 @@ struct V2TasksView: View {
             } action: { width in
                 if abs(width - pageWidth) > 0.5 { pageWidth = width }
             }
-            .v2ProfileSwitchContent()
+            .environmentObject(updates)
+        }
+        .onChange(of: shell.isTabActive, initial: true) { _, shown in
+            updates.isShown = shown
         }
         // The control rides in the header, so the pages scroll under one
         // soft edge, as a chat does under its header, instead of stopping
@@ -68,7 +93,7 @@ struct V2TasksView: View {
                 V2SegmentedControl(
                     selection: segment,
                     options: [
-                        (value: Segment.board, title: AppLocalization.string("Board")),
+                        (value: Segment.board, title: AppLocalization.string("Board", table: .tasks)),
                         (value: Segment.scheduled, title: AppLocalization.string("Scheduled"))
                     ]
                 )
@@ -101,7 +126,19 @@ struct V2TasksView: View {
         // Until the width is known the other page hides instead.
         let slides = !reduceMotion && pageWidth > 0
         return content()
-            .transformEnvironment(\.v2Shell) { $0.isTabActive = $0.isTabActive && isShown }
+            .v2ProfileSwitchContent()
+            .transformEnvironment(\.v2Shell) {
+                $0.isTabActive = $0.isTabActive && isShown
+                // The page out of sight shows no profile switch, as a
+                // hidden tab doesn't: shifted along with the one in view,
+                // the Scheduled list laid its rows out again on every
+                // frame of the slide.
+                if !isShown {
+                    $0.contentFaded = false
+                    $0.contentShift = 0
+                    $0.isPickingProfile = false
+                }
+            }
             .offset(x: slides ? side * pageWidth : 0)
             .opacity(isShown || slides ? 1 : 0)
             .allowsHitTesting(isShown)
@@ -118,7 +155,10 @@ struct V2ScheduledList: View {
     // chat's own row does: a name cut to one line is no use at that size.
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @ObservedObject var appLanguage = AppLanguageStore.shared
-    @EnvironmentObject private var appState: AppState
+    /// The tab's updates (`V2ShownUpdates`): the list waits while another
+    /// tab is up.
+    @EnvironmentObject private var updates: V2ShownUpdates
+    private var appState: AppState { updates.appState }
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.v2Shell) private var shell
     @State private var selectedJob: CronJob?
@@ -127,12 +167,27 @@ struct V2ScheduledList: View {
     @State private var showingBlueprints = false
     /// A job a blueprint just made, opened once the gallery has closed.
     @State private var createdJob: CronJob?
+    /// Whether the Tasks tab itself is up, whichever page shows: a page
+    /// left while it stayed up slides back in, a tab shown again doesn't.
+    var isTabShown = true
+    /// The dashboard, profile and connection the list last read for.
+    @State private var readScope: String?
+    /// The page was last hidden by the other page sliding in, with the tab
+    /// still up, so showing it again slides.
+    @State private var hiddenByPageSlide = false
+    /// A page's slide into view, until it has settled and the list has
+    /// laid out (`ConduitMotion.easeSpring`).
+    private static let pageSlideWait: Duration = .seconds(1)
     /// Pinned jobs, per profile: "profile\tjobID" lines. Kept on the phone;
     /// Hermes has no pin for a job.
     @AppStorage("conduit.v2.pinnedCronJobs") private var pinnedRaw = ""
 
     private var jobs: [CronJob] {
         CronJobFilter.visibleJobs(appState.cronJobs, filter: .all, query: "")
+    }
+
+    private var readScopeNow: String {
+        "\(appState.activeDashboardID?.uuidString ?? "")|\(appState.activeProfile)|\(appState.isConnected)"
     }
 
     private func pinKey(_ job: CronJob) -> String {
@@ -232,8 +287,26 @@ struct V2ScheduledList: View {
         }
         // A hidden Tasks tab stays mounted; it loads when shown, like Chats.
         // The list is the dashboard's: another one reads its own, as the drawer's does.
-        .task(id: "\(appState.activeDashboardID?.uuidString ?? "")|\(appState.activeProfile)|\(appState.isConnected)|\(shell.isTabActive)") {
-            guard shell.isTabActive else { return }
+        // The tab's own visibility is in the id too, so a tab hidden or shown
+        // while this page is out of sight still records how it was hidden.
+        .task(id: "\(readScopeNow)|\(shell.isTabActive)|\(isTabShown)") {
+            // A reconnect reads at once, like the first show.
+            guard appState.isConnected else { readScope = nil; return }
+            guard shell.isTabActive else {
+                hiddenByPageSlide = isTabShown
+                return
+            }
+            // Slid back in with what it already read: the read waits for the
+            // page to settle. Its publishes each redraw the page, and fell
+            // in the slide's first frames. The tab shown again doesn't
+            // slide, so it reads at once.
+            let slidIn = hiddenByPageSlide
+            hiddenByPageSlide = false
+            let scope = readScopeNow
+            if scope == readScope, slidIn {
+                do { try await Task.sleep(for: Self.pageSlideWait) } catch { return }
+            }
+            readScope = scope
             await appState.refreshScheduledContent()
         }
         // The capability report can land after this tab's first read, and the
@@ -294,14 +367,14 @@ struct V2ScheduledList: View {
                 Haptics.light()
                 editorTarget = .create
             } label: {
-                Label(AppLocalization.string("New job"), systemImage: "plus")
+                Label(AppLocalization.string("New job", table: .tasks), systemImage: "plus")
             }
             .buttonStyle(.settingsPrimary)
             Button {
                 Haptics.light()
                 showingBlueprints = true
             } label: {
-                Label(AppLocalization.string("From a blueprint"), systemImage: "square.grid.2x2")
+                Label(AppLocalization.string("From a blueprint", table: .tasks), systemImage: "square.grid.2x2")
             }
             .buttonStyle(.settings)
         }
@@ -313,14 +386,14 @@ struct V2ScheduledList: View {
     /// there lists them, one tap away.
     private var listFooter: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text(AppLocalization.string("Each run is saved as its own conversation. Chats lists them under the Scheduled filter. Ask Hermes to add or change a schedule."))
+            Text(AppLocalization.string("Each run is saved as its own conversation. Chats lists them under the Scheduled filter. Ask Hermes to add or change a schedule.", table: .tasks))
                 .scaledFont(.footnote)
                 .foregroundStyle(.secondary)
             Button {
                 Haptics.light()
                 shell.showScheduledRuns()
             } label: {
-                Label(AppLocalization.string("Show runs in Chats"), systemImage: "bubble.left.and.bubble.right")
+                Label(AppLocalization.string("Show runs in Chats", table: .tasks), systemImage: "bubble.left.and.bubble.right")
                     .scaledFont(.footnote.weight(.semibold))
             }
             .buttonStyle(.borderless)
@@ -439,7 +512,7 @@ struct V2ScheduledList: View {
             }
             .buttonStyle(.plain)
             .accessibilityElement(children: .combine)
-            .accessibilityHint(AppLocalization.string("Opens the job's details and run history. Touch and hold for more actions."))
+            .accessibilityHint(AppLocalization.string("Opens the job's details and run history. Touch and hold for more actions.", table: .tasks))
 
             if !job.isFinished {
                 Toggle(isOn: Binding(
@@ -520,8 +593,8 @@ struct V2ScheduledList: View {
         guard job.isActive else { return job.statusLabel }
         guard let raw = job.nextRunAt, !raw.isEmpty else { return job.statusLabel }
         guard let date = CronScheduleText.parseDate(raw) else {
-            return AppLocalization.string("Next run \(raw)")
+            return AppLocalization.string("Next run \(raw)", table: .tasks)
         }
-        return AppLocalization.string("Next run \(CronScheduleText.runTimeText(date))")
+        return AppLocalization.string("Next run \(CronScheduleText.runTimeText(date))", table: .tasks)
     }
 }

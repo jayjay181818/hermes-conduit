@@ -222,14 +222,17 @@ enum GeminiLiveProtocol {
         }
     }
 
+    /// Keys sorted: Swift gives each dictionary its own key order, and a
+    /// call's tools and instructions must come out byte for byte the same
+    /// on every call, or a server's prompt cache can't reuse them (#2669).
     static func encode(_ message: [String: Any]) throws -> String {
-        let data = try JSONSerialization.data(withJSONObject: message, options: [])
+        let data = try JSONSerialization.data(withJSONObject: message, options: [.sortedKeys])
         return String(decoding: data, as: UTF8.self)
     }
 
     // MARK: Server → client
 
-    struct FunctionCall: Equatable {
+    struct FunctionCall: Equatable, Sendable {
         let id: String
         let name: String
         /// String-valued arguments: numbers as their text, lists and
@@ -258,7 +261,7 @@ enum GeminiLiveProtocol {
         }
     }
 
-    enum ServerEvent: Equatable {
+    enum ServerEvent: Equatable, Sendable {
         case setupComplete
         /// Model speech: 16-bit PCM at `sampleRate`.
         case audio(Data, sampleRate: Double)

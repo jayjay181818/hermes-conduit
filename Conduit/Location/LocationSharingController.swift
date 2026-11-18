@@ -28,11 +28,11 @@ enum LocationSharingError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .noDashboard:
-            return AppLocalization.string("Connect to your Hermes dashboard first.")
+            return AppLocalization.string("Connect to your Hermes dashboard first.", table: .phone)
         case .permissionDenied:
-            return AppLocalization.string("Conduit doesn't have permission to use your location. Allow it in the Settings app under Privacy & Security > Location Services > Conduit.")
+            return AppLocalization.string("Conduit doesn't have permission to use your location. Allow it in the Settings app under Privacy & Security > Location Services > Conduit.", table: .phone)
         case .unreadable:
-            return AppLocalization.string("Unlock your iPhone and try again.")
+            return AppLocalization.string("Unlock your iPhone and try again.", table: .phone)
         }
     }
 }
@@ -104,6 +104,10 @@ final class LocationSharingController: ObservableObject {
     /// batch now being sent was built.
     private var spotsForgotten = 0
     private var spotsSentAt = 0
+    /// A reply to the batch sent last lists the shops to watch: not once
+    /// shops were forgotten, sharing ended or a Sign Out dropped the queue
+    /// since it was sent.
+    var spotRepliesLand: Bool { spotsSentAt == spotsForgotten }
     /// Whether shops could be watched at the last reconfigure (nil before
     /// the first).
     private var spotsAllowedBefore: Bool?
@@ -115,12 +119,63 @@ final class LocationSharingController: ObservableObject {
     private(set) var lastTalkingUpload: LocationTalkingUpload?
     private var activated = false
 
-    init(engine: LocationSyncEngine? = nil, config: LocationSharedConfig? = nil, unsent: LocationUnsent? = nil) {
+    /// Reads the stored config file (tests pass one that can't be read).
+    private let readStoredConfig: () -> LocationSharedStore.Read<LocationSharedConfig>
+    /// Reads the stored unsent queue (tests pass their own).
+    private let readStoredUnsent: () -> LocationUnsent
+    /// Writes the unsent queue, saying whether it was written (tests pass
+    /// their own, so they never touch the app group's file).
+    private let writeStoredUnsent: (LocationUnsent) -> Bool
+    /// A Sign Out dropped the queue while the config couldn't be read, or
+    /// its write over the queue's file failed (a full disk), and no save of
+    /// the queue has reached the file since: the copy on disk is what was
+    /// dropped, so it isn't read back, once the config is or at the next
+    /// launch, and the save is tried again until it lands. Kept in the
+    /// Keychain too (`dropMarker`), so a relaunch knows.
+    private(set) var unsentDroppedWhileUnreadable = false {
+        didSet {
+            guard unsentDroppedWhileUnreadable != oldValue else { return }
+            // A clear the Keychain refused is tried again at the next save
+            // that lands, so a stale note can't empty the queue at a launch.
+            let changed = dropMarker.set(unsentDroppedWhileUnreadable)
+            dropMarkerClearPending = !unsentDroppedWhileUnreadable && !changed
+            // A note the Keychain refused is tried again at each save that
+            // fails, and each foreground's retry (issue 2619).
+            dropMarkerSetPending = unsentDroppedWhileUnreadable && !changed
+        }
+    }
+    /// The Keychain refused to clear the drop note: tried again at each
+    /// save of the queue that lands (#2613's review).
+    private var dropMarkerClearPending = false
+    /// The Keychain refused the drop note: tried again while the drop
+    /// hasn't reached the file.
+    private var dropMarkerSetPending = false
+    /// Where a dropped queue not yet written over is remembered across a
+    /// launch (tests pass their own).
+    private let dropMarker: LocationDropMarker
+    /// The dashboard the Keychain's host pass was saved for: it's saved
+    /// only for the dashboard sharing is bound to, so it names the binding
+    /// while the config can't be read.
+    var hostPassDashboardID: () -> UUID? = { LocationKeychain.loadHostPass()?.dashboardID }
+
+    init(
+        engine: LocationSyncEngine? = nil,
+        config: LocationSharedConfig? = nil,
+        unsent: LocationUnsent? = nil,
+        readStoredConfig: @escaping () -> LocationSharedStore.Read<LocationSharedConfig> = { LocationSharedStore.readConfig() },
+        readStoredUnsent: @escaping () -> LocationUnsent = { LocationSharedStore.readUnsent() },
+        writeStoredUnsent: @escaping (LocationUnsent) -> Bool = { LocationSharedStore.saveUnsent($0) },
+        dropMarker: LocationDropMarker = .keychain
+    ) {
         self.engine = engine ?? LocationSyncEngine(deviceName: { UIDevice.current.conduitName })
+        self.readStoredConfig = readStoredConfig
+        self.readStoredUnsent = readStoredUnsent
+        self.writeStoredUnsent = writeStoredUnsent
+        self.dropMarker = dropMarker
         if let config {
             self.config = config
         } else {
-            switch LocationSharedStore.readConfig() {
+            switch readStoredConfig() {
             case .value(let stored): self.config = stored
             case .missing: self.config = LocationSharedConfig()
             case .unreadable:
@@ -128,11 +183,23 @@ final class LocationSharingController: ObservableObject {
                 configUnreadable = true
             }
         }
-        self.unsent = unsent ?? LocationSharedStore.readUnsent()
+        // A Sign Out's drop that never reached the queue's file before the
+        // app quit: the file's copy is what was dropped, so it isn't read,
+        // and the write over it is tried again (at the first config read
+        // and each foreground).
+        // The note is read after the file, so a first unlock between the
+        // two can't leave the file's dropped queue read back (issue 2619).
+        let stored = unsent ?? readStoredUnsent()
+        if dropMarker.isSet() {
+            self.unsentDroppedWhileUnreadable = true
+            self.unsent = unsent ?? LocationUnsent()
+        } else {
+            self.unsent = stored
+        }
         self.engine.spotsReplied = { [weak self] watches in
             // A reply to a batch sent before Walking past went off lists
             // watches the host no longer keeps.
-            guard let self, self.spotsSentAt == self.spotsForgotten else { return }
+            guard let self, self.spotRepliesLand else { return }
             self.spots.replied(watches, near: self.fixes.lastKnownFix)
         }
     }
@@ -149,13 +216,29 @@ final class LocationSharingController: ObservableObject {
     @discardableResult
     func readConfigIfNeeded() -> Bool {
         guard configUnreadable else { return true }
-        switch LocationSharedStore.readConfig() {
+        switch readStoredConfig() {
         case .value(let stored):
             config = stored
-            unsent = LocationSharedStore.readUnsent()
+            // A note the Keychain couldn't be read for at launch (before
+            // the first unlock) counts now, before the file is read back.
+            if !unsentDroppedWhileUnreadable, dropMarker.isSet() { unsentDroppedWhileUnreadable = true }
+            if unsentDroppedWhileUnreadable {
+                // A Sign Out dropped the queue and its file hasn't been
+                // written since: the file's copy is what was dropped, so
+                // what's in memory (recorded since) replaces it. A failed
+                // write keeps the flag, and the next foreground tries again.
+                saveUnsent()
+            } else {
+                unsent = readStoredUnsent()
+            }
             configUnreadable = false
             return true
         case .missing:
+            // No config, but the dropped queue's file may still be there;
+            // a note unreadable at launch counts now, as with a config
+            // (issue 2619).
+            if !unsentDroppedWhileUnreadable, dropMarker.isSet() { unsentDroppedWhileUnreadable = true }
+            if unsentDroppedWhileUnreadable { saveUnsent() }
             configUnreadable = false
             return true
         case .unreadable:
@@ -207,8 +290,24 @@ final class LocationSharingController: ObservableObject {
         reconfigureMonitors()
     }
 
-    private func saveUnsent() {
-        LocationSharedStore.saveUnsent(unsent)
+    @discardableResult
+    private func saveUnsent() -> Bool {
+        let saved = writeStoredUnsent(unsent)
+        // The file holds what's in memory now: nothing dropped is left in it.
+        if saved {
+            unsentDroppedWhileUnreadable = false
+            if dropMarkerClearPending { dropMarkerClearPending = !dropMarker.set(false) }
+        } else if dropMarkerSetPending, unsentDroppedWhileUnreadable {
+            dropMarkerSetPending = !dropMarker.set(true)
+        }
+        return saved
+    }
+
+    /// Tries again to write over a dropped queue's file, so a relaunch
+    /// doesn't read it back.
+    func retryDroppedUnsentSave() {
+        guard unsentDroppedWhileUnreadable else { return }
+        saveUnsent()
     }
 
     // MARK: Launch and foreground
@@ -226,6 +325,7 @@ final class LocationSharingController: ObservableObject {
     /// Conduit came to the foreground: permissions may have changed in the
     /// Settings app, and anything unsent goes now.
     func appBecameActive() {
+        retryDroppedUnsentSave()
         guard readConfigIfNeeded() else { return }
         refreshAuthorization()
         retryConfigSave()
@@ -280,6 +380,46 @@ final class LocationSharingController: ObservableObject {
 
     /// Shop entries waiting to be sent.
     var unsentSpotEntryCount: Int { unsent.spotEntries.count }
+    var hasUnsent: Bool { !unsent.isEmpty }
+    /// Moves on at each `dropUnsent`, so a fix or event taken before it
+    /// isn't kept after a wait that outlasted it.
+    private var unsentDrops = 0
+
+    /// Sign Out of the dashboard sharing is bound to drops the fix, visits
+    /// and shop entries not sent yet: the next sign-in there may be another
+    /// account, and they'd go under it (issue 2482). Sharing stays on and
+    /// bound, so what's recorded after Sign Out goes with the next sign-in.
+    /// While the config can't be read, the binding isn't known: the queue
+    /// goes unless the host pass names another dashboard (issue 2591), as
+    /// keeping it could send one account's places under another's. A pass
+    /// left from an earlier binding whose replacement failed to save would
+    /// keep it: an edge this errs on, as nothing else names the binding.
+    func dropUnsent(boundTo dashboardID: UUID) {
+        if readConfigIfNeeded() {
+            guard config.binding?.dashboardID == dashboardID else { return }
+        } else if let passDashboard = hostPassDashboardID(), passDashboard != dashboardID {
+            return
+        }
+        unsentDrops &+= 1
+        // A reply still coming to a batch sent before the drop lists no
+        // shops into the dropped queue, as at the end of sharing (issue
+        // 2616).
+        spotsForgotten += 1
+        lastTalkingUpload = nil
+        // A dropped call fix mustn't hold back the call's next moves
+        // (issue 2562).
+        lastCallFix = nil
+        // The file's copy may hold what memory doesn't (it couldn't be read
+        // at launch): it isn't read back after this drop, until a save of
+        // the queue lands (this one clears the flag when it does).
+        if configUnreadable { unsentDroppedWhileUnreadable = true }
+        unsent.fix = nil
+        unsent.events = []
+        unsent.spotEntries = []
+        // A write that fails (a full disk) leaves the dropped queue in the
+        // file whatever the config: tried again until it lands.
+        if !saveUnsent() { unsentDroppedWhileUnreadable = true }
+    }
 
     func reconfigureMonitors() {
         monitor.configure(settings: settings, places: places, bound: config.binding != nil && !configUnreadable)
@@ -350,7 +490,8 @@ final class LocationSharingController: ObservableObject {
         guard callWatch != nil, settings.shares(.call, at: now()) else { return }
         if let last = lastCallFix, last.distance(from: location) < LocationBackgroundMonitor.callMoveDistance { return }
         lastCallFix = location
-        Task { await share(location, source: .call) }
+        let drops = unsentDrops
+        Task { await share(location, source: .call, drops: drops) }
     }
 
     // MARK: Layer 2: in the background
@@ -363,7 +504,8 @@ final class LocationSharingController: ObservableObject {
         // The first answer for a place is where the phone is, not a move.
         guard let before, before != inside, settings.shares(.place, at: now()) else { return }
         let event = LocationPlaceEvent(kind: inside ? .arrive : .leave, placeID: place.id, at: date, isPrivate: place.isPrivate)
-        Task { await shareFix(source: .place, events: [event]) }
+        let drops = unsentDrops
+        Task { await shareFix(source: .place, events: [event], drops: drops) }
     }
 
     private func visited(_ visit: CLVisit) {
@@ -373,12 +515,14 @@ final class LocationSharingController: ObservableObject {
             coordinate: visit.coordinate, altitude: 0, horizontalAccuracy: visit.horizontalAccuracy,
             verticalAccuracy: -1, timestamp: at == .distantPast ? now() : at
         )
-        Task { await share(location, source: .visit) }
+        let drops = unsentDrops
+        Task { await share(location, source: .visit, drops: drops) }
     }
 
     private func movedSignificantly(_ location: CLLocation) {
         guard readConfigIfNeeded(), settings.shares(.significant, at: now()) else { return }
-        Task { await share(location, source: .significant) }
+        let drops = unsentDrops
+        Task { await share(location, source: .significant, drops: drops) }
     }
 
     /// The phone came within a watched shop's circle: a fresh fix says how
@@ -386,6 +530,7 @@ final class LocationSharingController: ObservableObject {
     /// entry goes now. Nothing inside a private place.
     private func spotEntered(_ spot: PulseSpotState.Spot, at date: Date) {
         guard readConfigIfNeeded(), watchesSpots else { return }
+        let drops = unsentDrops
         Task { @MainActor in
             let endBackground = beginBackgroundWork(for: .place)
             defer { endBackground() }
@@ -402,8 +547,8 @@ final class LocationSharingController: ObservableObject {
                 speed: location.flatMap { $0.speed >= 0 ? $0.speed : nil },
                 radius: spot.radius)
             // Walking past may have been turned off, or the shop dropped,
-            // while the fix came.
-            guard watchesSpots, spots.state.watches.contains(where: { $0.id == spot.watchID }),
+            // while the fix came, or a Sign Out dropped what wasn't sent.
+            guard drops == unsentDrops, watchesSpots, spots.state.watches.contains(where: { $0.id == spot.watchID }),
                   spots.state.spots.contains(where: { $0.id == spot.id }) else { return }
             unsent.keep(spotEntry: entry)
             saveUnsent()
@@ -415,10 +560,12 @@ final class LocationSharingController: ObservableObject {
     // MARK: Taking and sending
 
     /// Takes a fix for `source` (with any events) and sends it. True when
-    /// the host has it.
+    /// the host has it. `drops` is `unsentDrops` when what's shared was
+    /// seen: a Sign Out since drops it.
     @discardableResult
-    func shareFix(source: LocationFixSource, events: [LocationPlaceEvent] = []) async -> Bool {
-        guard let bound = config.binding, settings.shares(source, at: now()) else { return false }
+    func shareFix(source: LocationFixSource, events: [LocationPlaceEvent] = [], drops seen: Int? = nil) async -> Bool {
+        let drops = seen ?? unsentDrops
+        guard drops == unsentDrops, let bound = config.binding, settings.shares(source, at: now()) else { return false }
         // A background relaunch gets a few seconds: the fix, place name and
         // send run inside an assertion, and an arrive/leave is kept before
         // the fix so a suspension can't lose it.
@@ -443,7 +590,8 @@ final class LocationSharingController: ObservableObject {
         // Sharing ended or moved to another dashboard while the fix came:
         // it and these events were taken for the old one, so the events
         // kept above leave too, or a rebind's flush would send them there.
-        guard config.binding == bound else {
+        // So do they when a Sign Out dropped what wasn't sent meanwhile.
+        guard config.binding == bound, drops == unsentDrops else {
             if !events.isEmpty {
                 unsent.remove(fixID: nil, eventIDs: Set(events.map(\.id)))
                 saveUnsent()
@@ -457,7 +605,7 @@ final class LocationSharingController: ObservableObject {
            !messageFixIsNews(LocationRawFix(location), precision: precision) {
             return true
         }
-        return await share(location, source: source, events: events)
+        return await share(location, source: source, events: events, drops: drops)
     }
 
     /// A fix iOS took a few minutes ago while the phone was still, instead
@@ -494,8 +642,11 @@ final class LocationSharingController: ObservableObject {
     }
 
     @discardableResult
-    func share(_ location: CLLocation?, source: LocationFixSource, events: [LocationPlaceEvent] = []) async -> Bool {
-        guard readConfigIfNeeded(), config.binding != nil, settings.shares(source, at: now()) else { return false }
+    func share(_ location: CLLocation?, source: LocationFixSource, events: [LocationPlaceEvent] = [],
+               drops seen: Int? = nil) async -> Bool {
+        let drops = seen ?? unsentDrops
+        guard drops == unsentDrops, readConfigIfNeeded(), config.binding != nil,
+              settings.shares(source, at: now()) else { return false }
         let endBackground = beginBackgroundWork(for: source)
         defer { endBackground() }
         let bound = config.binding
@@ -506,8 +657,9 @@ final class LocationSharingController: ObservableObject {
             let precision = settings.precision(for: source)
             let area = precision == .places ? nil : await fixes.area(for: location)
             // Sharing ended or moved to another dashboard during the lookup:
-            // this fix and its events were taken for the old one.
-            guard config.binding == bound, settings.shares(source, at: now()) else { return false }
+            // this fix and its events were taken for the old one. A Sign Out
+            // meanwhile dropped what wasn't sent, these with it.
+            guard config.binding == bound, drops == unsentDrops, settings.shares(source, at: now()) else { return false }
             record = LocationFixRecord(source: source, raw: LocationRawFix(location), area: area)
         }
         guard record != nil || !events.isEmpty else { return false }
@@ -560,7 +712,10 @@ final class LocationSharingController: ObservableObject {
         var pending = unsent
         if pending.isEmpty, !settingsOnly { return true }
         let forgotten = spotsForgotten
+        let drops = unsentDrops
         guard let request = await requestProvider?(binding) else { return false }
+        // A Sign Out while the connection came dropped this batch's copy.
+        guard drops == unsentDrops else { return false }
         // Walking past turned off, a pause, or Location settings changed
         // while the connection came: this batch carries no shops.
         if spotsForgotten != forgotten || !watchesSpots {
@@ -873,5 +1028,33 @@ final class LocationSharingController: ObservableObject {
         }
         // Unbound, the shops' monitor is emptied and spots.json forgotten.
         reconfigureMonitors()
+    }
+}
+
+/// Remembers, outside the queue's own file, that a Sign Out dropped the
+/// unsent queue and the file still holds it (#2612's review).
+struct LocationDropMarker {
+    var isSet: () -> Bool
+    /// Says whether the change was stored.
+    var set: (Bool) -> Bool
+
+    static var keychain: LocationDropMarker {
+        LocationDropMarker(isSet: { LocationKeychain.unsentDropped() }, set: { LocationKeychain.setUnsentDropped($0) })
+    }
+
+    /// Kept in memory only, for tests: `stored` stands for the Keychain.
+    static func memory(_ stored: Box = Box()) -> LocationDropMarker {
+        LocationDropMarker(isSet: { stored.isSet }, set: { value in
+            guard stored.writable else { return false }
+            stored.isSet = value
+            return true
+        })
+    }
+
+    final class Box {
+        var isSet: Bool
+        /// False stands for a Keychain that refuses changes.
+        var writable = true
+        init(_ isSet: Bool = false) { self.isSet = isSet }
     }
 }

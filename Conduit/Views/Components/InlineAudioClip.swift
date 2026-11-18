@@ -72,7 +72,7 @@ final class ChatAudioClipPlayer: NSObject, ObservableObject {
         NotificationCenter.default.addObserver(
             self,
             selector: #selector(handleInterruption(_:)),
-            name: AVAudioSession.interruptionNotification,
+            name: .audioSessionInterruption,
             object: nil
         )
     }
@@ -208,8 +208,7 @@ final class ChatAudioClipPlayer: NSObject, ObservableObject {
     }
 
     @objc nonisolated private func handleInterruption(_ notification: Notification) {
-        guard let raw = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
-              AVAudioSession.InterruptionType(rawValue: raw) == .began else { return }
+        guard AudioSessionInterruption(notification) == .began else { return }
         Task { @MainActor [weak self] in
             guard let self, self.clip?.phase == .playing else { return }
             self.pause()
@@ -386,7 +385,7 @@ struct InlineAudioClipView: View {
     private var detailText: String {
         switch problem {
         case .unavailable: return AppLocalization.string("Couldn't open this file")
-        case .unsupported: return AppLocalization.string("Can't play this format here. Open it full screen instead.")
+        case .unsupported: return AppLocalization.string("Can't play this format here. Open it full screen instead.", table: .voice)
         case nil: return openFailed ? AppLocalization.string("Couldn't open this file") : AppLocalization.string("Audio")
         }
     }

@@ -27,15 +27,15 @@ enum CapabilitiesStoreError: LocalizedError, Equatable {
     var errorDescription: String? {
         switch self {
         case .notConnected:
-            return AppLocalization.string("Connect to a Hermes dashboard to load capabilities.")
+            return AppLocalization.string("Connect to a Hermes dashboard to load capabilities.", table: .bots)
         case .timedOut:
-            return AppLocalization.string("Hermes is still working on it. Check again in a moment.")
+            return AppLocalization.string("Hermes is still working on it. Check again in a moment.", table: .bots)
         case .declined(let reason):
             return reason
         case .editUnsupported:
-            return AppLocalization.string("This Hermes can't change servers yet. Update Hermes and try again.")
+            return AppLocalization.string("This Hermes can't change servers yet. Update Hermes and try again.", table: .bots)
         case .profileChanged:
-            return AppLocalization.string("Conduit switched to another profile, so nothing was saved.")
+            return AppLocalization.string("Conduit switched to another profile, so nothing was saved.", table: .bots)
         }
     }
 }
@@ -121,6 +121,8 @@ final class CapabilitiesStore {
     /// Hub skills being removed, by name, and why one failed.
     private(set) var skillRemovals: [String: CapabilityInstallState] = [:]
     private(set) var skillsUpdate: CapabilityInstallState?
+    /// Check for Updates' answer, nil until asked.
+    private(set) var hubSkillUpdates: HubSkillUpdatesState?
 
     // Tools
     /// Tool name -> calls over the last year; nil until read.
@@ -169,6 +171,9 @@ final class CapabilitiesStore {
     /// asked before a newer one, or before a change, never puts back the
     /// installed skills it saw.
     @ObservationIgnored private var skillHubEpoch = 0
+    /// Bumped by each update check and each finished update, so a check
+    /// that answers after the update ran doesn't list what it updated.
+    @ObservationIgnored private var hubUpdatesCheck = 0
     @ObservationIgnored private var connectorsEpoch = 0
     /// The read whose list is showing.
     @ObservationIgnored private var connectorsShownEpoch = 0
@@ -207,6 +212,7 @@ final class CapabilitiesStore {
         skillHubMissing = false
         skillRemovals = [:]
         skillsUpdate = nil
+        hubSkillUpdates = nil
         toolCalls = nil
         servers = []
         connectorCatalog = []
@@ -495,7 +501,7 @@ final class CapabilitiesStore {
                 timeout: 45_000
             )
             guard let action = started["name"] as? String else {
-                throw CapabilitiesStoreError.declined(AppLocalization.string("Hermes didn't start the install."))
+                throw CapabilitiesStoreError.declined(AppLocalization.string("Hermes didn't start the install.", table: .bots))
             }
             let status = try await waitForAction(action, token: token)
             if status.succeeded {
@@ -505,7 +511,7 @@ final class CapabilitiesStore {
             }
             guard token == generation else { return false }
             guard status.succeeded else {
-                skillInstalls[identifier] = .failed(status.failureReason ?? AppLocalization.string("The install didn't finish."))
+                skillInstalls[identifier] = .failed(status.failureReason ?? AppLocalization.string("The install didn't finish.", table: .bots))
                 return false
             }
             skillInstalls[identifier] = nil
@@ -590,12 +596,12 @@ final class CapabilitiesStore {
                 timeout: 45_000
             )
             guard let action = started["name"] as? String else {
-                throw CapabilitiesStoreError.declined(AppLocalization.string("Hermes didn't start removing it."))
+                throw CapabilitiesStoreError.declined(AppLocalization.string("Hermes didn't start removing it.", table: .bots))
             }
             let status = try await waitForAction(action, token: token)
             guard token == generation else { return false }
             guard status.succeeded else {
-                skillRemovals[name] = .failed(status.failureReason ?? AppLocalization.string("Removing it didn't finish."))
+                skillRemovals[name] = .failed(status.failureReason ?? AppLocalization.string("Removing it didn't finish.", table: .bots))
                 return false
             }
             skillRemovals[name] = nil
@@ -635,15 +641,45 @@ final class CapabilitiesStore {
             let status = try await waitForAction(action, token: token)
             guard token == generation else { return false }
             guard status.succeeded else {
-                skillsUpdate = .failed(status.failureReason ?? AppLocalization.string("The update didn't finish."))
+                skillsUpdate = .failed(status.failureReason ?? AppLocalization.string("The update didn't finish.", table: .bots))
                 return false
             }
             skillsUpdate = nil
+            // What was listed as having updates has them now, and a check
+            // still running asked before the update.
+            hubUpdatesCheck &+= 1
+            switch hubSkillUpdates {
+            case .found, .checking: hubSkillUpdates = .found([])
+            // A check that failed before the update says nothing now.
+            case .failed: hubSkillUpdates = nil
+            case nil: break
+            }
             return true
         } catch {
             guard token == generation, !(error is CancellationError) else { return false }
             skillsUpdate = .failed(UserFacingError.message(for: error))
             return false
+        }
+    }
+
+    /// Asks Hermes which hub skills have a newer version at their source
+    /// (`hermes skills check`, which fetches from every source, so it can
+    /// take a minute), as Hermes Desktop's Skills tab does.
+    func checkHubSkillUpdates() async {
+        let token = generation
+        hubUpdatesCheck &+= 1
+        let check = hubUpdatesCheck
+        hubSkillUpdates = .checking
+        do {
+            let answer = try await request(scoped("/api/skills/hub/updates"), timeout: 120_000)
+            guard token == generation, check == hubUpdatesCheck else { return }
+            let rows = (answer["updates"] as? [Any] ?? []).compactMap(HubSkillUpdate.init)
+            hubSkillUpdates = .found(rows)
+        } catch {
+            guard token == generation, check == hubUpdatesCheck, !(error is CancellationError) else { return }
+            hubSkillUpdates = Self.isMissingRoute(error)
+                ? .failed(AppLocalization.string("Update Hermes to check hub skills for updates.", table: .bots))
+                : .failed(UserFacingError.message(for: error))
         }
     }
 
@@ -802,22 +838,28 @@ final class CapabilitiesStore {
         var pending = due[...]
         // The list may have gone while it was still reading the servers.
         guard !Task.isCancelled else { return }
+        // These names are this profile's: after a switch none of them is
+        // tested on the other one, whose server may share a name.
+        let token = generation
         await withTaskGroup(of: Void.self) { group in
             for _ in 0..<3 {
                 guard let next = pending.popFirst() else { break }
-                group.addTask { await self.probe(next.name) }
+                group.addTask { await self.probe(next.name, generation: token) }
             }
             while await group.next() != nil {
                 // Leaving the list starts no more tests; the ones running
                 // finish (see probe).
-                if !Task.isCancelled, let next = pending.popFirst() {
-                    group.addTask { await self.probe(next.name) }
+                if !Task.isCancelled, token == generation, let next = pending.popFirst() {
+                    group.addTask { await self.probe(next.name, generation: token) }
                 }
             }
         }
     }
 
-    func probe(_ name: String) async {
+    /// `expected`: the profile and dashboard the name was picked on; after
+    /// a switch the test isn't sent.
+    func probe(_ name: String, generation expected: Int? = nil) async {
+        if let expected, expected != generation { return }
         // Each test starts the server on the host: one at a time.
         guard !probing.contains(name) else { return }
         let token = generation
@@ -889,7 +931,9 @@ final class CapabilitiesStore {
         await readKeptServersAgain()
         if enabled {
             // Unless reading the kept list again just tested it.
-            if (probes[name]?.checkedAt ?? .distantPast) < kept { await probe(name) }
+            // The re-read may have outlasted a switch: the test then goes
+            // nowhere.
+            if (probes[name]?.checkedAt ?? .distantPast) < kept { await probe(name, generation: token) }
         } else {
             probes[name] = nil
         }
@@ -1009,10 +1053,48 @@ final class CapabilitiesStore {
         // Tested again in the background: the editor closes on the save. A
         // kept list Hermes' answer took the place of has its servers tested
         // now, as the tab's open would have, the saved one with them.
+        // The tests start after this returns: a switch in between sends
+        // none of them to the other profile or dashboard.
         if wasKept, !showsKept.contains(.connectors) {
-            Task { await probeServers() }
+            Task {
+                guard token == generation else { return }
+                await probeServers()
+            }
         } else if servers.first(where: { $0.name == name })?.enabled == true {
-            Task { await probe(name) }
+            Task { await probe(name, generation: token) }
+        }
+    }
+
+    /// A server Add Server just had Hermes write (`mcp.servers.add`, on the
+    /// gateway, where Edit Bot adds its servers too). Hermes' list brings
+    /// it, so a read asked before the add isn't kept after it; when that
+    /// list can't be read, the server shows from its entry, as an edited
+    /// one does. It's tested if it's on. `token` is the store's generation
+    /// when Save was pressed: after a switch nothing here changes.
+    func serverAdded(_ name: String, entry: [String: Any], generation token: Int) async {
+        guard token == generation else { return }
+        answers?.noteWrite(KeptRoute.servers)
+        answers?.noteWrite(KeptRoute.connectorCatalog)
+        probes[name] = nil
+        probeEpochs[name, default: 0] &+= 1
+        let wasKept = showsKept.contains(.connectors)
+        let mine = connectorsEpoch &+ 1
+        let reloaded = await loadConnectors()
+        guard token == generation else { return }
+        let fresh = reloaded || connectorsShownEpoch > mine
+        if !fresh || !servers.contains(where: { $0.name == name }) {
+            servers.removeAll { $0.name == name }
+            servers.append(ConnectorServer.saved(name: name, entry: entry, replacing: nil))
+        }
+        // The tests start after this returns: a switch in between sends
+        // none of them to the other profile or dashboard.
+        if wasKept, !showsKept.contains(.connectors) {
+            Task {
+                guard token == generation else { return }
+                await probeServers()
+            }
+        } else if servers.first(where: { $0.name == name })?.enabled == true {
+            Task { await probe(name, generation: token) }
         }
     }
 
@@ -1054,7 +1136,7 @@ final class CapabilitiesStore {
                 let status = try await waitForAction(action, token: token)
                 guard status.succeeded else {
                     guard token == generation else { return false }
-                    connectorInstalls[entry.name] = .failed(status.failureReason ?? AppLocalization.string("The install didn't finish."))
+                    connectorInstalls[entry.name] = .failed(status.failureReason ?? AppLocalization.string("The install didn't finish.", table: .bots))
                     return false
                 }
             }
@@ -1077,7 +1159,7 @@ final class CapabilitiesStore {
                 // with them.
                 await probeServers()
             } else {
-                await probe(entry.name)
+                await probe(entry.name, generation: token)
             }
             return true
         } catch {
@@ -1133,7 +1215,7 @@ final class CapabilitiesStore {
             return
         }
         guard servers.first(where: { $0.name == name })?.enabled == true else { return }
-        await probe(name)
+        await probe(name, generation: token)
     }
 
     // MARK: Plugins

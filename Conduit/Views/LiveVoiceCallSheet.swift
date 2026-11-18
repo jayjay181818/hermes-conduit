@@ -81,6 +81,8 @@ struct LiveVoiceCallSheet: View {
     /// The job chat to open once the result sheet has gone, so the call
     /// sheet isn't dismissed while its child is still animating out.
     @State private var pendingJobChat: String?
+    /// The pending job chat's own profile; nil is the call's.
+    @State private var pendingJobProfile: String?
     /// The cards that opened by themselves, so each opens only once.
     @State private var autoOpenedCardIDs: Set<UUID> = []
     /// Whether what's open opened by itself, so a newer card may replace it.
@@ -143,14 +145,18 @@ struct LiveVoiceCallSheet: View {
             // Leaving for the job's chat minimises the call.
             guard let chatID = pendingJobChat else { return }
             pendingJobChat = nil
+            let profile = pendingJobProfile
+            pendingJobProfile = nil
             dismiss()
-            openURL(ConduitAppLink.session(id: chatID).url)
+            openURL(appState.callChatLink(ConduitAppLink.session(id: chatID, profile: profile)).url)
         }) { selected in
             Group {
                 switch selected {
                 case .job(let jobID):
                     LiveVoiceJobResultSheet(jobs: jobs, jobID: jobID) { chatID in
                         pendingJobChat = chatID
+                        // A job naming no profile is the call's.
+                        pendingJobProfile = jobs.jobs.first { $0.id == jobID }?.profile ?? appState.voiceCallProfile
                         selection = nil
                     }
                 case .screen(let card, _):
@@ -241,7 +247,7 @@ struct LiveVoiceCallSheet: View {
                             jobs: jobs,
                             // The mode menu under the title names the engine.
                             engine: modeSwitch == nil ? title : "",
-                            profile: appState.profileDisplayName(appState.activeProfile),
+                            profile: appState.profileDisplayName(appState.voiceCallProfile),
                             onOpenChat: openAttachedChat
                         )
                     } else {
@@ -264,6 +270,8 @@ struct LiveVoiceCallSheet: View {
                 if let modeSwitch {
                     VoiceModeCapsule(modeSwitch: modeSwitch)
                 }
+                // The microphone and output pickers (issue 2389).
+                VoiceCallAudioDeviceButtons()
             }
             .frame(maxWidth: .infinity)
 
@@ -282,7 +290,8 @@ struct LiveVoiceCallSheet: View {
     /// call goes on minimised, as it does when a job's chat opens.
     private func openAttachedChat(_ link: ConduitAppLink) {
         dismiss()
-        openURL(link.url)
+        // On the call's own profile, which may not be the one on screen.
+        openURL(appState.callChatLink(link).url)
     }
 
     // MARK: Stage
@@ -456,7 +465,7 @@ struct LiveVoiceCallSheet: View {
 
     private func label(for entry: VoiceConversationTranscriptEntry) -> String {
         entry.speaker == .user
-            ? AppLocalization.string("You: \(entry.text)")
+            ? AppLocalization.string("You: \(entry.text)", table: .voice)
             : assistantLabel(entry.text)
     }
 
@@ -485,11 +494,11 @@ struct LiveVoiceCallSheet: View {
                 }
                 LiveVoiceCallButton(
                     symbol: isSpeakerMuted ? LiveVoiceCallButton.silencedSymbol : LiveVoiceCallButton.silenceSymbol,
-                    title: isSpeakerMuted ? AppLocalization.string("Sound on") : AppLocalization.string("Silence"),
+                    title: isSpeakerMuted ? AppLocalization.string("Sound on", table: .voice) : AppLocalization.string("Silence", table: .voice),
                     style: isSpeakerMuted ? .selected : .normal,
                     voiceOverLabel: isSpeakerMuted
-                        ? AppLocalization.string("Turn the assistant's sound back on")
-                        : AppLocalization.string("Silence the assistant"),
+                        ? AppLocalization.string("Turn the assistant's sound back on", table: .voice)
+                        : AppLocalization.string("Silence the assistant", table: .voice),
                     action: onToggleSpeaker
                 )
                 .disabled(!canMute)
@@ -501,8 +510,8 @@ struct LiveVoiceCallSheet: View {
                         symbol: "stop.fill",
                         title: AppLocalization.string("Interrupt"),
                         voiceOverHint: canInterrupt
-                            ? AppLocalization.string("Stops the assistant so you can speak")
-                            : AppLocalization.string("Available while the assistant is speaking"),
+                            ? AppLocalization.string("Stops the assistant so you can speak", table: .voice)
+                            : AppLocalization.string("Available while the assistant is speaking", table: .voice),
                         action: onInterrupt
                     )
                     .disabled(!canInterrupt)
@@ -514,7 +523,7 @@ struct LiveVoiceCallSheet: View {
             }
             LiveVoiceCallButton(
                 symbol: "text.bubble.fill",
-                title: AppLocalization.string("Transcript"),
+                title: AppLocalization.string("Transcript", table: .voice),
                 style: showsTranscript ? .selected : .normal,
                 action: { showsTranscript.toggle() }
             )
@@ -524,7 +533,7 @@ struct LiveVoiceCallSheet: View {
                 title: AppLocalization.string("End"),
                 style: .destructive,
                 voiceOverLabel: AppLocalization.string("End call"),
-                voiceOverHint: AppLocalization.string("Hangs up the call"),
+                voiceOverHint: AppLocalization.string("Hangs up the call", table: .voice),
                 action: onEnd
             )
         }
@@ -690,8 +699,8 @@ private struct LiveVoiceAskFirstButton: View {
     private func showCaption(for on: Bool) {
         captionTask?.cancel()
         let text = on
-            ? AppLocalization.string("Asking before sending to Hermes")
-            : AppLocalization.string("Sending straight to Hermes")
+            ? AppLocalization.string("Asking before sending to Hermes", table: .voice)
+            : AppLocalization.string("Sending straight to Hermes", table: .voice)
         withAnimation(.easeOut(duration: 0.2)) { caption = text }
         // The caption itself is hidden from VoiceOver: said once instead.
         AccessibilityNotification.Announcement(text).post()
@@ -787,7 +796,7 @@ struct LiveVoiceCallModeMenuButton: View {
     private static let symbol = "arrow.triangle.swap"
 
     var body: some View {
-        let title = AppLocalization.string("Switch voice")
+        let title = AppLocalization.string("Switch voice", table: .voice)
         LiveVoiceCallButtonFace(
             symbol: Self.symbol,
             title: title,
@@ -1103,7 +1112,7 @@ struct V2CallCaptions: View {
                     .truncationMode(.head)
                     .minimumScaleFactor(0.6)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .accessibilityLabel(Text(verbatim: AppLocalization.string("You: \(pending)")))
+                    .accessibilityLabel(Text(verbatim: AppLocalization.string("You: \(pending)", table: .voice)))
                     .accessibilityHint(Text("Still listening"))
             }
         }

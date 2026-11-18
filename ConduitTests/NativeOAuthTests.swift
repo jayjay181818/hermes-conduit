@@ -341,6 +341,73 @@ final class NativeOAuthTests: XCTestCase {
         )
     }
 
+    /// Hermes' session token goes in Hermes' own header, so an
+    /// `Authorization` header stays free for a proxy (issue 2442).
+    func testASessionTokenGoesInHermesOwnHeaderNotAuthorization() async throws {
+        var seen: [URLRequest] = []
+        NativeOAuthURLProtocolStub.handler = { request in
+            seen.append(request)
+            return (200, ["ticket": "ticket-1"])
+        }
+        let client = makeClient()
+        let ticket = try await client.mintTicket(accessToken: "deployment-token", asSessionToken: true)
+        XCTAssertEqual(ticket, "ticket-1")
+        XCTAssertEqual(seen.last?.value(forHTTPHeaderField: "X-Hermes-Session-Token"), "deployment-token")
+        XCTAssertNil(seen.last?.value(forHTTPHeaderField: "Authorization"))
+
+        _ = try await client.mintTicket(accessToken: "native-access")
+        XCTAssertEqual(seen.last?.value(forHTTPHeaderField: "Authorization"), "Bearer native-access")
+        XCTAssertNil(seen.last?.value(forHTTPHeaderField: "X-Hermes-Session-Token"))
+    }
+
+    @MainActor
+    func testASessionTokenSignInNeverRefreshesAndKeepsAProxysAuthorization() {
+        let session = NativeOAuthTokenSet.sessionToken("deployment-token")
+        XCTAssertTrue(session.isSessionToken)
+        XCTAssertFalse(session.needsRefresh())
+        XCTAssertTrue(session.refreshToken.isEmpty)
+        var request = URLRequest(url: URL(string: "https://hermes.example/api/status")!)
+        request.setValue("Basic cHJveHk6cHJveHk=", forHTTPHeaderField: "Authorization")
+        session.authorize(&request)
+        XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Basic cHJveHk6cHJveHk=")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "X-Hermes-Session-Token"), "deployment-token")
+        XCTAssertEqual(session.sentAccessToken(in: request), "deployment-token")
+
+        let native = tokens()
+        XCTAssertFalse(native.isSessionToken)
+        native.authorize(&request)
+        XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer old-access")
+        XCTAssertEqual(native.sentAccessToken(in: request), "old-access")
+        XCTAssertNil(native.sentAccessToken(in: URLRequest(url: URL(string: "https://hermes.example")!)))
+
+        XCTAssertNil(SessionTokenSignInForm.problem(with: "deployment-token"))
+        XCTAssertNotNil(SessionTokenSignInForm.problem(with: "two words"))
+    }
+
+    /// A session-token sign-in cancelled while Hermes checked the token
+    /// (issue 2462): nothing connects, and Keychain holds the grant the
+    /// token replaced, or nothing when there was none.
+    @MainActor
+    func testACancelledSessionTokenSignInPutsBackThePreviousGrant() {
+        let dashboardID = UUID()
+        defer { KeychainHelper.clearNativeOAuthTokens(dashboardID: dashboardID) }
+        let previous = tokens()
+        let token = tokens(access: "typed-token")
+        let replacing = NativeOAuthLoginResult(tokens: token, ticket: "ticket", previousTokens: previous)
+
+        KeychainHelper.saveNativeOAuthTokens(token, dashboardID: dashboardID)
+        XCTAssertNotNil(SessionTokenSignInForm.keep(replacing, cancelled: false, dashboardID: dashboardID), "not cancelled: it connects")
+        XCTAssertEqual(KeychainHelper.loadNativeOAuthTokens(dashboardID: dashboardID)?.accessToken, "typed-token")
+
+        XCTAssertNil(SessionTokenSignInForm.keep(replacing, cancelled: true, dashboardID: dashboardID), "cancelled: nothing connects")
+        XCTAssertEqual(KeychainHelper.loadNativeOAuthTokens(dashboardID: dashboardID)?.accessToken, previous.accessToken)
+
+        KeychainHelper.saveNativeOAuthTokens(token, dashboardID: dashboardID)
+        let first = NativeOAuthLoginResult(tokens: token, ticket: "ticket")
+        XCTAssertNil(SessionTokenSignInForm.keep(first, cancelled: true, dashboardID: dashboardID))
+        XCTAssertNil(KeychainHelper.loadNativeOAuthTokens(dashboardID: dashboardID), "no grant before: none after")
+    }
+
     @MainActor
     func testBridgeAuthModeReflectsDashboardScopedTokens() {
         let dashboardID = UUID()
@@ -590,6 +657,51 @@ final class NativeOAuthTests: XCTestCase {
         XCTAssertEqual(mutationCalls, 1)
         XCTAssertEqual(KeychainHelper.loadNativeOAuthTokens(dashboardID: dashboardID)?.accessToken, "new-access")
         session.invalidate()
+    }
+
+    /// A 401 behind a proxy reads the same as Hermes' own: the session
+    /// token is kept, the request fails as sign-in required, and nothing
+    /// is refreshed (issue 2481). A native grant with no refresh token is
+    /// still cleared.
+    @MainActor
+    func testASessionToken401KeepsTheSavedToken() async throws {
+        let dashboardID = UUID()
+        defer { KeychainHelper.clearNativeOAuthTokens(dashboardID: dashboardID) }
+        let token = NativeOAuthTokenSet.sessionToken("deployment-token")
+        XCTAssertTrue(KeychainHelper.saveNativeOAuthTokens(token, dashboardID: dashboardID))
+        var calls = 0
+        NativeOAuthURLProtocolStub.handler = { request in
+            calls += 1
+            XCTAssertNotEqual(request.url?.path, "/auth/native/refresh")
+            return (401, ["detail": "proxy"])
+        }
+        let session = NativeOAuthSession(tokens: token, dashboardID: dashboardID, client: makeClient())
+        do {
+            _ = try await session.requestJSON(path: "/api/status")
+            XCTFail("A 401 must fail the request")
+        } catch DashboardTicketBridgeError.signInRequired {
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+        XCTAssertEqual(calls, 1)
+        XCTAssertEqual(KeychainHelper.loadNativeOAuthTokens(dashboardID: dashboardID), token)
+        session.discardRejectedGrant()
+        XCTAssertEqual(KeychainHelper.loadNativeOAuthTokens(dashboardID: dashboardID), token)
+        session.invalidate()
+
+        let noRefresh = NativeOAuthTokenSet(
+            accessToken: "old-access", refreshToken: "", expiresAt: 4_000_000_000, provider: "google", userID: "user"
+        )
+        XCTAssertTrue(KeychainHelper.saveNativeOAuthTokens(noRefresh, dashboardID: dashboardID))
+        let native = NativeOAuthSession(tokens: noRefresh, dashboardID: dashboardID, client: makeClient())
+        _ = try? await native.requestJSON(path: "/api/status")
+        XCTAssertNil(KeychainHelper.loadNativeOAuthTokens(dashboardID: dashboardID))
+        native.invalidate()
+
+        XCTAssertNotEqual(
+            SessionTokenSignInForm.refusalProblem(behindProxy: true),
+            SessionTokenSignInForm.refusalProblem(behindProxy: false)
+        )
     }
 
     /// Location's host pass copies the access token; it's saved again on

@@ -90,7 +90,7 @@ struct V2TopBar<Trailing: View, LowerLeading: View>: View {
             needsYou: appState.needsYou,
             scrolls: scrolls,
             unread: unread,
-            showsAllChip: leadsWithAllChip && AllProfilesChats.isAvailable(profiles: appState.profiles),
+            showsAllChip: leadsWithAllChip && appState.allProfilesChatsAvailable,
             onManage: { showProfileManager = true },
             onChooseAll: { showAllProfilesChooser = true }
         )
@@ -318,11 +318,15 @@ struct V2ProfileStrip: View {
                 // starts at the first profile; bring the selected one in.
                 // After the first layout pass, or the scroll does nothing.
                 .onAppear {
-                    Task { @MainActor in proxy.scrollTo(appState.activeProfile, anchor: .center) }
+                    Task { @MainActor in proxy.scrollTo(selectedChipID, anchor: .center) }
                 }
-                .onChange(of: appState.activeProfile) { _, profile in
+                // In a group, the chip is the dashboard's and the profile's:
+                // a switch to another dashboard on the same profile name
+                // scrolls to that dashboard's, never the one just left
+                // (Eric, 2026-11-16: the strip bounced off the pick).
+                .onChange(of: selectedChipID) { _, id in
                     withAnimation(ConduitMotion.ease(reduceMotion: reduceMotion)) {
-                        proxy.scrollTo(profile, anchor: .center)
+                        proxy.scrollTo(id, anchor: .center)
                     }
                 }
             }
@@ -332,15 +336,45 @@ struct V2ProfileStrip: View {
         }
     }
 
+    /// The selected profile's chip: in a group, keyed by its dashboard too.
+    private var selectedChipID: String {
+        groupChips.isEmpty ? appState.activeProfile
+            : CombinedBotsHomeOrder.key(appState.activeDashboardID, appState.activeProfile)
+    }
+
+    /// Chats in a combined group: every dashboard's profiles in one row,
+    /// in the group's order, each with its dashboard's badge (Eric,
+    /// 2026-11-16). Empty elsewhere, and until another dashboard's
+    /// profiles are known.
+    private var groupChips: [CombinedProfileChip] {
+        guard showsAllChip else { return [] }
+        let chips = appState.combinedProfileStrip(own: profiles)
+        return chips.contains(where: \.isOther) ? chips : []
+    }
+
     private var chips: some View {
-        HStack(spacing: 8) {
+        let group = groupChips
+        return HStack(spacing: 8) {
             if showsAllChip {
                 allChip
                     .id(Self.allChipID)
             }
-            ForEach(profiles, id: \.self) { profile in
-                chip(profile, unread: unread.contains(profile))
-                    .id(profile)
+            if group.isEmpty {
+                ForEach(profiles, id: \.self) { profile in
+                    chip(profile, unread: unread.contains(profile))
+                        .id(profile)
+                }
+            } else {
+                let avatars = otherAvatars(group)
+                ForEach(group) { item in
+                    if item.isOther, let dashboardID = item.dashboardID {
+                        otherChip(item.profile, in: dashboardID, avatar: avatars[item.id])
+                            .id(item.id)
+                    } else {
+                        chip(item.profile, unread: unread.contains(item.profile), badge: item.dashboardID)
+                            .id(item.id)
+                    }
+                }
             }
         }
         .padding(.vertical, 2)
@@ -390,7 +424,63 @@ struct V2ProfileStrip: View {
     /// One view per profile whichever is selected, so a switch moves the
     /// glass capsule and the name across instead of swapping two different
     /// buttons (which also reloaded both pictures).
-    private func chip(_ profile: String, unread: Bool) -> some View {
+    /// The pictures this phone saved for the other dashboards' profiles:
+    /// the ones Bots Home's read of that dashboard already holds, so a
+    /// redraw lists no folder; the folder only before that read.
+    private func otherAvatars(_ chips: [CombinedProfileChip]) -> [String: URL] {
+        var urls: [String: URL] = [:]
+        for id in Set(chips.filter(\.isOther).compactMap(\.dashboardID)) {
+            let saved = appState.combinedDashboardBots[id]?.avatars
+                ?? appState.profileAppearanceStore.loadAvatarURLs(dashboardID: id)
+            for chip in chips where chip.dashboardID == id { urls[chip.id] = saved[chip.profile] }
+        }
+        return urls
+    }
+
+    /// Another combined dashboard's profile: its picture, dimmed as an
+    /// unselected chip, with the dashboard's badge and what waits there. A
+    /// tap switches to that dashboard (through its kept connection), then
+    /// to the profile, as a pick on one dashboard does.
+    private func otherChip(_ profile: String, in dashboardID: UUID, avatar: URL?) -> some View {
+        let waiting = (needsYou.otherDashboards[dashboardID] ?? [])
+            .filter { appState.profilesMatch($0.profile, profile) }.count
+        let dashboardName = appState.combinedDashboardBadge(dashboardID)?.name ?? ""
+        return Button {
+            Haptics.selection()
+            Task { @MainActor in
+                guard await appState.switchForCombinedProfile(in: dashboardID, profile: profile) else { return }
+                if !appState.profilesMatch(appState.activeProfile, profile) {
+                    shell.pickProfile(profile)
+                }
+            }
+        } label: {
+            ProfileAvatarView(profile: profile, displayName: profile, url: avatar, size: pictureSize, dashboardID: dashboardID)
+                .opacity(0.62)
+                .overlay(alignment: .bottomTrailing) {
+                    CombinedDashboardBadge(dashboardID: dashboardID, size: 14)
+                        .offset(x: 2, y: 2)
+                        .accessibilityHidden(true)
+                }
+                .overlay(alignment: .topTrailing) {
+                    if waiting > 0 {
+                        NeedsYouCountBadge(count: waiting)
+                            .offset(x: 5, y: -4)
+                            .transition(.opacity)
+                            .accessibilityHidden(true)
+                    }
+                }
+                .padding(3)
+                .frame(minWidth: 44, minHeight: 44)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(PressableButtonStyle())
+        .accessibilityIdentifier("v2.profile.\(dashboardID.uuidString).\(profile)")
+        .accessibilityLabel(AppLocalization.string("\(profile) profile", table: .chat))
+        .accessibilityValue(Self.spokenValue(waiting: waiting, also: dashboardName.isEmpty ? nil : dashboardName))
+        .accessibilityHint(AppLocalization.string("Switches to that dashboard and this profile", table: .chat))
+    }
+
+    private func chip(_ profile: String, unread: Bool, badge: UUID? = nil) -> some View {
         let name = appState.profileDisplayName(profile)
         let isSelected = !allSelected && profile == appState.activeProfile
         let waiting = needsYou.count(for: profile, matches: appState.profilesMatch)
@@ -420,8 +510,19 @@ struct V2ProfileStrip: View {
                 Haptics.selection()
                 appState.setAllProfilesChatsOn(false)
             } else {
-                if allSelected { appState.setAllProfilesChatsOn(false) }
-                shell.pickProfile(profile)
+                // The shell turns All off as the switch starts, and during
+                // a call only once the user accepts, so Cancel leaves the
+                // list as it was (V2Shell.pickProfile). A pick while a
+                // switch runs is only kept for later and asks nothing, so
+                // All goes off now, as before.
+                if allSelected, switching {
+                    appState.setAllProfilesChatsOn(false)
+                    shell.pickProfile(profile)
+                } else if allSelected {
+                    shell.pickProfileLeavingAll(profile)
+                } else {
+                    shell.pickProfile(profile)
+                }
             }
         } label: {
             HStack(spacing: 7) {
@@ -431,6 +532,15 @@ struct V2ProfileStrip: View {
                         Circle()
                             .strokeBorder(Color.conduitAccent, lineWidth: 1.5)
                             .opacity(isSelected ? 1 : 0)
+                    }
+                    // In a combined group's strip, every profile carries its
+                    // dashboard's badge, this one's too.
+                    .overlay(alignment: .bottomTrailing) {
+                        if let badge {
+                            CombinedDashboardBadge(dashboardID: badge, size: 14)
+                                .offset(x: 2, y: 2)
+                                .accessibilityHidden(true)
+                        }
                     }
                     // Another profile's unread. With one chip the waiting
                     // badge owns the top-trailing corner, so the dot moves
@@ -491,9 +601,9 @@ struct V2ProfileStrip: View {
         .buttonStyle(PressableButtonStyle())
         .modifier(DashboardSwitchMenu(enabled: profile == appState.activeProfile))
         .accessibilityIdentifier(isSelected ? "sidebar.workspace" : "v2.profile.\(profile)")
-        .accessibilityLabel(AppLocalization.string("\(name) profile"))
-        .accessibilityValue(Self.spokenValue(waiting: waiting, unread: unreadValue))
-        .accessibilityHint(currentOnly || (isSelected && !(appState.isProfileSwitching || shell.isPickingProfile)) ? AppLocalization.string("Manage profiles") : AppLocalization.string("Switches to this profile"))
+        .accessibilityLabel(AppLocalization.string("\(name) profile", table: .chat))
+        .accessibilityValue(Self.spokenValue(waiting: waiting, also: unreadValue))
+        .accessibilityHint(currentOnly || (isSelected && !(appState.isProfileSwitching || shell.isPickingProfile)) ? AppLocalization.string("Manage profiles", table: .chat) : AppLocalization.string("Switches to this profile", table: .chat))
         .accessibilityAddTraits(isSelected ? .isSelected : [])
     }
 
@@ -588,10 +698,10 @@ struct V2ProfileStrip: View {
         .accessibilityLabel(AppLocalization.string("All profiles"))
         .accessibilityValue(Self.spokenValue(
             waiting: waiting,
-            unread: currentOnly && !unread.isEmpty ? AppLocalization.string("Unread in another profile") : nil
+            also: currentOnly && !unread.isEmpty ? AppLocalization.string("Unread in another profile") : nil
         ))
         .accessibilityHint(isSelected
-            ? AppLocalization.string("Chooses which profiles All shows")
+            ? AppLocalization.string("Chooses which profiles All shows", table: .chat)
             : AppLocalization.string("Shows the chats of several profiles in one list"))
         .accessibilityAddTraits(isSelected ? .isSelected : [])
     }
@@ -613,6 +723,8 @@ struct V2ProfileStrip: View {
 private struct DashboardSwitchMenu: ViewModifier {
     @EnvironmentObject private var appState: AppState
     let enabled: Bool
+    /// A switch picked during a call, waiting on the user's answer (issue 2390).
+    @State private var pendingCallEndingSwitch: CallEndingSwitch?
 
     func body(content: Content) -> some View {
         // Always attached, with the items gated: switching the modifier on
@@ -626,10 +738,17 @@ private struct DashboardSwitchMenu: ViewModifier {
                     ForEach(others) { dashboard in
                         Button {
                             Haptics.medium()
-                            Task { await appState.switchDashboard(to: dashboard.id) }
+                            appState.switchEndingCall(to: dashboard.label, pending: &pendingCallEndingSwitch) {
+                                Task { await appState.switchDashboard(to: dashboard.id) }
+                            }
                         } label: {
                             Label {
                                 Text(verbatim: dashboard.label)
+                                // A combined dashboard says how it is
+                                // beside this one (stage 3c).
+                                if let status = appState.combinedDashboardStatus(dashboard.id) {
+                                    Text(verbatim: status.label)
+                                }
                             } icon: {
                                 Image(systemName: "server.rack")
                             }
@@ -638,6 +757,7 @@ private struct DashboardSwitchMenu: ViewModifier {
                 }
             }
         }
+        .callEndingSwitchConfirmation($pendingCallEndingSwitch)
     }
 }
 
@@ -769,10 +889,11 @@ struct V2SegmentedControl<Value: Hashable>: View {
 
 
 extension V2ProfileStrip {
-    /// A chip's spoken value: what waits there, then its unread line, which
-    /// the one chip words as another profile's.
-    static func spokenValue(waiting: Int, unread: String?) -> String {
-        [waiting > 0 ? AppLocalization.string("\(Int(waiting)) waiting on you") : nil, unread]
+    /// A chip's spoken value: what waits there, then what else the chip
+    /// says (its unread line, which the one chip words as another
+    /// profile's, or another dashboard's name).
+    static func spokenValue(waiting: Int, also: String?) -> String {
+        [waiting > 0 ? AppLocalization.string("\(Int(waiting)) waiting on you", table: .chat) : nil, also]
             .compactMap { $0 }.joined(separator: ", ")
     }
 

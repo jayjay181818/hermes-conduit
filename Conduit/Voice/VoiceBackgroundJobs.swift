@@ -170,6 +170,17 @@ struct VoiceBackgroundJob: Identifiable, Equatable {
     /// Whether a background job's first prompt went to Hermes. Until then a
     /// follow-up joins its instructions instead of interrupting it.
     var requestSent = false
+    /// Whether a continued job holds its chat while it checks the chat is
+    /// free and finds its runtime: the call's other requests wait meanwhile.
+    /// Once its request counts as sent, `requestSent` holds the chat instead.
+    var claimsChat = false
+    /// Whether a continued job's submit began (after its turn surface
+    /// report). Until then a cancel interrupts nothing in its chat.
+    var submitted = false
+    /// A continued job's submit is on its way: it holds its chat until the
+    /// submit returns, cancelled or not, so a cancel repeated then never
+    /// stops the call's next request there (issue 2295).
+    var submitInFlight = false
     /// A follow-up being put into the running turn (#451). While it is on
     /// its way, or waits to run as the next turn, a completion isn't taken
     /// as the request's end.
@@ -292,6 +303,10 @@ enum VoiceBackgroundJobNotice: Equatable {
     case submit(prompt: String, fallback: String)
 }
 
+/// A job whose request was never sent (a cancel or reset overtook it): its
+/// turn surface report is dropped, as after a refused send.
+struct VoiceJobNotSentError: Error {}
+
 /// Hermes operations the supervisor needs. Closures (not a protocol) so
 /// AppState can bind them to whichever client is current at call time and
 /// tests can script them.
@@ -330,9 +345,19 @@ struct VoiceBackgroundJobBackend {
     /// while its session is made can't file it under another bot.
     var activeProfile: @MainActor () -> String? = { nil }
     var submit: @MainActor (_ sessionID: String, _ text: String) async throws -> Void
+    /// Tells the plugin where a job's request came from, just before its
+    /// submit (TurnSurface, #888): spoken, from the Watch for a Watch call's
+    /// job. Returns what forgets that report when the submit fails or a
+    /// cancel or reset overtakes the start before it.
+    var reportTurnSurface: @MainActor (_ sessionID: String, _ text: String, _ fromWatch: Bool) async
+        -> @MainActor (Error) -> Void = { _, _, _ in { _ in } }
     var cancel: @MainActor (_ sessionID: String) async throws -> Void
     /// The live runtimes of `profile` (nil: the active profile).
     var liveSessions: @MainActor (_ profile: String?) async throws -> [LiveSessionStatus]
+    /// Read-only confirmation for a runtime its profile's registry has never
+    /// listed: true/false when Hermes knows, nil when it cannot say. Throws
+    /// session-not-found when the runtime is gone; other errors prove nothing.
+    var sessionRunning: @MainActor (_ sessionID: String, _ profile: String?) async throws -> Bool? = { _, _ in nil }
     /// Maps a spoken profile or bot name to the profile it names.
     var resolveProfile: @MainActor (_ spokenName: String) -> VoiceJobProfileTarget = { _ in .unknown }
     /// Whether a turn is running in the attached chat right now.
@@ -684,6 +709,10 @@ final class VoiceBackgroundJobSupervisor: ObservableObject, VoiceBackgroundJobHa
 
     /// The host's call watches; nil when Hermes can't call.
     var callbacks: VoiceCallbackBackend?
+    /// The hanging-up call's profile, set as its pass starts: a pass's
+    /// notice names it where the job names none, so a hand-back while the
+    /// pass waits can't send the notice to the profile on screen.
+    var settlingCallProfile: String?
     /// Answers what a call from Hermes waits on (#449 step 4); nil before
     /// AppState sets it.
     var callDecisions: VoiceCallDecisions?
@@ -812,6 +841,12 @@ final class VoiceBackgroundJobSupervisor: ObservableObject, VoiceBackgroundJobHa
     }
     private var callbackWatches: [UUID: CallbackWatch] = [:]
     private var callbackSyncTask: Task<Void, Never>?
+    /// The callback pass still running (a hang-up's settles its watches).
+    var callbackSyncInFlight: Task<Void, Never>? { callbackSyncTask }
+    #if DEBUG
+    /// A callback pass that a test holds open, as a hang-up's is on the wire.
+    func holdCallbackSyncForTesting(_ pass: Task<Void, Never>) { callbackSyncTask = pass }
+    #endif
     private var callbackSyncAgain = false
     private var callbackRenewTask: Task<Void, Never>?
     /// What classic voice says first when a call from Hermes opened it.
@@ -976,6 +1011,34 @@ final class VoiceBackgroundJobSupervisor: ObservableObject, VoiceBackgroundJobHa
         }
     }
 
+    /// The pass that set `settlingCallProfile`: only its own end clears it.
+    private var settlingPass: UUID?
+
+    /// The hang-up pass for a call on `callProfile`: its notices name that
+    /// profile where a job names none, and the profile is cleared as the
+    /// pass ends, unless a later pass set its own (#2630's review). With no
+    /// call to finish, or nothing of the call's to settle, a pass still
+    /// running keeps its profile and none is left set.
+    @discardableResult
+    func finishCallbacks(callProfile: String?) -> Task<Void, Never>? {
+        guard callbackCallID != nil else { return nil }
+        let previous = (pass: settlingPass, profile: settlingCallProfile)
+        let pass = UUID()
+        settlingPass = pass
+        settlingCallProfile = callProfile
+        guard let task = finishCallbacks() else {
+            settlingPass = previous.pass
+            settlingCallProfile = previous.profile
+            return nil
+        }
+        return Task { [weak self] in
+            await task.value
+            guard let self, self.settlingPass == pass else { return }
+            self.settlingPass = nil
+            self.settlingCallProfile = nil
+        }
+    }
+
     /// The call hung up: what it asked to be called about is let go of on
     /// the host, and a job that ended without the call telling it gets
     /// Conduit's own notification. Called before the call lets go of its
@@ -1003,6 +1066,76 @@ final class VoiceBackgroundJobSupervisor: ObservableObject, VoiceBackgroundJobHa
         guard callbackWatches.values.contains(where: { $0.callID == callID }) else { return nil }
         syncCallbacks()
         return callbackSyncTask
+    }
+
+    /// One ended call's watch, settled apart from the supervisor.
+    private struct DetachedCallbackSettle {
+        let watchID: String?
+        let profile: String?
+        let notify: VoiceCallbackTarget?
+        let kind: HermesCallRequest.Kind?
+    }
+
+    /// The ended call's watches whose jobs are over, settled apart from the
+    /// supervisor: a new call that starts at once resets it while the
+    /// hang-up's pass is still on the wire, and the reset would cancel the
+    /// pass (issue 2551). Each is let go of on the host, and one that ended
+    /// without the call telling it gets Conduit's own notification, as the
+    /// pass does. A watch whose job still runs is left to its hold, which
+    /// lapses on the host within `callbackHoldSeconds`; Hermes calls as
+    /// usual after that. Taken before the reset; the task runs on its own.
+    /// `callProfile` is the ended call's profile, named on each settle
+    /// whose watch or job names none: the task runs after the hand-back,
+    /// when "no profile" would mean the one on screen (#2626's review).
+    @discardableResult
+    func detachEndedCallbackSettles(callProfile: String? = nil) -> Task<Void, Never>? {
+        guard let callbacks else { return nil }
+        var settles: [DetachedCallbackSettle] = []
+        func pinned(_ target: VoiceCallbackTarget?) -> VoiceCallbackTarget? { Self.pin(target, to: callProfile) }
+        for (id, entry) in Array(callbackWatches) {
+            let profile = entry.profile ?? callProfile
+            guard let callID = entry.callID, callID != callbackCallID else { continue }
+            guard let job = job(id) else {
+                // Settled and told: nothing to call about.
+                settles.append(DetachedCallbackSettle(watchID: entry.watchID, profile: profile, notify: nil, kind: nil))
+                callbackWatches[id] = nil
+                continue
+            }
+            switch job.status {
+            case .cancelled:
+                settles.append(DetachedCallbackSettle(watchID: entry.watchID, profile: profile, notify: nil, kind: nil))
+            case .finished, .failed:
+                let untold = entry.untoldAtHangUp ?? callbackOutcomeUntold(id)
+                let target = untold ? pinned(Self.callbackTarget(job)) : nil
+                if target != nil { update(id) { $0.outcomeDelivered = true } }
+                settles.append(DetachedCallbackSettle(
+                    watchID: entry.watchID, profile: profile, notify: target,
+                    kind: job.status == .finished ? .done : .failed
+                ))
+            case .starting, .running, .needsInput:
+                // The host already saw it end: told at once, as the pass
+                // would, rather than after the hold lapses.
+                guard entry.hostSawEnd, let target = pinned(Self.callbackTarget(job)),
+                      job.isThreadTurn || job.requestSent else { continue }
+                settles.append(DetachedCallbackSettle(watchID: nil, profile: profile, notify: target, kind: entry.hostEndKind))
+            }
+            callbackWatches[id] = nil
+        }
+        guard !settles.isEmpty else { return nil }
+        return Task { @MainActor in
+            for settle in settles {
+                if let watchID = settle.watchID { try? await callbacks.cancel(watchID, settle.profile) }
+                if let target = settle.notify { await callbacks.notify(target, settle.kind) }
+            }
+        }
+    }
+
+    /// `target` naming `profile` where it names none.
+    static func pin(_ target: VoiceCallbackTarget?, to profile: String?) -> VoiceCallbackTarget? {
+        guard let target, target.profile == nil, let profile else { return target }
+        return VoiceCallbackTarget(title: target.title, sessionIDs: target.sessionIDs,
+                                   runtimeSessionID: target.runtimeSessionID,
+                                   storedSessionID: target.storedSessionID, profile: profile)
     }
 
     /// Whether the job ended without the user hearing how: no notice taken
@@ -1034,17 +1167,22 @@ final class VoiceBackgroundJobSupervisor: ObservableObject, VoiceBackgroundJobHa
             if let watchID = entry.watchID { try? await callbacks.cancel(watchID, entry.profile) }
             return
         }
-        let target = Self.callbackTarget(job)
+        let target = Self.pin(Self.callbackTarget(job), to: entry.profile ?? settlingCallProfile)
         switch job.status {
         case .cancelled:
             if let watchID = entry.watchID { try? await callbacks.cancel(watchID, entry.profile) }
         case .finished, .failed:
             let untold = entry.untoldAtHangUp ?? callbackOutcomeUntold(id)
+            // Decided and marked before the cancel's wait: the watch is out
+            // of the list already, so a reset in that wait (a new call
+            // handing the jobs back) can't settle it apart, and the notice
+            // still goes (#2626's review).
+            let notify = generation == self.generation && untold ? target : nil
+            if notify != nil { update(id) { $0.outcomeDelivered = true } }
             if let watchID = entry.watchID { try? await callbacks.cancel(watchID, entry.profile) }
-            guard generation == self.generation, untold, let target else { break }
+            guard let notify else { break }
             // Ended without the call telling it: Conduit calls itself.
-            update(id) { $0.outcomeDelivered = true }
-            await callbacks.notify(target, job.status == .finished ? .done : .failed)
+            await callbacks.notify(notify, job.status == .finished ? .done : .failed)
         case .starting, .running, .needsInput:
             // A chat request still waiting its turn goes with the call.
             if job.isThreadTurn, !job.threadTurnSubmitted { break }
@@ -1446,7 +1584,7 @@ final class VoiceBackgroundJobSupervisor: ObservableObject, VoiceBackgroundJobHa
         }
         let activeCount = activeJobCount
         guard activeCount < Self.maximumActiveJobs else {
-            return AppLocalization.string("You already have \(activeCount) background jobs running. Cancel them before starting another.")
+            return AppLocalization.string("You already have \(activeCount) background jobs running. Cancel them before starting another.", table: .voice)
         }
         let routed = VoiceJobProfiles.route(instructions: requested, spokenProfile: spokenProfile, resolve: { self.backend.resolveProfile($0) })
         let instructions: String
@@ -1528,7 +1666,7 @@ final class VoiceBackgroundJobSupervisor: ObservableObject, VoiceBackgroundJobHa
                 return await abandonStart(job, sessionID: createdSessionID, generation: generation)
             }
             guard let runtimeID = createdSessionID else {
-                throw VoiceAudioError.unavailable(AppLocalization.string("Hermes did not return a session."))
+                throw VoiceAudioError.unavailable(AppLocalization.string("Hermes did not return a session.", table: .voice))
             }
             update(job.id) {
                 $0.runtimeSessionID = runtimeID
@@ -1550,7 +1688,19 @@ final class VoiceBackgroundJobSupervisor: ObservableObject, VoiceBackgroundJobHa
                 $0.requestSent = true
                 $0.sentAt = Date()
             }
-            try await backend.submit(runtimeID, Self.jobPrompt(for: request))
+            let prompt = Self.jobPrompt(for: request)
+            let dropTurnSurface = await backend.reportTurnSurface(runtimeID, prompt, fromWatch)
+            // A cancel or reset while the report went: nothing is sent.
+            guard startIsCurrent(job.id, generation: generation) else {
+                dropTurnSurface(VoiceJobNotSentError())
+                return await abandonStart(job, sessionID: runtimeID, generation: generation)
+            }
+            do {
+                try await backend.submit(runtimeID, prompt)
+            } catch {
+                dropTurnSurface(error)
+                throw error
+            }
             // Events may legitimately move the job past .starting while
             // submit awaits; only a cancel or a reset retires it here. A
             // cancel that landed mid-submit reached Hermes before the turn
@@ -1611,7 +1761,7 @@ final class VoiceBackgroundJobSupervisor: ObservableObject, VoiceBackgroundJobHa
     ) async -> String {
         let activeCount = activeJobCount
         guard activeCount < Self.maximumActiveJobs else {
-            return AppLocalization.string("You already have \(activeCount) background jobs running. Cancel them before starting another.")
+            return AppLocalization.string("You already have \(activeCount) background jobs running. Cancel them before starting another.", table: .voice)
         }
         var job = VoiceBackgroundJob(
             id: UUID(),
@@ -1641,14 +1791,29 @@ final class VoiceBackgroundJobSupervisor: ObservableObject, VoiceBackgroundJobHa
     private func sendContinuedJob(
         _ jobID: UUID, in chat: VoiceThreadTarget, generation: UInt64, onRuntime: (@MainActor (String) -> Void)? = nil
     ) async {
+        // However it ends, the call's thread turns it held go in.
+        defer { pumpThreadTurns() }
         while generation == self.generation, job(jobID)?.status == .starting {
             // One request at a time in the chat: an earlier job of the call
-            // still running there, or a turn typed in it, goes first.
+            // still running there, a thread turn of the call sent there, or a
+            // turn typed in it, goes first. A job
+            // claims the chat before it asks whether a turn runs there, so
+            // two of the call's requests never both pass during that wait
+            // (issue 2283).
+            // A thread turn is matched by its chat as runThreadTurns matches
+            // them, so one sent on a runtime the chat resumed onto since
+            // still counts (issue 2325).
             let earlier = jobs.contains { other in
-                other.id != jobID && other.status.isActive && other.requestSent
-                    && [other.runtimeSessionID, other.storedSessionID].compactMap { $0 }.contains { chat.owns(sessionID: $0) }
+                other.id != jobID && (other.submitInFlight || other.status.isActive
+                    && (other.requestSent || other.claimsChat || other.isThreadTurn && other.threadTurnSubmitted))
+                    && ([other.runtimeSessionID, other.storedSessionID].compactMap { $0 }.contains { chat.owns(sessionID: $0) }
+                        || other.isThreadTurn && threadTargets[other.id].map { Self.sameChat($0, chat) } == true)
             }
-            if !earlier, !(await backend.threadIsBusy(chat)) { break }
+            if !earlier {
+                update(jobID) { $0.claimsChat = true }
+                if !(await backend.threadIsBusy(chat)) { break }
+                update(jobID) { $0.claimsChat = false }
+            }
             try? await Task.sleep(for: threadWaitInterval)
         }
         guard generation == self.generation, job(jobID)?.status == .starting else { return }
@@ -1657,13 +1822,52 @@ final class VoiceBackgroundJobSupervisor: ObservableObject, VoiceBackgroundJobHa
             guard generation == self.generation, job(jobID)?.status == .starting else { return }
             let request = job(jobID)?.instructions ?? ""
             if !runtimeID.isEmpty { onRuntime?(runtimeID) }
+            // Sent from here on: a follow-up interrupts rather than joins
+            // text already reported, and the call's next request waits.
             update(jobID) {
                 if !runtimeID.isEmpty { $0.runtimeSessionID = runtimeID }
                 $0.requestSent = true
+                $0.claimsChat = false
                 $0.sentAt = Date()
             }
-            try await backend.submit(runtimeID.isEmpty ? chat.runtimeSessionID : runtimeID, Self.jobPrompt(for: request))
+            // Only a Watch call continues a chat this way: its later
+            // requests say so too, not just its first job's (#888).
+            let sessionID = runtimeID.isEmpty ? chat.runtimeSessionID : runtimeID
+            let prompt = Self.jobPrompt(for: request)
+            let dropTurnSurface = await backend.reportTurnSurface(sessionID, prompt, true)
+            // A cancel while the report went sends nothing. Until the submit
+            // begins, a cancel never interrupts the chat, whose running turn
+            // would be another's.
+            guard generation == self.generation, job(jobID)?.status == .starting else {
+                dropTurnSurface(VoiceJobNotSentError())
+                return
+            }
+            update(jobID) {
+                $0.submitted = true
+                $0.submitInFlight = true
+            }
+            // Holds the chat through the repeated cancel below too.
+            defer { update(jobID) { $0.submitInFlight = false } }
+            do {
+                try await backend.submit(sessionID, prompt)
+            } catch {
+                dropTurnSurface(error)
+                // Cancelled meanwhile: Hermes may have taken it before the
+                // answer was lost, so the cancel is repeated (issue 2295).
+                if generation == self.generation, job(jobID)?.status == .cancelled {
+                    if !sessionID.isEmpty { try? await backend.cancel(sessionID) }
+                    return
+                }
+                throw error
+            }
             guard generation == self.generation else { return }
+            // A cancel that landed mid-submit reached Hermes before the turn
+            // existed, so it is repeated now that there is one to stop, as a
+            // first job's start does (issue 2295).
+            if job(jobID)?.status == .cancelled {
+                if !sessionID.isEmpty { try? await backend.cancel(sessionID) }
+                return
+            }
             if job(jobID)?.status == .starting { update(jobID) { $0.status = .running } }
             armCallback(jobID)
             startPollingIfNeeded()
@@ -1890,7 +2094,7 @@ final class VoiceBackgroundJobSupervisor: ObservableObject, VoiceBackgroundJobHa
             return (nil, AppLocalization.string("This call isn't attached to a chat."))
         }
         guard !request.isEmpty else {
-            return (nil, AppLocalization.string("Hermes didn't get a request to send."))
+            return (nil, AppLocalization.string("Hermes didn't get a request to send.", table: .voice))
         }
         // Hermes is paused in the chat on a question or approval: a new
         // turn would only queue behind it, and nothing comes back until the
@@ -1903,7 +2107,7 @@ final class VoiceBackgroundJobSupervisor: ObservableObject, VoiceBackgroundJobHa
                 && [job.runtimeSessionID, job.storedSessionID].compactMap { $0 }.contains { thread.owns(sessionID: $0) }
         }
         if jobWaits || callWaitsOn != nil {
-            return (nil, AppLocalization.string("Hermes is paused in this chat until you answer what it asked, so it can't take another request yet. Answer it first, or ask Hermes to explain more as your answer."))
+            return (nil, AppLocalization.string("Hermes is paused in this chat until you answer what it asked, so it can't take another request yet. Answer it first, or ask Hermes to explain more as your answer.", table: .voice))
         }
         // Only this chat's turns count: ones an earlier call left running in
         // another chat don't hold this one.
@@ -1912,7 +2116,7 @@ final class VoiceBackgroundJobSupervisor: ObservableObject, VoiceBackgroundJobHa
                 && threadTargets[job.id].map { Self.sameChat($0, thread) } == true
         }.count + (callChatJobRuns(in: thread) ? 1 : 0) // the request whose chat the call took
         guard inFlight < Self.maximumThreadTurns else {
-            return (nil, AppLocalization.string("Hermes is still working on your earlier requests in this chat. Ask again once they finish."))
+            return (nil, AppLocalization.string("Hermes is still working on your earlier requests in this chat. Ask again once they finish.", table: .voice))
         }
         var job = VoiceBackgroundJob(
             id: UUID(),
@@ -1969,6 +2173,37 @@ final class VoiceBackgroundJobSupervisor: ObservableObject, VoiceBackgroundJobHa
     /// The chat the call was attached to until it was deleted: the call's
     /// new chat is made on its bot. Cleared when the call leaves.
     private(set) var deletedLiveThread: VoiceThreadTarget?
+
+    /// The ids of the sessions made on the profile in use (the jobs and the
+    /// call's chat that name no profile), for a call that keeps its profile
+    /// across a switch (all-live stage 2).
+    var sessionIDsOnActiveProfile: [String?] {
+        var ids = jobs.filter { $0.profile == nil }.flatMap { [$0.runtimeSessionID, $0.storedSessionID] }
+        for thread in [liveThread, deletedLiveThread].compactMap({ $0 }) where thread.profile == nil {
+            ids += [thread.runtimeSessionID, thread.storedSessionID]
+        }
+        return ids
+    }
+
+    /// The sessions of the jobs and the call's chat that name a profile of
+    /// their own, with it: a client made with no predecessor to inherit
+    /// them from names it for each again.
+    var sessionIDsNamingAProfile: [(profile: String, ids: [String?])] {
+        var named = jobs.compactMap { job in job.profile.map { (profile: $0, ids: [job.runtimeSessionID, job.storedSessionID]) } }
+        for thread in [liveThread, deletedLiveThread].compactMap({ $0 }) {
+            if let profile = thread.profile { named.append((profile: profile, ids: [thread.runtimeSessionID, thread.storedSessionID])) }
+        }
+        return named
+    }
+
+    /// Every session the call's jobs and thread use, whatever their profile.
+    var callSessionIDs: [String?] {
+        var ids = jobs.flatMap { [$0.runtimeSessionID, $0.storedSessionID] }
+        for thread in [liveThread, deletedLiveThread].compactMap({ $0 }) {
+            ids += [thread.runtimeSessionID, thread.storedSessionID]
+        }
+        return ids
+    }
 
     /// Whether `chat` was deleted (`noteChatDeleted`).
     func isDeletedChat(_ chat: VoiceThreadTarget) -> Bool {
@@ -2186,7 +2421,7 @@ final class VoiceBackgroundJobSupervisor: ObservableObject, VoiceBackgroundJobHa
             let chatHasSentTurn = jobs.contains { job in
                 job.isThreadTurn && job.threadTurnSubmitted && job.status.isActive && !job.isDetachedThreadTurn
                     && threadTargets[job.id].map { Self.sameChat($0, thread) } == true
-            } || callChatJobRuns(in: thread)
+            } || callChatJobRuns(in: thread) || continuedJobHoldsChat(thread)
             if chatHasSentTurn { return }
             if await backend.threadIsBusy(thread) {
                 guard generation == self.generation else { return }
@@ -2212,6 +2447,10 @@ final class VoiceBackgroundJobSupervisor: ObservableObject, VoiceBackgroundJobHa
                     continue
                 }
                 guard generation == self.generation, job(next.id)?.status == .starting else { continue }
+                // Checked again with nothing awaited before the send: a
+                // continued job that claimed the chat while this resolved
+                // holds it, and pumps this again when it lets go.
+                if continuedJobHoldsChat(thread) || continuedJobHoldsChat(resolved) { return }
                 // Only now does the turn own the chat's events. A follow-up
                 // said while it waited joined the request (#451).
                 let request = job(next.id)?.instructions ?? next.instructions
@@ -2275,6 +2514,21 @@ final class VoiceBackgroundJobSupervisor: ObservableObject, VoiceBackgroundJobHa
 
     /// Whether the job whose chat the call took (#1250) still runs there:
     /// the call's turns wait for it, as for a turn of their own.
+    /// A continued job of the call holds `thread`, from claiming it through
+    /// its submit's return: a cancel it repeats then must not stop a turn
+    /// sent meanwhile (review of #2310). Once its turn runs, the chat is
+    /// busy and that holds it. Not once the submit has returned: a failed
+    /// cancel puts the job back to starting, and holding the chat then
+    /// would keep the call's turns waiting with nothing to pump them
+    /// (issue 2325).
+    private func continuedJobHoldsChat(_ thread: VoiceThreadTarget) -> Bool {
+        jobs.contains { job in
+            job.continuesChat
+                && (job.submitInFlight || job.status == .starting && (job.claimsChat || job.requestSent && !job.submitted))
+                && [job.runtimeSessionID, job.storedSessionID].compactMap { $0 }.contains { thread.owns(sessionID: $0) }
+        }
+    }
+
     private func callChatJobRuns(in thread: VoiceThreadTarget) -> Bool {
         guard let id = callChatJobID, let job = job(id), job.status.isActive else { return false }
         return [job.runtimeSessionID, job.storedSessionID].compactMap { $0 }.contains { thread.owns(sessionID: $0) }
@@ -2334,7 +2588,7 @@ final class VoiceBackgroundJobSupervisor: ObservableObject, VoiceBackgroundJobHa
     private func failedStartReply(_ id: UUID) -> String {
         update(id) { $0.outcomeDelivered = true }
         pruneSettledJobs()
-        return AppLocalization.string("Couldn't start the background job.")
+        return AppLocalization.string("Couldn't start the background job.", table: .voice)
     }
 
     /// A start is still wanted while its job is `.starting` in the ledger
@@ -2349,7 +2603,7 @@ final class VoiceBackgroundJobSupervisor: ObservableObject, VoiceBackgroundJobHa
     private func abandonStart(_ job: VoiceBackgroundJob, sessionID: String?, generation: UInt64) async -> String {
         if let sessionID { try? await backend.cancel(sessionID) }
         guard generation == self.generation else {
-            return AppLocalization.string("Couldn't start the background job.")
+            return AppLocalization.string("Couldn't start the background job.", table: .voice)
         }
         return AppLocalization.string("\(job.title) was cancelled.")
     }
@@ -2357,15 +2611,15 @@ final class VoiceBackgroundJobSupervisor: ObservableObject, VoiceBackgroundJobHa
     func statusSummary() -> String {
         let visible = listedJobs
         guard !visible.isEmpty else {
-            return AppLocalization.string("No background jobs are running.")
+            return AppLocalization.string("No background jobs are running.", table: .voice)
         }
         return visible.map { job -> String in
             let title = job.title
             switch job.status {
             case .starting, .running:
-                return AppLocalization.string("\(title) is still running.")
+                return AppLocalization.string("\(title) is still running.", table: .voice)
             case .needsInput:
-                return AppLocalization.string("\(title) is waiting for your input.")
+                return AppLocalization.string("\(title) is waiting for your input.", table: .voice)
             case .finished:
                 return AppLocalization.string("\(title) has finished.")
             case .failed:
@@ -2379,18 +2633,18 @@ final class VoiceBackgroundJobSupervisor: ObservableObject, VoiceBackgroundJobHa
     func cancelAll() async -> String {
         let targets = backgroundJobs.filter { $0.status.isActive }
         guard !targets.isEmpty else {
-            return AppLocalization.string("There are no background jobs to cancel.")
+            return AppLocalization.string("There are no background jobs to cancel.", table: .voice)
         }
         var failures: [String] = []
         for job in targets {
             if !(await cancelOnHermes(job)) {
-                failures.append(AppLocalization.string("Couldn't cancel \(job.title). It may still be running."))
+                failures.append(AppLocalization.string("Couldn't cancel \(job.title). It may still be running.", table: .voice))
             }
         }
         stopPollingIfIdle()
         pruneSettledJobs()
         let count = targets.count - failures.count
-        let summary = count > 0 ? [AppLocalization.string("Cancelled \(count) background jobs.")] : []
+        let summary = count > 0 ? [AppLocalization.string("Cancelled \(count) background jobs.", table: .voice)] : []
         return (summary + failures).joined(separator: " ")
     }
 
@@ -2426,13 +2680,15 @@ final class VoiceBackgroundJobSupervisor: ObservableObject, VoiceBackgroundJobHa
         pruneSettledJobs()
         return cancelled
             ? AppLocalization.string("\(job.title) was cancelled.")
-            : AppLocalization.string("Couldn't cancel \(job.title). It may still be running.")
+            : AppLocalization.string("Couldn't cancel \(job.title). It may still be running.", table: .voice)
     }
 
     /// Marks the job cancelled and interrupts its Hermes session. If Hermes
     /// refuses, the job goes back to what it was and stays supervised, so
     /// nobody is told a running job stopped. Returns whether it cancelled.
+    /// A session-not-found answer confirms there is nothing left to stop.
     private func cancelOnHermes(_ job: VoiceBackgroundJob) async -> Bool {
+        let generation = generation
         // Mark first: the interrupt's own terminal event must read as a
         // cancellation, not a failure to announce.
         update(job.id) {
@@ -2442,21 +2698,31 @@ final class VoiceBackgroundJobSupervisor: ObservableObject, VoiceBackgroundJobHa
         callbackJobMayHaveSettled(job.id)
         // Still waiting its turn in the call's chat: what runs there is
         // another request's, so nothing is interrupted.
-        if job.continuesChat, !job.requestSent { return true }
+        if job.continuesChat, !job.submitted { return true }
         guard let sessionID = job.runtimeSessionID else { return true }
         do {
             try await backend.cancel(sessionID)
+            guard generation == self.generation else { return false }
             // The call's chat is free of its first request: the call's
             // turns waiting on it go in (#1250).
             if job.isCallChat { pumpThreadTurns() }
             return true
         } catch {
+            guard generation == self.generation else { return false }
+            // A reaped runtime cannot be interrupted and has nothing left
+            // to cancel. Keep the user's cancellation instead of reviving it.
+            if HermesClient.isSessionNotFoundError(error) {
+                if job.isCallChat || job.continuesChat { pumpThreadTurns() }
+                return true
+            }
             if self.job(job.id)?.status == .cancelled {
                 update(job.id) {
                     $0.status = job.status
                     $0.outcomeDelivered = job.outcomeDelivered
                 }
             }
+            // The call's turns that waited on it go in once nothing holds the chat.
+            if job.continuesChat { pumpThreadTurns() }
             return false
         }
     }
@@ -3106,11 +3372,11 @@ final class VoiceBackgroundJobSupervisor: ObservableObject, VoiceBackgroundJobHa
     }
 
     static func finishedNotice(_ title: String) -> String {
-        AppLocalization.string("\(title) has finished. Open it in Conduit to read the result.")
+        AppLocalization.string("\(title) has finished. Open it in Conduit to read the result.", table: .voice)
     }
 
     static func waitingNotice(_ title: String) -> String {
-        AppLocalization.string("\(title) is waiting for your approval or an answer. Open it in Conduit to respond.")
+        AppLocalization.string("\(title) is waiting for your approval or an answer. Open it in Conduit to respond.", table: .voice)
     }
 
     /// What a job waiting on the user says: the command it asks to run,
@@ -3123,7 +3389,7 @@ final class VoiceBackgroundJobSupervisor: ObservableObject, VoiceBackgroundJobHa
         let asked = HermesApprovalText.description(approval.description).trimmingCharacters(in: .whitespacesAndNewlines)
         let what = asked.isEmpty ? HermesApprovalText.command(approval.command) : asked
         let clipped = what.count > 200 ? String(what.prefix(200)) + "…" : what
-        return AppLocalization.string("\(job.title) needs your OK to go on: \(clipped). Say yes to allow it once, or no.")
+        return AppLocalization.string("\(job.title) needs your OK to go on: \(clipped). Say yes to allow it once, or no.", table: .voice)
     }
 
     /// A job's question, with its choices numbered as an answer names them.
@@ -3135,7 +3401,7 @@ final class VoiceBackgroundJobSupervisor: ObservableObject, VoiceBackgroundJobHa
     /// first line, kept short. A provider's raw error can run on, and a
     /// read-back repeats the notice word for word.
     static func failedNotice(_ title: String, reason: String) -> String {
-        let notice = AppLocalization.string("\(title) failed. Open it in Conduit for details.")
+        let notice = AppLocalization.string("\(title) failed. Open it in Conduit for details.", table: .voice)
         let line = reason.split(whereSeparator: \.isNewline).lazy
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .first { !$0.isEmpty } ?? ""
@@ -3227,6 +3493,9 @@ final class VoiceBackgroundJobSupervisor: ObservableObject, VoiceBackgroundJobHa
         var changed = false
         var settledThreadTurns: [UUID] = []
         var settledJobs: [UUID] = []
+        var unlistedJobs: [UUID] = []
+        var missingJobs: Set<UUID> = []
+        var checkedRuntimes: [UUID: String] = [:]
         var learned: [(String, String)] = []
         var callChatLearned = false
         defer {
@@ -3255,14 +3524,17 @@ final class VoiceBackgroundJobSupervisor: ObservableObject, VoiceBackgroundJobHa
                 // A listed, idle runtime is positive evidence the turn ended.
                 if row.isRunning || row.status == "starting" { continue }
             } else {
+                // Successful registry reads must miss twice before a direct
+                // check, just as absence must repeat before normal settling.
+                jobs[index].consecutiveMissedPolls += 1
+                if jobs[index].consecutiveMissedPolls < Self.missedPollsBeforeSettling { continue }
                 // Another profile's registry is only trusted about absence
                 // once it has listed the job: a gateway that ignored the
                 // profile would otherwise "finish" a job still running there.
-                if job.profile != nil, !job.listedByLivenessPoll { continue }
-                // Absence is only trusted when it repeats: a row missing
-                // from one read must not discard the real completion.
-                jobs[index].consecutiveMissedPolls += 1
-                if jobs[index].consecutiveMissedPolls < Self.missedPollsBeforeSettling { continue }
+                if job.profile != nil, !job.listedByLivenessPoll {
+                    unlistedJobs.append(job.id)
+                    continue
+                }
             }
             // A thread turn's reply is in its chat: read it before settling,
             // so the call hears the reply, not a pointer to the chat.
@@ -3284,6 +3556,40 @@ final class VoiceBackgroundJobSupervisor: ObservableObject, VoiceBackgroundJobHa
             jobs[index].waitingQuestion = nil
             changed = true
         }
+        for id in unlistedJobs {
+            guard let job = self.job(id), job.status.isActive,
+                  let runtimeID = job.runtimeSessionID, !runtimeID.isEmpty else { continue }
+            let goneFromHermes: Bool
+            do {
+                let running = try await backend.sessionRunning(runtimeID, job.profile)
+                guard generation == self.generation else { return }
+                if running == true {
+                    // Positive evidence also overtakes an older probe whose
+                    // missing/idle answer has not landed yet.
+                    if self.job(id)?.runtimeSessionID == runtimeID {
+                        update(id) { $0.consecutiveMissedPolls = 0 }
+                    }
+                    continue
+                }
+                // A running session or a title-only answer does not prove an
+                // end. Never turn a timeout or unsupported probe into absence.
+                guard running == false else { continue }
+                goneFromHermes = false
+            } catch {
+                guard generation == self.generation else { return }
+                guard HermesClient.isSessionNotFoundError(error) else { continue }
+                goneFromHermes = true
+            }
+            // An event, another poll, a stop, or a reset may have overtaken
+            // the read. Only the same still-unlisted runtime can settle.
+            guard let current = self.job(id), current.status.isActive,
+                  current.runtimeSessionID == runtimeID, !current.listedByLivenessPoll,
+                  current.consecutiveMissedPolls >= Self.missedPollsBeforeSettling else { continue }
+            if goneFromHermes { missingJobs.insert(id) }
+            checkedRuntimes[id] = runtimeID
+            if current.isThreadTurn { settledThreadTurns.append(id) }
+            else { settledJobs.append(id) }
+        }
         for id in settledJobs {
             guard let job = self.job(id) else { continue }
             // The job's own chat, read as an attached chat's would be.
@@ -3297,9 +3603,14 @@ final class VoiceBackgroundJobSupervisor: ObservableObject, VoiceBackgroundJobHa
             guard generation == self.generation else { return }
             // Events may have settled it meanwhile; they carry the real reply.
             guard let current = self.job(id), current.status.isActive else { continue }
+            if let checked = checkedRuntimes[id] {
+                guard current.runtimeSessionID == checked, !current.listedByLivenessPoll,
+                      current.consecutiveMissedPolls >= Self.missedPollsBeforeSettling else { continue }
+            }
             let inCallChat = runsInCallChat(current) || current.sharesCallChat
             update(id) {
-                $0.status = .finished
+                $0.status = missingJobs.contains(id) && (reply?.isEmpty ?? true) && $0.result == nil && $0.heldCompletion == nil
+                    ? .failed(AppLocalization.string("That chat is no longer available.")) : .finished
                 if inCallChat { $0.settledByPoll = true }
                 if let reply, !reply.isEmpty { $0.result = reply }
                 // A completion held for a follow-up that never carried on.
@@ -3313,7 +3624,10 @@ final class VoiceBackgroundJobSupervisor: ObservableObject, VoiceBackgroundJobHa
         }
         for id in settledThreadTurns {
             guard var thread = threadTargets[id] else {
-                update(id) { $0.status = .finished }
+                update(id) {
+                    $0.status = missingJobs.contains(id)
+                        ? .failed(AppLocalization.string("That chat is no longer available.")) : .finished
+                }
                 changed = true
                 continue
             }
@@ -3324,8 +3638,13 @@ final class VoiceBackgroundJobSupervisor: ObservableObject, VoiceBackgroundJobHa
             guard generation == self.generation else { return }
             // Events may have settled it meanwhile; they carry the real reply.
             guard let current = job(id), current.status.isActive else { continue }
+            if let checked = checkedRuntimes[id] {
+                guard current.runtimeSessionID == checked, !current.listedByLivenessPoll,
+                      current.consecutiveMissedPolls >= Self.missedPollsBeforeSettling else { continue }
+            }
             update(id) {
-                $0.status = .finished
+                $0.status = missingJobs.contains(id) && (reply?.isEmpty ?? true) && $0.result == nil && $0.heldCompletion == nil
+                    ? .failed(AppLocalization.string("That chat is no longer available.")) : .finished
                 $0.settledByPoll = true
                 if let reply, !reply.isEmpty { $0.result = reply }
                 if $0.result == nil { $0.result = $0.heldCompletion }
@@ -3417,8 +3736,10 @@ final class VoiceBackgroundJobSupervisor: ObservableObject, VoiceBackgroundJobHa
         // job must still be here.
         // The request whose chat the call took stays: the saved call's line
         // for it follows the chat's stored id once the poll learns it.
+        // A job whose submit is still out stays too: its cancel can land
+        // and put it back to starting.
         let settled = jobs.filter {
-            !$0.status.isActive && $0.outcomeDelivered && noticesInFlight[$0.id] == nil && $0.id != callChatJobID
+            !$0.status.isActive && $0.outcomeDelivered && noticesInFlight[$0.id] == nil && $0.id != callChatJobID && !$0.submitInFlight
         }
         let excess = settled.count - Self.maximumSettledJobs
         guard excess > 0 else { return }

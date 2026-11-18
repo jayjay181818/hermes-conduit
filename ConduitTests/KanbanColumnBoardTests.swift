@@ -59,7 +59,7 @@ final class KanbanColumnBoardTests: XCTestCase {
             for: KanbanBoardFilterPolicy.visibleColumns(board: board, search: "", assignee: nil, tenant: nil)
         )
         let blocked = try XCTUnwrap(summaries.first { $0.status == "blocked" })
-        XCTAssertEqual(blocked.title, AppLocalization.string("Blocked"))
+        XCTAssertEqual(blocked.title, AppLocalization.string("Blocked", table: .tasks))
         XCTAssertEqual(blocked.count, 3)
         XCTAssertFalse(blocked.isLocked)
         let done = try XCTUnwrap(summaries.first { $0.status == "done" })
@@ -146,6 +146,7 @@ final class KanbanColumnBoardTests: XCTestCase {
         let host = UIHostingController(
             rootView: KanbanView(columnsLayout: true, store: store)
                 .padding(.horizontal, 14)
+                .environmentObject(V2ShownUpdates(appState))
                 .environmentObject(appState)
         )
         let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 402, height: 874))

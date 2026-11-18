@@ -33,7 +33,7 @@ extension BotModeTests {
         XCTAssertTrue(snapshot.isOn)
         XCTAssertEqual(snapshot.botName, "Furina")
         XCTAssertEqual(snapshot.items.map(\.ref), ["W1", "W2", "A1", "W3"])
-        XCTAssertEqual(snapshot.active.map(\.ref), ["W1", "W2", "A1"])
+        XCTAssertEqual(snapshot.active.map(\.ref), ["W2", "W1", "A1"])  // what waits on the user comes first
         XCTAssertEqual(snapshot.recent.map(\.ref), ["W3"])
         XCTAssertEqual(snapshot.sessionIDs, ["20261101_w1", "20261101_w2", "20261101_w3"])
         let running = snapshot.items[0]
@@ -47,6 +47,61 @@ extension BotModeTests {
         XCTAssertEqual(snapshot.items[2].otherBot, "Nahida")
         XCTAssertEqual(snapshot.item(forSession: ["20261101_w2"])?.ref, "W2")
         XCTAssertNotNil(snapshot.stripText)
+    }
+
+    /// Bots Home with one or two bots (Eric, 2026-11-15): a lone bot shows
+    /// its open work, what waits on the user first, three at most; two bots
+    /// side by side, except at accessibility sizes; three or more the grid.
+    /// Bots Home's last reply re-reads on the open chat's newest reply row
+    /// with text (issue 2519): a tool row, a steer or an empty reply row
+    /// after it changes nothing; its text replaced under its id does.
+    func testBotsHomeLastReplyFollowsTheNewestReplyRow() {
+        let reply = ChatMessage(id: "r1", role: .assistant, content: "The build is green.", timestamp: "1")
+        let key = BotLastReply.replyKey([reply])
+        XCTAssertFalse(key.isEmpty)
+        let trailing = [
+            reply,
+            ChatMessage(id: "t1", role: .tool, content: "", timestamp: "2"),
+            ChatMessage(id: "s1", role: .user, content: "and the tests?", timestamp: "3"),
+            ChatMessage(id: "e1", role: .assistant, content: "  ", timestamp: "4"),
+        ]
+        XCTAssertEqual(BotLastReply.replyKey(trailing), key, "rows after the reply leave it as it was")
+        var edited = trailing
+        edited[0] = ChatMessage(id: "r1", role: .assistant, content: "The build is red.", timestamp: "1")
+        XCTAssertNotEqual(BotLastReply.replyKey(edited), key, "a reply replaced under its id is read again")
+        XCTAssertEqual(BotLastReply.replyKey([]), "")
+    }
+
+    func testBotsHomeWithFewBots() throws {
+        let snapshot = try XCTUnwrap(BotWorkSnapshot(response: workResponse(), profile: "furina"))
+        XCTAssertEqual(BotsHomeWork.preview(snapshot).map(\.ref), ["W2", "W1", "A1"])
+        XCTAssertEqual(BotsHomeWork.preview(nil), [])
+        // Three at most, what waits on the user first.
+        var moreResponse = workResponse()
+        var rows = try XCTUnwrap(moreResponse["work"] as? [[String: Any]])
+        rows.append(["ref": "W4", "kind": "workstream", "status": "ready", "title": "Notes",
+                     "session_id": "20261101_w4", "actions": ["send"]])
+        moreResponse["work"] = rows
+        let more = try XCTUnwrap(BotWorkSnapshot(response: moreResponse, profile: "furina"))
+        XCTAssertEqual(more.active.count, 4)
+        XCTAssertEqual(BotsHomeWork.preview(more).map(\.ref), ["W2", "W1", "A1"])
+        let off = BotWorkSnapshot(response: ["ok": true, "policy": "off", "work": []], profile: "furina")
+        XCTAssertEqual(BotsHomeWork.preview(off), [])
+        XCTAssertEqual(BotsHomeLayout.of(visibleBots: 1, accessibilitySize: false), .solo)
+        XCTAssertEqual(BotsHomeLayout.of(visibleBots: 1, accessibilitySize: true), .solo)
+        XCTAssertEqual(BotsHomeLayout.of(visibleBots: 2, accessibilitySize: false), .pair)
+        XCTAssertEqual(BotsHomeLayout.of(visibleBots: 2, accessibilitySize: true), .grid)
+        XCTAssertEqual(BotsHomeLayout.of(visibleBots: 3, accessibilitySize: false), .grid)
+        XCTAssertEqual(BotsHomeLayout.of(visibleBots: 0, accessibilitySize: false), .grid)
+        // Another combined dashboard's bots join the grid: one or two give way.
+        XCTAssertEqual(BotsHomeLayout.of(visibleBots: 1, accessibilitySize: false, othersShown: true), .grid)
+        XCTAssertEqual(BotsHomeLayout.of(visibleBots: 2, accessibilitySize: false, othersShown: true), .grid)
+        XCTAssertNil(BotsHomeWork.lastActiveLabel(nil))
+        XCTAssertNil(BotsHomeWork.lastActiveLabel(0))
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        // Seconds and milliseconds read as the same moment.
+        XCTAssertEqual(BotsHomeWork.lastActiveLabel(1_799_999_400, now: now),
+                       BotsHomeWork.lastActiveLabel(1_799_999_400_000, now: now))
     }
 
     func testWorkPanelRefusesAnAnswerThatIsntAList() {
@@ -587,6 +642,82 @@ extension BotModeTests {
         XCTAssertFalse(store.isWorkstream(row("20261101_w2")))
     }
 
+    func testAnOpenQuestionNeedsTheUserAndATapAnswersIt() throws {
+        // Under Ask Me First the Bot Chat's question waited with no sign of it and nowhere to answer (Eric 2026-11-13).
+        var response = workResponse()
+        response["counts"] = ["working": 1, "needs_you": 1, "ready": 0, "waiting": 1, "questions": 2]
+        response["coordination"] = ["mode": "ask", "items": [
+            ["id": "P3", "kind": "proposal", "ref": "W1", "refs": ["W1"], "title": "Login bug", "at": 1_800_000_300.0,
+             "text": "Stop W1", "status": "open", "answer": "", "why": [], "actions": ["approve", "decline"]],
+            ["id": "P2", "kind": "proposal", "ref": "W2", "title": "Deploy", "at": 1_800_000_200.0,
+             "text": "Move W2 to v2", "status": "open", "answer": "", "why": [], "actions": ["approve", "decline"]],
+            ["id": "P1", "kind": "proposal", "ref": "W2", "title": "Deploy", "at": 1_800_000_100.0,
+             "text": "Pause W2", "status": "declined", "answer": "", "why": [], "actions": []],
+            ["id": "E5", "kind": "flag", "ref": "W1", "title": "Login bug", "at": 1_800_000_050.0,
+             "text": "W1 found v1 is gone", "with": ["W2"], "woke": true, "why": [], "actions": ["approve", "decline"]],
+        ]]
+        let snapshot = try XCTUnwrap(BotWorkSnapshot(response: response, profile: "furina"))
+        XCTAssertEqual(snapshot.questionCount, 2)
+        XCTAssertEqual(snapshot.needsYouCount, 3)  // the workstream that needs them, and the two questions
+        // Oldest first, and only what can be answered here: not an answered one, nor a flag.
+        XCTAssertEqual(snapshot.coordination?.openQuestions.map(\.id), ["P2", "P3"])
+        let answered = snapshot.answering("P2", approved: true)
+        XCTAssertEqual(answered.questionCount, 1)
+        XCTAssertEqual(answered.needsYouCount, 2)
+        XCTAssertEqual(answered.coordination?.openQuestions.map(\.id), ["P3"])
+        let kept = try XCTUnwrap(answered.coordination?.items.first { $0.id == "P2" })
+        XCTAssertEqual(kept.stateText, "You approved")
+        XCTAssertFalse(kept.canAnswer)
+        XCTAssertEqual(answered.answering("P2", approved: false), answered)  // answered once
+        XCTAssertEqual(answered.answering("P3", approved: false).coordination?.items.first?.stateText, "You declined")
+        XCTAssertEqual(answered.answering("P3", approved: false).needsYouCount, 1)
+        // A plugin before 0.168.0 takes no answer and counts none: its questions stay in the Coordination list.
+        var older = response
+        older["counts"] = ["working": 1, "needs_you": 1, "ready": 0, "waiting": 1]
+        older["coordination"] = ["mode": "ask", "items": [
+            ["id": "P2", "kind": "proposal", "ref": "W2", "title": "Deploy", "at": 1_800_000_200.0,
+             "text": "Move W2 to v2", "status": "open", "answer": "", "why": []],
+        ]]
+        let before = try XCTUnwrap(BotWorkSnapshot(response: older, profile: "furina"))
+        XCTAssertEqual(before.needsYouCount, 1)
+        XCTAssertEqual(before.coordination?.openQuestions, [])
+        XCTAssertEqual(before.answering("P2", approved: true), before)
+        // The Bot Chat's own step for it reads as what it did, not its tool's name.
+        let asked = try XCTUnwrap(BotWorkCall.parse(
+            toolName: "work_propose", input: #"{"text": "Stop W1", "ref": "W1"}"#, output: #"{"ok": true, "id": "P3"}"#
+        ))
+        XCTAssertEqual(asked.title(running: false), "Asked you")
+        let recorded = try XCTUnwrap(BotWorkCall.parse(
+            toolName: "tool_call", input: #"{"name": "work_propose", "arguments": {"id": "P3", "answer": "approved"}}"#,
+            output: #"{"ok": true, "id": "P3", "status": "approved"}"#
+        ))
+        XCTAssertEqual(recorded.title(running: false), "Kept your answer")
+        let refused = try XCTUnwrap(BotWorkCall.parse(
+            toolName: "work_propose", input: #"{"text": "Stop W1", "ref": "W1"}"#,
+            output: #"{"ok": false, "error": "already_asked"}"#
+        ))
+        XCTAssertNil(refused.title(running: false))
+    }
+
+    func testAWorkListThatCouldNotBeReadSaysSoUntilOneIs() throws {
+        // The Work panel span for good when its first read failed.
+        let store = BotWorkStore()
+        XCTAssertFalse(store.couldNotRead("furina"))
+        store.noteUnread("furina")
+        XCTAssertTrue(store.couldNotRead("furina"))
+        store.retryReading("furina")  // Try Again: it waits again
+        XCTAssertFalse(store.couldNotRead("furina"))
+        store.noteUnread("furina")
+        store.set(try XCTUnwrap(BotWorkSnapshot(response: workResponse(), profile: "furina")))
+        XCTAssertFalse(store.couldNotRead("furina"))
+        store.noteUnread("furina")  // a later read that fails keeps the list shown
+        XCTAssertFalse(store.couldNotRead("furina"))
+        store.clear()
+        store.noteUnread("furina")
+        store.clear()
+        XCTAssertFalse(store.couldNotRead("furina"))
+    }
+
     func testWorkToolCallsDrawAsWorkCards() throws {
         let started = try XCTUnwrap(BotWorkCall.parse(
             toolName: "work_start",
@@ -620,6 +751,14 @@ extension BotModeTests {
             toolName: "work_stop", input: #"{"ref": "W3"}"#, output: #"{"output": "W3 is not running"}"#
         ))
         XCTAssertNil(wrapped.title(running: false))
+        // A note to another bot (notifier issue 2395) names the bot it told.
+        let told = try XCTUnwrap(BotWorkCall.parse(
+            toolName: "tool_call", input: #"{"name": "work_tell", "arguments": {"bot": "Nahida", "text": "Built."}}"#,
+            output: #"{"ok": true, "bot": "Nahida", "note": "Told Nahida. It needs no answer."}"#
+        ))
+        XCTAssertEqual(told.tool, .tell)
+        XCTAssertEqual(told.title(running: false), "Told Nahida")
+        XCTAssertEqual(told.text, "Built.")
         XCTAssertNil(BotWorkCall.parse(toolName: "terminal", input: #"{"command": "ls"}"#, output: nil))
         XCTAssertNil(BotWorkCall.parse(toolName: "tool_call", input: #"{"name": "terminal"}"#, output: nil))
     }
@@ -832,7 +971,8 @@ extension BotModeTests {
     /// Bots Home (Eric 2026-11-03, layout A): Bots is the first tab and
     /// the old Chats tab is Sessions.
     func testBotsComeFirstAndChatsIsSessions() {
-        XCTAssertEqual(V2Tab.destinations, [.bots, .chats, .tasks, .settings])
+        XCTAssertEqual(V2TabLayout.standard.shown, [.bots, .chats, .tasks, .settings])
+        XCTAssertEqual(V2TabLayout.standard.first, .bots)
         XCTAssertEqual(V2Tab.chats.title, AppLocalization.string("Sessions"))
     }
 
@@ -873,10 +1013,156 @@ extension BotModeTests {
         XCTAssertEqual(slot.read() as? [String], ["atlas", "hermes"])
         slot.write(["furina", "atlas"])
         XCTAssertEqual(appState.botOrder.names, ["furina", "atlas"])
-        XCTAssertEqual(defaults.stringArray(forKey: BotOrder.storageKey), ["furina", "atlas"])
+        let key = BotOrder.storageKey(scope: appState.dashboardListsScope)
+        XCTAssertEqual(defaults.stringArray(forKey: key), ["furina", "atlas"])
         slot.write(nil)
         XCTAssertTrue(appState.botOrder.isEmpty)
-        XCTAssertNil(defaults.stringArray(forKey: BotOrder.storageKey))
+        XCTAssertNil(defaults.stringArray(forKey: key))
+    }
+
+    /// Each dashboard keeps its own bots' and rooms' orders, Pinned order,
+    /// stars and hidden projects: a switch reads the selected one's, and
+    /// connecting there no longer wipes them (Eric, 2026-11-14: switching
+    /// between two dashboards reshuffled Bots Home, as the wiped order then
+    /// went to the host through Sync across devices).
+    @MainActor
+    func testEachDashboardKeepsItsOwnOrdersAcrossASwitch() throws {
+        let suite = "BotWorkstreamsTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        addTeardownBlock { defaults.removePersistentDomain(forName: suite) }
+        let conduit = SavedDashboard(id: UUID(), label: "conduit", normalizedURL: "https://conduit.example.test")
+        let furina = SavedDashboard(id: UUID(), label: "Furina", normalizedURL: "https://furina.example.test")
+        let appState = AppState(
+            defaults: defaults,
+            loadSavedConnection: false,
+            dashboardRegistry: SavedDashboardRegistry(activeDashboardID: conduit.id, dashboards: [conduit, furina])
+        )
+        let chat = SessionSummary(id: "chat-1", alternateIds: [], title: "Chat", model: "Hermes", updatedLabel: "",
+                                  profile: "default", source: .chat, isActive: false, isArchived: false)
+        appState.setBotOrder(BotOrder(names: ["furina", "atlas"]))
+        appState.setGroupRoomOrder(BotOrder(names: ["b", "a"], kind: .rooms))
+        appState.setPinnedChatOrder(["p2", "p1"], profile: "default")
+        appState.setSessionStarred(chat, starred: true, profile: "default")
+        let hidden = appState.syncedPreferenceSlots.first { $0.key == "app.hidden_chat_projects" }
+        hidden?.write(["work"])
+
+        appState.savedDashboardRegistry.activeDashboardID = furina.id
+        XCTAssertTrue(appState.botOrder.isEmpty, "Furina never had conduit's order")
+        XCTAssertTrue(appState.groupRoomOrder.isEmpty)
+        XCTAssertTrue(appState.pinnedChatOrder.isEmpty)
+        XCTAssertFalse(appState.isSessionStarred(chat))
+        XCTAssertNil(appState.syncedPreferenceSlots.first { $0.key == "app.hidden_chat_projects" }?.read())
+        appState.setBotOrder(BotOrder(names: ["nahida", "raiden"]))
+        appState.prepareChatResumeForConnection(to: furina.normalizedURL, dashboardID: furina.id)
+        XCTAssertEqual(appState.botOrder.names, ["nahida", "raiden"], "connecting there keeps its order")
+
+        appState.savedDashboardRegistry.activeDashboardID = conduit.id
+        appState.prepareChatResumeForConnection(to: conduit.normalizedURL, dashboardID: conduit.id)
+        XCTAssertEqual(appState.botOrder.names, ["furina", "atlas"])
+        XCTAssertEqual(appState.botOrderSlot.read() as? [String], ["furina", "atlas"], "sync sends conduit's own")
+        XCTAssertEqual(appState.groupRoomOrder.names, ["b", "a"])
+        XCTAssertEqual(appState.pinnedChatOrder.ids(profile: "default"), ["p2", "p1"])
+        XCTAssertTrue(appState.isSessionStarred(chat))
+        XCTAssertEqual(
+            appState.syncedPreferenceSlots.first { $0.key == "app.hidden_chat_projects" }?.read() as? [String],
+            ["work"]
+        )
+
+        // Forgetting one dashboard's (Sign Out, Remove) leaves the other's,
+        // and its sync ledger forgets them, so the next sign-in takes the
+        // host's copy instead of sending an empty one.
+        let controller = SyncedPreferencesController(defaults: defaults)
+        let entry = SyncedPreferencesLedgerEntry(lastLocal: ["bots.order": "[\"x\"]", "app.accent": "\"gold\""])
+        controller.setLedger(entry, for: "\(furina.id.uuidString)|default")
+        controller.setLedger(entry, for: "\(conduit.id.uuidString)|default")
+        appState.forgetDashboardLists(dashboardID: furina.id)
+        XCTAssertEqual(controller.ledger(for: "\(furina.id.uuidString)|default")?.lastLocal, ["app.accent": "\"gold\""])
+        XCTAssertEqual(controller.ledger(for: "\(conduit.id.uuidString)|default")?.lastLocal, entry.lastLocal)
+        XCTAssertNil(defaults.stringArray(forKey: BotOrder.storageKey(scope: furina.id.uuidString)))
+        XCTAssertEqual(appState.botOrder.names, ["furina", "atlas"])
+        appState.forgetDashboardLists(dashboardID: conduit.id)
+        XCTAssertTrue(appState.botOrder.isEmpty)
+        XCTAssertFalse(appState.isSessionStarred(chat))
+        XCTAssertEqual(defaults.dictionary(forKey: HiddenChatProjects.key) as? [String: [String]], [:])
+    }
+
+    /// A phone with no saved dashboard at launch moves the phone-wide copies
+    /// to the first dashboard registered, as its appearance does.
+    @MainActor
+    func testTheFirstDashboardRegisteredTakesThePhoneWideOrders() throws {
+        let suite = "BotWorkstreamsTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        addTeardownBlock { defaults.removePersistentDomain(forName: suite) }
+        defaults.set(["furina", "atlas"], forKey: BotOrder.storageKey)
+        // Registering saves the registry to the Keychain: keep it off the real one.
+        KeychainHelper.useBackendForTesting(InMemoryKeychainBackend())
+        addTeardownBlock { KeychainHelper.useBackendForTesting(KeychainHelper.SystemKeychainBackend()) }
+        let appState = AppState(defaults: defaults, loadSavedConnection: false, dashboardRegistry: SavedDashboardRegistry())
+        let id = try XCTUnwrap(appState.resolveDashboardID(forURL: "https://conduit.example.test", registerIfMissing: true))
+        XCTAssertEqual(defaults.stringArray(forKey: BotOrder.storageKey(scope: id.uuidString)), ["furina", "atlas"])
+        XCTAssertNil(defaults.object(forKey: BotOrder.storageKey))
+        appState.savedDashboardRegistry.activeDashboardID = id
+        XCTAssertEqual(appState.botOrder.names, ["furina", "atlas"])
+    }
+
+    /// The phone-wide copies from before go to the dashboard selected at
+    /// launch, and the other dashboards' sync ledgers forget those keys, so
+    /// their first sync takes the host's order rather than clearing it.
+    @MainActor
+    func testThePhoneWideOrdersMoveToTheSelectedDashboard() throws {
+        let suite = "BotWorkstreamsTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        addTeardownBlock { defaults.removePersistentDomain(forName: suite) }
+        let conduit = SavedDashboard(id: UUID(), label: "conduit", normalizedURL: "https://conduit.example.test")
+        let furina = SavedDashboard(id: UUID(), label: "Furina", normalizedURL: "https://furina.example.test")
+        defaults.set(["furina", "atlas"], forKey: BotOrder.storageKey)
+        defaults.set(["b", "a"], forKey: BotOrder.roomStorageKey)
+        defaults.set(["default": ["work"], "\(furina.id.uuidString)|default": ["lab"]], forKey: HiddenChatProjects.key)
+        let controller = SyncedPreferencesController(defaults: defaults)
+        let entry = SyncedPreferencesLedgerEntry(lastLocal: ["bots.order": "[\"x\"]", "app.accent": "\"gold\""])
+        controller.setLedger(entry, for: "\(conduit.id.uuidString)|default")
+        controller.setLedger(entry, for: "\(furina.id.uuidString)|default")
+
+        let appState = AppState(
+            defaults: defaults,
+            loadSavedConnection: false,
+            dashboardRegistry: SavedDashboardRegistry(activeDashboardID: conduit.id, dashboards: [conduit, furina])
+        )
+        XCTAssertEqual(appState.botOrder.names, ["furina", "atlas"])
+        XCTAssertEqual(appState.groupRoomOrder.names, ["b", "a"])
+        XCTAssertNil(defaults.object(forKey: BotOrder.storageKey), "the phone-wide copy goes")
+        XCTAssertNil(defaults.object(forKey: BotOrder.roomStorageKey))
+        XCTAssertEqual(
+            defaults.dictionary(forKey: HiddenChatProjects.key) as? [String: [String]],
+            ["\(conduit.id.uuidString)|default": ["work"], "\(furina.id.uuidString)|default": ["lab"]]
+        )
+        XCTAssertEqual(controller.ledger(for: "\(conduit.id.uuidString)|default")?.lastLocal, entry.lastLocal)
+        XCTAssertEqual(
+            controller.ledger(for: "\(furina.id.uuidString)|default")?.lastLocal, ["app.accent": "\"gold\""],
+            "phone-wide preferences keep their ledger"
+        )
+        appState.savedDashboardRegistry.activeDashboardID = furina.id
+        XCTAssertTrue(appState.botOrder.isEmpty)
+
+        // Once only: a later launch leaves the ledgers alone.
+        controller.setLedger(entry, for: "\(furina.id.uuidString)|default")
+        _ = AppState(
+            defaults: defaults,
+            loadSavedConnection: false,
+            dashboardRegistry: SavedDashboardRegistry(activeDashboardID: conduit.id, dashboards: [conduit, furina])
+        )
+        XCTAssertEqual(controller.ledger(for: "\(furina.id.uuidString)|default")?.lastLocal, entry.lastLocal)
+
+        // A switch on an older build wiped the phone-wide copy: with nothing
+        // to move, every ledger, the selected dashboard's too, forgets them.
+        defaults.removeObject(forKey: AppState.dashboardListsAdoptedKey)
+        _ = AppState(
+            defaults: defaults,
+            loadSavedConnection: false,
+            dashboardRegistry: SavedDashboardRegistry(activeDashboardID: conduit.id, dashboards: [conduit, furina])
+        )
+        XCTAssertEqual(controller.ledger(for: "\(conduit.id.uuidString)|default")?.lastLocal, ["app.accent": "\"gold\""])
+        XCTAssertEqual(controller.ledger(for: "\(furina.id.uuidString)|default")?.lastLocal, ["app.accent": "\"gold\""])
     }
 
     /// A room being started: bots join once, whatever their case, all or
@@ -1023,8 +1309,8 @@ extension BotModeTests {
     }
 
     /// A ring takes the bot's glow color (picked or drawn from its photo),
-    /// else its Hermes color, else its name's hue (build 248); a group
-    /// room's name and bubble take the same (build 254).
+    /// else its Hermes color, else its starter face's, else its name's hue
+    /// (build 248); a group room's name and bubble take the same (build 254).
     @MainActor
     func testABotsRingTakesItsGlowColorFirst() {
         func bot(_ color: String?) -> BotProfile {
@@ -1036,6 +1322,10 @@ extension BotModeTests {
         XCTAssertEqual(AppState.botColor(bot("#00ff00"), glow: glow), glow.color, "the glow wins")
         XCTAssertEqual(AppState.botColor(bot("#00ff00"), glow: nil), BotAvatarView.color(for: "#00ff00", name: "raiden"))
         XCTAssertEqual(AppState.botColor(bot(nil), glow: nil), BotAvatarView.color(for: nil, name: "raiden"), "the name's hue")
+        var faced = bot(nil)
+        faced.starterFace = 2
+        XCTAssertEqual(AppState.botColor(faced, glow: nil), BotAvatarView.color(for: StarterFaces.set[2].hex, name: "raiden"),
+                       "no Hermes color: its starter face's")
         // A group room names and tints the bot in the same color as its
         // ring, not its Hermes color under a picked or photo glow.
         XCTAssertEqual(
@@ -1069,6 +1359,397 @@ extension BotModeTests {
         XCTAssertFalse(BotChatSwap.isBackSwipe(CGSize(width: 60, height: 0)), "too short")
         XCTAssertFalse(BotChatSwap.isBackSwipe(CGSize(width: 120, height: 100)), "mostly down")
         XCTAssertFalse(BotChatSwap.isBackSwipe(CGSize(width: -120, height: 0)), "the other way")
+    }
+
+    /// The slide is the transcript's own, asked for by the screen: the
+    /// chat on screen leaves as Back is tapped, and the one opened comes in
+    /// with its rows, whichever of the screen and the transcript hears of
+    /// the open first. A swap that never draws brings the old rows back.
+    @MainActor
+    func testTheSwapSlidesTheTranscriptAsItsRowsAreDrawn() async throws {
+        let stage = SwapStageRecorder()
+        let motion = TranscriptSwapMotion()
+        motion.stage = stage
+
+        // Back: the workstream leaves at once, the Bot Chat comes in with
+        // its rows.
+        motion.leave(.back)
+        motion.expect(.back, conversation: "opened")
+        XCTAssertEqual(stage.played, ["out back at once"], "already away, it doesn't leave twice")
+        XCTAssertNil(motion.rowsDrawn(conversationChanged: false, chatRows: true), "the workstream's own rows drawn again")
+        XCTAssertEqual(motion.rowsDrawn(conversationChanged: true, chatRows: true), .back)
+        XCTAssertNil(motion.rowsDrawn(conversationChanged: true, chatRows: true), "one slide for one swap")
+
+        // A workstream opened: the screen hears after the rows are drawn.
+        stage.reset()
+        stage.shownConversation = "opened"
+        stage.conversationJustChanged = true
+        stage.showsChatRows = true
+        motion.expect(.forward, conversation: "opened")
+        XCTAssertEqual(stage.played, ["in forward"])
+        XCTAssertNil(motion.expected)
+
+        // The screen hears long after the rows were drawn (the open chat's
+        // id follows the drawn chat's by a few hundred milliseconds):
+        // nothing moves, and rows still away come back.
+        stage.reset()
+        stage.shownConversation = "opened"
+        stage.showsChatRows = true
+        motion.expect(.forward, conversation: "opened")
+        XCTAssertEqual(stage.played, [], "rows on screen don't slide away")
+        XCTAssertNil(motion.expected)
+        stage.rowsAreAway = true
+        motion.expect(.forward, conversation: "opened")
+        XCTAssertEqual(stage.played, ["back"])
+        // Its welcome, drawn a while ago, stays too.
+        stage.reset()
+        stage.shownConversation = "opened"
+        motion.expect(.forward, conversation: "opened")
+        XCTAssertEqual(stage.played, [])
+        XCTAssertNil(motion.expected)
+        // Drawn in this pass, the welcome steps aside for the rows.
+        stage.conversationJustChanged = true
+        motion.expect(.forward, conversation: "opened")
+        XCTAssertEqual(stage.played, ["out forward"])
+        XCTAssertTrue(motion.chatIsOnStage)
+        // Asked again while its rows are waited for, the wait goes on.
+        stage.conversationJustChanged = false
+        motion.expect(.forward, conversation: "opened")
+        XCTAssertEqual(stage.played, ["out forward"], "the welcome stays aside")
+        XCTAssertEqual(motion.rowsDrawn(conversationChanged: false, chatRows: true), .forward)
+        // Left while its rows were waited for, it has no slide to come
+        // in with.
+        stage.reset()
+        stage.shownConversation = "opened"
+        stage.conversationJustChanged = true
+        motion.expect(.forward, conversation: "opened")
+        motion.leave(.back)
+        XCTAssertNil(motion.rowsDrawn(conversationChanged: false, chatRows: true))
+        XCTAssertEqual(stage.played, ["out forward", "out back at once"])
+
+        // A workstream opened, the screen hearing first: the Bot Chat
+        // steps aside, never flushed from inside a view update, and the
+        // workstream comes in with its rows.
+        stage.reset()
+        motion.expect(.forward, conversation: "opened")
+        XCTAssertEqual(stage.played, ["out forward"])
+        XCTAssertEqual(motion.rowsDrawn(conversationChanged: true, chatRows: true), .forward)
+
+        // A chat with no saved rows draws its welcome first: it waits out
+        // of sight, and the chat slides in when Hermes' rows land.
+        stage.reset()
+        motion.expect(.forward, conversation: "opened")
+        XCTAssertNil(motion.rowsDrawn(conversationChanged: true, chatRows: false))
+        XCTAssertTrue(motion.chatIsOnStage)
+        XCTAssertEqual(motion.rowsDrawn(conversationChanged: false, chatRows: true), .forward)
+
+        // A chat with nothing in it: its welcome comes back after a moment.
+        stage.reset()
+        motion.rowsPatience = .milliseconds(20)
+        motion.expect(.forward, conversation: "opened")
+        XCTAssertNil(motion.rowsDrawn(conversationChanged: true, chatRows: false))
+        try await Task.sleep(for: .milliseconds(200))
+        XCTAssertEqual(stage.played, ["out forward", "back"])
+        XCTAssertNil(motion.expected)
+
+        // An open that fails draws nothing: the rows that left come back,
+        // and the next chat drawn doesn't slide for it.
+        stage.reset()
+        motion.patience = .milliseconds(20)
+        motion.leave(.back)
+        motion.expect(.back, conversation: "opened")
+        try await Task.sleep(for: .milliseconds(200))
+        XCTAssertEqual(stage.played, ["out back at once", "back"])
+        XCTAssertNil(motion.rowsDrawn(conversationChanged: true, chatRows: true))
+
+        // A push comes in from the trailing edge over a chat that steps
+        // aside; a pop's chat leaves by that edge.
+        XCTAssertEqual(TranscriptSwapSlide.arrivingShift(.forward), 1)
+        XCTAssertEqual(TranscriptSwapSlide.leavingShift(.back), 1)
+        XCTAssertLessThan(TranscriptSwapSlide.arrivingShift(.back), 0)
+        XCTAssertLessThan(TranscriptSwapSlide.leavingShift(.forward), 0)
+        // Rows that left stay away until the next slide; one coming in
+        // ends where the rows are.
+        let layer = CALayer()
+        XCTAssertFalse(TranscriptSwapSlide.out(from: layer, by: 100).isRemovedOnCompletion)
+        XCTAssertTrue(TranscriptSwapSlide.in(from: 100, opacity: 0.4).isRemovedOnCompletion)
+        XCTAssertTrue(TranscriptSwapSlide.back(from: layer).isRemovedOnCompletion)
+        // The screen hears of a chat twice, by the id the transcript draws
+        // and then by the open chat's: one slide, asked for by the first
+        // that places it.
+        let botChat = BotChatSwap.Shown(botChat: "furina")
+        let work = BotChatSwap.Shown(botChat: "furina", workstreamOf: "furina", workstream: "w6")
+        var heard = BotChatSwap.heard(work, after: botChat, opened: false)
+        XCTAssertEqual(heard.swap, .forward)
+        heard = BotChatSwap.heard(work, after: heard.shown, opened: true)
+        XCTAssertNil(heard.swap, "the open chat's id asks for nothing more")
+        XCTAssertEqual(heard.shown, work)
+        heard = BotChatSwap.heard(BotChatSwap.Shown(), after: botChat, opened: false)
+        XCTAssertNil(heard.swap)
+        XCTAssertEqual(heard.shown, botChat, "not placed by the drawn id, it's still the open chat's to place")
+        XCTAssertEqual(BotChatSwap.heard(work, after: heard.shown, opened: true).swap, .forward)
+        XCTAssertEqual(BotChatSwap.heard(BotChatSwap.Shown(), after: work, opened: true).shown, BotChatSwap.Shown(), "another kind of chat opened")
+        XCTAssertEqual(BotChatSwap.heard(botChat, after: work, opened: false).swap, .back)
+        var other = work
+        other.workstream = "w7"
+        XCTAssertEqual(BotChatSwap.heard(other, after: work, opened: false).swap, .forward, "another of the bot's workstreams")
+
+        // The pass that changes the chat still carries the last chat's
+        // rows: the new chat's are the first that differ.
+        let botChatRows = [TranscriptRow(id: "m1", kind: .thinking), TranscriptRow(id: "m2", kind: .thinking)]
+        var chatLeft = TranscriptRowsOfChatLeft()
+        XCTAssertFalse(chatLeft.areStill(botChatRows), "no chat was left")
+        chatLeft.chatChanged(showing: botChatRows)
+        XCTAssertTrue(chatLeft.areStill(botChatRows))
+        XCTAssertFalse(chatLeft.areStill([TranscriptRow(id: TranscriptRow.emptyID, kind: .empty)]), "the welcome is the new chat's")
+        XCTAssertFalse(chatLeft.areStill(botChatRows), "rows that changed once are the new chat's from then on")
+        // A Bot Chat's Load earlier isn't carried over with its messages.
+        chatLeft.chatChanged(showing: [TranscriptRow(id: TranscriptRow.loadEarlierID, kind: .loadEarlier(isLoading: false))] + botChatRows)
+        XCTAssertTrue(chatLeft.areStill(botChatRows))
+        XCTAssertFalse(chatLeft.areStill([TranscriptRow(id: "w1", kind: .thinking)]))
+
+        // Only a chat's own rows count as the chat having come in.
+        XCTAssertFalse(TranscriptRow(id: TranscriptRow.emptyID, kind: .empty).isChatRow)
+        XCTAssertFalse(TranscriptRow(id: TranscriptRow.savedCopyStatusID, kind: .savedCopyStatus(isOpening: true)).isChatRow)
+        XCTAssertTrue(TranscriptRow(id: TranscriptRow.streamingID, kind: .streaming(isActive: true)).isChatRow)
+    }
+
+    /// Rows that slid away show nothing where they were, so they take no
+    /// taps and VoiceOver passes them, until they slide in or come back.
+    @MainActor
+    func testRowsThatSlidAwayTakeNoTapsUntilTheyShowAgain() async throws {
+        let suite = "swap-slide-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let controller = TranscriptViewController(
+            appState: AppState(defaults: defaults, loadSavedConnection: false),
+            scroller: TranscriptScroller()
+        )
+        // On screen, where the rows that leave slide out as a picture.
+        // In the test host's scene: a window with none is never rendered,
+        // and UIKit makes no picture of a view never rendered.
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let window = UIWindow(windowScene: scene)
+        window.frame = CGRect(x: 0, y: 0, width: 390, height: 844)
+        window.rootViewController = controller
+        window.isHidden = false
+        defer { window.isHidden = true }
+        window.layoutIfNeeded()
+        CATransaction.flush()
+        try await Task.sleep(for: .milliseconds(100))
+        let rows = controller.collectionView
+        let motion = TranscriptSwapMotion()
+        controller.swapMotion = motion
+        XCTAssertTrue(motion.stage === controller)
+        XCTAssertFalse(controller.showsChatRows, "nothing drawn yet")
+        let shown = controller.view.subviews.count
+
+        motion.leave(.back)
+        XCTAssertTrue(controller.rowsAreAway)
+        let picture = try XCTUnwrap(controller.leaving, "the rows that left slide out as a picture")
+        XCTAssertTrue(picture.superview === controller.view)
+        XCTAssertFalse(picture.isUserInteractionEnabled, "the picture of the rows that left takes no taps")
+        XCTAssertTrue(picture.accessibilityElementsHidden)
+        XCTAssertFalse(rows.isUserInteractionEnabled)
+        XCTAssertTrue(rows.accessibilityElementsHidden)
+
+        // The chat opened comes in.
+        controller.slideIn(.back)
+        XCTAssertFalse(controller.rowsAreAway)
+        XCTAssertTrue(rows.isUserInteractionEnabled)
+        XCTAssertFalse(rows.accessibilityElementsHidden)
+        XCTAssertNil(controller.leaving)
+        XCTAssertTrue(picture.superview === controller.view, "the picture finishes its slide before it goes")
+
+        // An open that draws nothing: they come back on their own, even
+        // if UIKit dropped the layer's animations meanwhile.
+        motion.patience = .milliseconds(20)
+        motion.leave(.back)
+        let second = try XCTUnwrap(controller.leaving)
+        rows.layer.removeAllAnimations()
+        try await Task.sleep(for: .milliseconds(200))
+        XCTAssertFalse(controller.rowsAreAway)
+        XCTAssertTrue(rows.isUserInteractionEnabled)
+        XCTAssertFalse(rows.accessibilityElementsHidden)
+        XCTAssertNil(controller.leaving)
+        XCTAssertNil(second.superview, "the picture goes as the rows come back")
+        try await Task.sleep(for: .milliseconds(400))
+        XCTAssertNil(picture.superview, "the slid-in picture went after its slide")
+        XCTAssertEqual(controller.view.subviews.count, shown)
+
+        // Rows that never left aren't touched by a comeback.
+        controller.comeBack()
+        XCTAssertTrue(rows.isUserInteractionEnabled)
+    }
+
+    /// A quick second swap: the Bot Chat's rows drawn while the
+    /// workstream's slide still waits come in from the leading edge once
+    /// the screen asks, not with the workstream's slide (issue 2513).
+    @MainActor
+    func testASecondSwapsRowsWaitForTheirOwnSlide() {
+        let stage = SwapStageRecorder()
+        let motion = TranscriptSwapMotion()
+        motion.stage = stage
+        motion.expect(.forward, conversation: "workstream")
+        XCTAssertEqual(stage.played, ["out forward"])
+        XCTAssertFalse(motion.waitsForAnotherChat(than: "workstream"))
+        // Back before the workstream drew: the Bot Chat's rows come first.
+        stage.shownConversation = "bot-chat"
+        stage.conversationJustChanged = true
+        stage.showsChatRows = true
+        XCTAssertTrue(motion.waitsForAnotherChat(than: "bot-chat"))
+        motion.expect(.back, conversation: "bot-chat")
+        XCTAssertEqual(stage.played, ["out forward", "in back"])
+        XCTAssertNil(motion.expected)
+        XCTAssertFalse(motion.waitsForAnotherChat(than: "bot-chat"))
+    }
+
+    /// The same with the workstream's welcome already on stage: the Bot
+    /// Chat's rows still slide in with their own swap, not the wait for
+    /// the workstream's.
+    func testASecondSwapsRowsSlideInPastTheFirstsWelcome() {
+        let stage = SwapStageRecorder()
+        let motion = TranscriptSwapMotion()
+        motion.stage = stage
+        stage.shownConversation = "workstream"
+        stage.conversationJustChanged = true
+        stage.showsChatRows = false
+        motion.expect(.forward, conversation: "workstream")
+        XCTAssertEqual(motion.expected, .forward)
+        stage.shownConversation = "bot-chat"
+        stage.showsChatRows = true
+        motion.expect(.back, conversation: "bot-chat")
+        XCTAssertEqual(stage.played.last, "in back")
+        XCTAssertNil(motion.expected)
+    }
+
+    /// A wait whose sleep ended just as a newer swap stood it down ends
+    /// nothing: the newer swap keeps its slide and the rows stay away.
+    @MainActor
+    func testAStoodDownWaitDoesntEndTheSwapAfterIt() async throws {
+        let stage = SwapStageRecorder()
+        let motion = TranscriptSwapMotion()
+        motion.stage = stage
+        motion.patience = .milliseconds(20)
+        motion.leave(.back)
+        // The sleep ends while the main thread is kept, as the swap keeps
+        // it; its wait is stood down before it gets to run.
+        usleep(100_000)
+        motion.patience = .seconds(30)
+        motion.expect(.back, conversation: "opened")
+        try await Task.sleep(for: .milliseconds(150))
+        XCTAssertEqual(stage.played, ["out back at once"], "the old wait brought nothing back")
+        XCTAssertEqual(motion.expected, .back)
+        XCTAssertEqual(motion.rowsDrawn(conversationChanged: true, chatRows: true), .back)
+    }
+
+    /// A sideways scroller scrolled away from its start takes a swipe
+    /// toward the trailing edge, so the swipe home waits; at its start, or
+    /// one that can't scroll, leaves the swipe home as it was.
+    @MainActor
+    func testASidewaysScrollerThatCanScrollBackHoldsTheSwipeHome() {
+        let root = UIViewController()
+        let page = UIViewController()
+        let navigation = UINavigationController()
+        navigation.setViewControllers([root, page], animated: false)
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
+        window.rootViewController = navigation
+        window.isHidden = false
+        defer { window.isHidden = true }
+        window.layoutIfNeeded()
+
+        let cards = UIScrollView(frame: CGRect(x: 0, y: 200, width: 390, height: 300))
+        cards.contentSize = CGSize(width: 1000, height: 300)
+        let card = UIView(frame: CGRect(x: 0, y: 0, width: 300, height: 300))
+        cards.addSubview(card)
+        page.view.addSubview(cards)
+        let middle = CGPoint(x: 200, y: 300)
+
+        XCTAssertFalse(SidewaysScrollTouch.canScrollBack(cards), "at its start")
+        XCTAssertFalse(SidewaysScrollTouch.holdsBackSwipe(under: card, at: middle, in: window))
+
+        cards.contentOffset = CGPoint(x: 150, y: 0)
+        XCTAssertTrue(SidewaysScrollTouch.canScrollBack(cards))
+        XCTAssertTrue(SidewaysScrollTouch.holdsBackSwipe(under: card, at: middle, in: window))
+        XCTAssertFalse(
+            SidewaysScrollTouch.holdsBackSwipe(under: card, at: CGPoint(x: 10, y: 300), in: window),
+            "from the leading edge it's still the swipe back"
+        )
+
+        cards.isScrollEnabled = false
+        XCTAssertFalse(SidewaysScrollTouch.canScrollBack(cards), "one that can't scroll")
+        cards.isScrollEnabled = true
+
+        let narrow = UIScrollView(frame: CGRect(x: 0, y: 0, width: 390, height: 100))
+        narrow.contentSize = CGSize(width: 390, height: 800)
+        narrow.contentOffset = CGPoint(x: 0, y: 200)
+        XCTAssertFalse(SidewaysScrollTouch.canScrollBack(narrow), "a scroller that only scrolls down")
+
+        // A pager the stack sits in isn't the page's scroller.
+        let pager = UIScrollView(frame: window.bounds)
+        pager.contentSize = CGSize(width: 1170, height: 844)
+        pager.contentOffset = CGPoint(x: 390, y: 0)
+        let pagerRoot = UIViewController()
+        let pagerPage = UIViewController()
+        let pagerStack = UINavigationController()
+        pagerStack.setViewControllers([pagerRoot, pagerPage], animated: false)
+        // The page's own view straight in the pager, standing in for the
+        // stack's views between them.
+        pagerPage.view.frame = window.bounds
+        pager.addSubview(pagerPage.view)
+        XCTAssertTrue(SidewaysScrollTouch.canScrollBack(pager))
+        let bubble = UIView(frame: CGRect(x: 50, y: 300, width: 200, height: 40))
+        pagerPage.view.addSubview(bubble)
+        XCTAssertFalse(SidewaysScrollTouch.holdsBackSwipe(under: bubble, at: middle, in: window))
+        pager.removeFromSuperview()
+
+        // The probe puts one watcher on its window, and each finger landing
+        // sets what the swipe home reads: over the scrolled cards, then not.
+        let probe = SidewaysScrollTouchProbe.ProbeView()
+        page.view.addSubview(probe)
+        page.view.addSubview(SidewaysScrollTouchProbe.ProbeView())
+        XCTAssertEqual(window.gestureRecognizers?.filter { $0 is SidewaysScrollTouchRecognizer }.count, 1)
+        cards.contentOffset = CGPoint(x: 150, y: 0)
+        SidewaysScrollTouch.touchBegan(at: middle, in: window)
+        XCTAssertTrue(SidewaysScrollTouch.lastTouchCouldScrollBack)
+        SidewaysScrollTouch.touchBegan(at: CGPoint(x: 200, y: 700), in: window)
+        XCTAssertFalse(SidewaysScrollTouch.lastTouchCouldScrollBack, "a finger off the cards")
+
+        // Right to left: SwiftUI flips its scroller by a transform, so the
+        // offset still counts from its leading end; a native one starts at
+        // its right end, the highest offset.
+        let flippedCards = UIScrollView(frame: CGRect(x: 0, y: 0, width: 390, height: 300))
+        flippedCards.contentSize = CGSize(width: 1000, height: 300)
+        flippedCards.transform = CGAffineTransform(scaleX: -1, y: 1)
+        XCTAssertFalse(SidewaysScrollTouch.canScrollBack(flippedCards, rightToLeft: true))
+        flippedCards.contentOffset = CGPoint(x: 150, y: 0)
+        XCTAssertTrue(SidewaysScrollTouch.canScrollBack(flippedCards, rightToLeft: true))
+        let nativeCards = UIScrollView(frame: CGRect(x: 0, y: 0, width: 390, height: 300))
+        nativeCards.contentSize = CGSize(width: 1000, height: 300)
+        nativeCards.contentOffset = CGPoint(x: 610, y: 0)
+        XCTAssertFalse(SidewaysScrollTouch.canScrollBack(nativeCards, rightToLeft: true), "at its right-hand start")
+        nativeCards.contentOffset = CGPoint(x: 300, y: 0)
+        XCTAssertTrue(SidewaysScrollTouch.canScrollBack(nativeCards, rightToLeft: true))
+
+        // In a right-to-left window the edge swipe starts at the right; a
+        // left-to-right scroller in it still starts at its left end.
+        window.semanticContentAttribute = .forceRightToLeft
+        cards.semanticContentAttribute = .forceLeftToRight
+        XCTAssertEqual(window.effectiveUserInterfaceLayoutDirection, .rightToLeft)
+        XCTAssertTrue(SidewaysScrollTouch.holdsBackSwipe(under: card, at: middle, in: window))
+        XCTAssertFalse(
+            SidewaysScrollTouch.holdsBackSwipe(under: card, at: CGPoint(x: 380, y: 300), in: window),
+            "from the right-hand leading edge it's the swipe back"
+        )
+        cards.contentOffset = .zero
+        XCTAssertFalse(SidewaysScrollTouch.holdsBackSwipe(under: card, at: middle, in: window), "at its left-hand start")
+        window.semanticContentAttribute = .unspecified
+
+        // Only the first finger down sets the flag.
+        let first = UITouch()
+        let second = UITouch()
+        XCTAssertTrue(SidewaysScrollTouchRecognizer.isFirstFinger([first], among: [first]))
+        XCTAssertFalse(SidewaysScrollTouchRecognizer.isFirstFinger([second], among: [first, second]))
     }
 
     /// A workstream's screen holds back the zoom's own dismissals by their
@@ -1256,6 +1937,11 @@ extension BotModeTests {
         }
         let roster = [bot("atlas", 10), bot("rei", nil), bot("furina", 30), bot("kai", 50, hidden: true), bot("nia", nil)]
         XCTAssertEqual(V2VoiceButton.botsToCall(roster).map(\.name), ["furina", "atlas", "rei", "nia"])
+        // A tap reads the bot from the roster as it is then: its row now,
+        // and none once the bot has gone, so the list can say so.
+        let choice = V2VoiceBotChoice(id: "furina", label: "Furina")
+        XCTAssertEqual(V2VoiceButton.bot(choice, in: [bot("atlas", 10), bot("furina", 70)])?.lastActive, 70)
+        XCTAssertNil(V2VoiceButton.bot(choice, in: [bot("atlas", 10)]))
     }
 
     /// Bots Home's Group Chats probe and the roster ask again on their own
@@ -1304,7 +1990,8 @@ extension BotModeTests {
         XCTAssertNil(slot.read())
         appState.moveGroupRoom("b", before: "a", shown: ["a", "b", "c"])
         XCTAssertEqual(slot.read() as? [String], ["b", "a", "c"])
-        XCTAssertEqual(defaults.stringArray(forKey: BotOrder.roomStorageKey), ["b", "a", "c"])
+        let key = BotOrder.roomStorageKey(scope: appState.dashboardListsScope)
+        XCTAssertEqual(defaults.stringArray(forKey: key), ["b", "a", "c"])
         XCTAssertTrue(appState.botOrder.isEmpty, "the bots' order is its own")
         appState.moveGroupRooms(fromOffsets: IndexSet(integer: 2), toOffset: 0, shown: ["b", "a", "c"])
         XCTAssertEqual(appState.groupRoomOrder.names, ["c", "b", "a"])
@@ -1317,7 +2004,7 @@ extension BotModeTests {
         XCTAssertEqual(BotOrder(names: ["a", "A"]).names, ["a"], "bots match in any case")
         slot.write(nil)
         XCTAssertTrue(appState.groupRoomOrder.isEmpty)
-        XCTAssertNil(defaults.stringArray(forKey: BotOrder.roomStorageKey))
+        XCTAssertNil(defaults.stringArray(forKey: key))
     }
 
     /// A room's tile dropped on another takes its place: carried on, it goes
@@ -1562,6 +2249,58 @@ extension BotModeTests {
         XCTAssertEqual(BotPortraitStatus.idle.title, "")
     }
 
+    /// Live status for every bot: what the bot's chats do (its profile's
+    /// registry and the plugin's waits) shows on its portrait, without the
+    /// plugin's workstreams too. A chat waiting on the user needs them,
+    /// a running chat says it's replying, never working (its workstreams
+    /// only, Eric 2026-11-16), and a room it talks in comes first
+    /// when nothing else works, since a room's turns run in its chats.
+    func testThePortraitSaysWhatTheBotsChatsDo() throws {
+        XCTAssertEqual(BotPortraitStatus.of(nil, chats: BotLiveChats(working: 2, waiting: 0)), .replying)
+        XCTAssertEqual(BotPortraitStatus.of(nil, chats: BotLiveChats(working: 2, waiting: 1)), .needsYou(1))
+        XCTAssertEqual(BotPortraitStatus.of(nil, talkingIn: ["Trip"], chats: BotLiveChats(working: 1, waiting: 0)),
+                       .inRooms(["Trip"]))
+        XCTAssertEqual(BotPortraitStatus.of(nil, chats: BotLiveChats()), .idle)
+        let both = try XCTUnwrap(BotWorkSnapshot(response: workResponse(), profile: "furina"))
+        XCTAssertEqual(BotPortraitStatus.of(both, chats: BotLiveChats(working: 0, waiting: 2)), .needsYou(3),
+                       "Its workstreams' and its chats' waits add up")
+        var working = workResponse()
+        working["counts"] = ["working": 2, "needs_you": 0, "ready": 0]
+        XCTAssertEqual(BotPortraitStatus.of(BotWorkSnapshot(response: working, profile: "furina"),
+                                            chats: BotLiveChats(working: 1, waiting: 0)), .working(2),
+                       "its chats replying aren't workstreams")
+        var quiet = workResponse()
+        quiet["counts"] = ["working": 0, "needs_you": 0, "ready": 1]
+        XCTAssertEqual(BotPortraitStatus.of(BotWorkSnapshot(response: quiet, profile: "furina"),
+                                            chats: BotLiveChats(working: 1, waiting: 0)), .replying,
+                       "A running chat says more than an unanswered ask")
+        var off = workResponse()
+        off["policy"] = "off"
+        XCTAssertEqual(BotPortraitStatus.of(BotWorkSnapshot(response: off, profile: "furina"),
+                                            chats: BotLiveChats(working: 0, waiting: 1)), .needsYou(1))
+
+        // A registry counts as one bot's only when Hermes' session authority
+        // listed it (its rows name their source), leaving out the bot's
+        // workstreams, which their own list counts.
+        let scoped = SessionLiveStatusIndex(rows: [
+            LiveSessionStatus(runtimeSessionId: "rt-chat", storedSessionId: "chat", status: "working", isProfileScoped: true),
+            LiveSessionStatus(runtimeSessionId: "rt-work", storedSessionId: "work", status: "working", isProfileScoped: true),
+            LiveSessionStatus(runtimeSessionId: "rt-ask", storedSessionId: "ask", status: "waiting", isProfileScoped: true),
+            LiveSessionStatus(runtimeSessionId: "rt-idle", storedSessionId: "idle", status: "idle", isProfileScoped: true),
+        ])
+        XCTAssertEqual(scoped.counts(leavingOut: ["work"]), BotLiveChats(working: 1, waiting: 1))
+        let legacy = SessionLiveStatusIndex(rows: [
+            LiveSessionStatus(runtimeSessionId: "rt-chat", storedSessionId: "chat", status: "working"),
+        ])
+        XCTAssertNil(legacy.counts(), "The legacy dashboard lists every profile's chats under each")
+        let chat = SessionSummary(id: "chat", alternateIds: [], title: "Chat", model: "Hermes", updatedLabel: "",
+                                  profile: "default", source: .chat, isActive: false, isArchived: false)
+        XCTAssertEqual(legacy.status(for: chat), .working, "Its rows still light chat rows by id")
+        let row = LiveSessionStatus(from: ["id": .string("rt"), "session_key": .string("s"), "status": .string("working"), "source": .null])
+        XCTAssertEqual(row?.isProfileScoped, true)
+        XCTAssertEqual(LiveSessionStatus(from: ["id": .string("rt")])?.isProfileScoped, false)
+    }
+
     /// Hand-offs between bots: answering another bot's ask comes before its
     /// own work, and an unanswered ask of its own shows when nothing else
     /// does; a closed or answered one shows nothing.
@@ -1585,6 +2324,31 @@ extension BotModeTests {
         // Its own work comes before waiting.
         response["counts"] = ["working": 2, "needs_you": 0, "ready": 0, "waiting": 1]
         XCTAssertEqual(BotPortraitStatus.of(BotWorkSnapshot(response: response, profile: "furina")), .working(2))
+    }
+
+    /// Background agents the Bot Chat itself started show on its portrait,
+    /// with its workstreams off too, where it's the one delegating; its
+    /// workstreams' work comes first (app issue 2206).
+    func testThePortraitShowsTheBotChatsOwnAgents() throws {
+        var off = workResponse()
+        off["policy"] = "off"
+        off["bot_chat_agents"] = 2
+        let delegating = BotPortraitStatus.of(BotWorkSnapshot(response: off, profile: "furina"))
+        XCTAssertEqual(delegating, .agents(2))
+        XCTAssertFalse(delegating.title.isEmpty)
+        off["bot_chat_agents"] = 0
+        XCTAssertEqual(BotPortraitStatus.of(BotWorkSnapshot(response: off, profile: "furina")), .idle)
+        off.removeValue(forKey: "bot_chat_agents")
+        XCTAssertEqual(BotWorkSnapshot(response: off, profile: "furina")?.botChatAgentCount, 0, "an older plugin")
+
+        var on = workResponse()
+        on["bot_chat_agents"] = 1
+        on["counts"] = ["working": 2, "needs_you": 0, "ready": 0]
+        XCTAssertEqual(BotPortraitStatus.of(BotWorkSnapshot(response: on, profile: "furina")), .working(2))
+        on["counts"] = ["working": 0, "needs_you": 0, "ready": 0]
+        on["work"] = [] as [[String: Any]]
+        XCTAssertEqual(BotPortraitStatus.of(BotWorkSnapshot(response: on, profile: "furina"), talkingIn: ["Trip"]),
+                       .agents(1), "before talking in a room")
     }
 }
 
@@ -1657,12 +2421,12 @@ extension BotModeTests {
         XCTAssertTrue(controlling.isChat(in: ["s1", "durable-1"]))
         XCTAssertFalse(controlling.isChat(in: []))
         XCTAssertEqual(BotScreenUse.name(of: controlling), "Trip plans")
-        XCTAssertEqual(BotScreenUse.name(of: controlling, openChat: ["s1"]), AppLocalization.string("this chat"))
+        XCTAssertEqual(BotScreenUse.name(of: controlling, openChat: ["s1"]), AppLocalization.string("this chat", table: .bots))
         XCTAssertEqual(BotScreenUse.name(of: try XCTUnwrap(use.last), openChat: ["s1"]), "W1")
         XCTAssertEqual(BotScreenUse.controllingLine(controlling, openChat: ["s1"]),
-                       AppLocalization.string("This chat is using the screen"))
+                       AppLocalization.string("This chat is using the screen", table: .bots))
         XCTAssertEqual(BotScreenUse.controllingLine(controlling),
-                       AppLocalization.string("\("Trip plans") is using the screen"))
+                       AppLocalization.string("\("Trip plans") is using the screen", table: .bots))
     }
 
     /// Which bot's screen a chat's menu opens (issue 2132): a Bot Chat's or
@@ -1728,5 +2492,39 @@ extension BotModeTests {
         let doneAsking = try XCTUnwrap(BotWorkItem(row: done))
         XCTAssertTrue(doneAsking.isActive)
         XCTAssertTrue(doneAsking.needsYou)
+    }
+}
+
+/// A transcript that only notes what `TranscriptSwapMotion` asks of it.
+@MainActor
+private final class SwapStageRecorder: TranscriptSwapStage {
+    var shownConversation: String? = "left"
+    var conversationJustChanged = false
+    var showsChatRows = false
+    var rowsAreAway = false
+    var played: [String] = []
+
+    func slideOut(_ swap: BotChatSwap, atOnce: Bool) {
+        rowsAreAway = true
+        played.append("out \(swap)" + (atOnce ? " at once" : ""))
+    }
+
+    func slideIn(_ swap: BotChatSwap) {
+        rowsAreAway = false
+        played.append("in \(swap)")
+    }
+
+    func comeBack() {
+        guard rowsAreAway else { return }
+        rowsAreAway = false
+        played.append("back")
+    }
+
+    func reset() {
+        shownConversation = "left"
+        conversationJustChanged = false
+        showsChatRows = false
+        rowsAreAway = false
+        played = []
     }
 }

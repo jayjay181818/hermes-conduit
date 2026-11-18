@@ -70,6 +70,9 @@ final class FakeVoiceJobBackend {
     let createParked = AwaitableCounter()
     /// Runs inside submit, so a test can deliver events mid-submission.
     var onSubmit: (@MainActor (_ sessionID: String) -> Void)?
+    /// Awaited inside submit, after `onSubmit`, so a test can cancel while
+    /// the submit is on its way.
+    var duringSubmit: (@MainActor () async -> Void)?
     private var parkedCreate: CheckedContinuation<Void, Never>?
     var liveRows: [LiveSessionStatus] = []
     private(set) var created = 0
@@ -83,6 +86,12 @@ final class FakeVoiceJobBackend {
     var profileTargets: [String: VoiceJobProfileTarget] = [:]
     /// Profiles whose liveSessions read throws.
     var failingLiveProfiles: Set<String> = []
+    var sessionRunningResult: Bool?
+    var sessionRunningError: Error?
+    private(set) var sessionReads: [(String, String?)] = []
+    var parksSessionRead = false
+    let sessionReadParked = AwaitableCounter()
+    private var parkedSessionRead: CheckedContinuation<Void, Never>?
     private(set) var titles: [(String, String)] = []
     /// Each job kept in its bot's work registry: profile, session, title, whether a Watch call's.
     private(set) var kept: [(String?, String, String, Bool)] = []
@@ -97,10 +106,18 @@ final class FakeVoiceJobBackend {
     private(set) var leftChats: [(String?, String)] = []
     var activeProfile: String? = "default"
     private(set) var submissions: [(String, String)] = []
+    /// Each turn surface reported before a submit: session, text, whether a
+    /// Watch call's job; and the sessions whose report a failed submit dropped.
+    private(set) var surfaceReports: [(String, String, Bool)] = []
+    private(set) var droppedSurfaces: [String] = []
+    /// Runs while a turn surface report goes, so a test can cancel meanwhile.
+    var onSurfaceReport: (@MainActor () async -> Void)?
     private(set) var cancelled: [String] = []
     /// The attached chat: whether a turn runs there, what was sent to it,
     /// and its latest reply.
     var threadBusy = false
+    /// How long a threadIsBusy read takes, so two reads can overlap.
+    var threadBusyDelay: Duration?
     var threadSubmitError: Error?
     var threadReply: String?
     /// The runtime the chat resumes onto; nil keeps the target's own.
@@ -175,7 +192,13 @@ final class FakeVoiceJobBackend {
             submit: { [self] id, text in
                 self.submissions.append((id, text))
                 self.onSubmit?(id)
+                await self.duringSubmit?()
                 if let error = self.submitError { throw error }
+            },
+            reportTurnSurface: { [self] id, text, fromWatch in
+                self.surfaceReports.append((id, text, fromWatch))
+                await self.onSurfaceReport?()
+                return { [self] _ in self.droppedSurfaces.append(id) }
             },
             cancel: { [self] id in
                 if self.parksCancel {
@@ -193,8 +216,23 @@ final class FakeVoiceJobBackend {
                 if let profile, self.failingLiveProfiles.contains(profile) { throw URLError(.timedOut) }
                 return self.liveRows
             },
+            sessionRunning: { [self] id, profile in
+                self.sessionReads.append((id, profile))
+                if self.parksSessionRead {
+                    self.parksSessionRead = false
+                    await withCheckedContinuation { continuation in
+                        self.parkedSessionRead = continuation
+                        self.sessionReadParked.increment()
+                    }
+                }
+                if let error = self.sessionRunningError { throw error }
+                return self.sessionRunningResult
+            },
             resolveProfile: { [self] name in self.profileTargets[name.lowercased()] ?? .unknown },
-            threadIsBusy: { [self] _ in self.threadBusy },
+            threadIsBusy: { [self] _ in
+                if let delay = self.threadBusyDelay { try? await Task.sleep(for: delay) }
+                return self.threadBusy
+            },
             resolveThreadRuntime: { [self] thread in
                 if let error = self.threadRuntimeError { throw error }
                 return self.threadRuntime ?? thread.runtimeSessionID
@@ -233,6 +271,12 @@ final class FakeVoiceJobBackend {
             threadAwaitsSeveralPrompts: { [self] _ in self.severalPrompts },
             openThreadMessages: { [self] _ in self.openMessages }
         )
+    }
+
+    func releaseSessionRead() {
+        let continuation = parkedSessionRead
+        parkedSessionRead = nil
+        continuation?.resume()
     }
 
     func releaseCreate() {
@@ -282,6 +326,114 @@ extension VoiceConversationControllerTests {
 
     /// Bot workstreams M5: the job is kept in its bot's registry by its
     /// stored id, once Hermes takes its request; the runtime id when Hermes names no other.
+    func testAJobReportsItsTurnSurfaceBeforeItsSubmitAndDropsItWhenRefused() async throws {
+        // Where the request came from reaches Hermes with the job's own
+        // prompt, the exact text submitted (#888): a Watch call's job says so.
+        let (supervisor, fake) = makeSupervisor()
+        _ = await supervisor.performVoiceCommand(.start(instructions: "check the backups"))
+        _ = await supervisor.startJob(instructions: "check the disks", profile: nil, callsModel: false, fromWatch: true)
+        XCTAssertEqual(fake.surfaceReports.map(\.0), fake.submissions.map(\.0))
+        XCTAssertEqual(fake.surfaceReports.map(\.1), fake.submissions.map(\.1))
+        XCTAssertEqual(fake.surfaceReports.map(\.2), [false, true])
+        XCTAssertTrue(fake.droppedSurfaces.isEmpty)
+        // A refused submit drops its report, so it can't label another turn.
+        let (refused, refusedFake) = makeSupervisor()
+        refusedFake.submitError = RpcError(code: 4009, message: "session busy")
+        _ = await refused.performVoiceCommand(.start(instructions: "check the weather"))
+        XCTAssertEqual(refusedFake.droppedSurfaces, refusedFake.submissions.map(\.0))
+        XCTAssertEqual(refusedFake.droppedSurfaces.count, 1)
+        // A cancel while the report goes: nothing is sent, and the report is dropped.
+        let (cancelled, cancelledFake) = makeSupervisor()
+        cancelledFake.onSurfaceReport = { [weak cancelled] in
+            guard let cancelled, let id = cancelled.jobs.first?.id else { return }
+            _ = await cancelled.cancel(jobID: id)
+        }
+        _ = await cancelled.startJob(instructions: "check the disks")
+        XCTAssertTrue(cancelledFake.submissions.isEmpty)
+        XCTAssertEqual(cancelledFake.droppedSurfaces, cancelledFake.surfaceReports.map(\.0))
+        XCTAssertEqual(cancelledFake.droppedSurfaces.count, 1)
+        // A Watch call's later request, in the chat its first job made, is the Watch's too.
+        let (continued, continuedFake) = makeSupervisor()
+        _ = await continued.continueJob(instructions: "and the logs",
+                                        in: VoiceThreadTarget(runtimeSessionID: "rt-call", storedSessionID: nil, title: "Call"))
+        for _ in 0..<200 where continuedFake.submissions.isEmpty { try? await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertEqual(continuedFake.submissions.map(\.0), ["rt-call"])
+        XCTAssertEqual(continuedFake.surfaceReports.map(\.2), [true])
+        XCTAssertEqual(continuedFake.surfaceReports.map(\.1), continuedFake.submissions.map(\.1))
+        // Refused there, its report is dropped too.
+        let (refusedContinued, refusedContinuedFake) = makeSupervisor()
+        refusedContinuedFake.submitError = RpcError(code: 4009, message: "session busy")
+        _ = await refusedContinued.continueJob(instructions: "and the logs",
+                                               in: VoiceThreadTarget(runtimeSessionID: "rt-call", storedSessionID: nil, title: "Call"))
+        for _ in 0..<200 where refusedContinuedFake.droppedSurfaces.isEmpty { try? await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertEqual(refusedContinuedFake.droppedSurfaces, ["rt-call"])
+        // Cancelled while its report goes: nothing is sent, the report is
+        // dropped, and the chat's running turn (another's) isn't interrupted.
+        let (cancelledContinued, cancelledContinuedFake) = makeSupervisor()
+        cancelledContinuedFake.onSurfaceReport = { [weak cancelledContinued] in
+            guard let cancelledContinued, let id = cancelledContinued.jobs.first?.id else { return }
+            _ = await cancelledContinued.cancel(jobID: id)
+        }
+        _ = await cancelledContinued.continueJob(instructions: "and the disks",
+                                                 in: VoiceThreadTarget(runtimeSessionID: "rt-call", storedSessionID: nil, title: "Call"))
+        for _ in 0..<200 where cancelledContinuedFake.droppedSurfaces.isEmpty { try? await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertEqual(cancelledContinuedFake.droppedSurfaces, ["rt-call"])
+        XCTAssertTrue(cancelledContinuedFake.submissions.isEmpty)
+        XCTAssertTrue(cancelledContinuedFake.cancelled.isEmpty)
+        // Cancelled once its submit began, it interrupts its turn in the chat.
+        let (sentContinued, sentContinuedFake) = makeSupervisor()
+        _ = await sentContinued.continueJob(instructions: "and the backups",
+                                            in: VoiceThreadTarget(runtimeSessionID: "rt-call", storedSessionID: nil, title: "Call"))
+        for _ in 0..<200 where sentContinuedFake.submissions.isEmpty { try? await Task.sleep(for: .milliseconds(10)) }
+        let sentID = try XCTUnwrap(sentContinued.jobs.first?.id)
+        _ = await sentContinued.cancel(jobID: sentID)
+        XCTAssertEqual(sentContinuedFake.cancelled, ["rt-call"])
+        XCTAssertTrue(sentContinuedFake.droppedSurfaces.isEmpty)
+        // Cancelled while its submit is on its way: that cancel reached
+        // Hermes before the turn, so it is repeated once the turn exists, as
+        // a first job's start does (issue 2295).
+        let (midSubmit, midSubmitFake) = makeSupervisor()
+        midSubmitFake.duringSubmit = { [weak midSubmit] in
+            guard let midSubmit, let id = midSubmit.jobs.first?.id else { return }
+            _ = await midSubmit.cancel(jobID: id)
+        }
+        _ = await midSubmit.continueJob(instructions: "and the mail",
+                                        in: VoiceThreadTarget(runtimeSessionID: "rt-call", storedSessionID: nil, title: "Call"))
+        for _ in 0..<200 where midSubmitFake.cancelled.count < 2 { try? await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertEqual(midSubmitFake.cancelled, ["rt-call", "rt-call"])
+        XCTAssertFalse(midSubmit.jobs.contains { $0.status.isActive }, "nothing runs unmonitored")
+        // Two of the call's requests at once: while one checks the chat is
+        // free, the other waits, so only one is sent (issue 2283).
+        let pairedFake = FakeVoiceJobBackend()
+        let paired = VoiceBackgroundJobSupervisor(
+            backend: pairedFake.backend, pollInterval: .seconds(3_600), threadWaitInterval: .milliseconds(5)
+        )
+        pairedFake.threadBusyDelay = .milliseconds(50)
+        let chat = VoiceThreadTarget(runtimeSessionID: "rt-call", storedSessionID: nil, title: "Call")
+        _ = await paired.continueJob(instructions: "check the disks", in: chat)
+        _ = await paired.continueJob(instructions: "check the logs", in: chat)
+        await waitFor { !pairedFake.submissions.isEmpty }
+        try? await Task.sleep(for: .milliseconds(200))
+        XCTAssertEqual(pairedFake.submissions.count, 1)
+        // Whichever went first (the tasks may start in either order), the
+        // other goes in once it is over, then ends too.
+        let firstSent = try XCTUnwrap(pairedFake.submissions.first?.1)
+        let first = try XCTUnwrap(paired.jobs.first { firstSent.contains($0.instructions) })
+        let second = try XCTUnwrap(paired.jobs.first { $0.id != first.id })
+        XCTAssertTrue(first.requestSent)
+        XCTAssertFalse(first.claimsChat)
+        _ = await paired.cancel(jobID: first.id)
+        await waitFor { pairedFake.submissions.count == 2 }
+        XCTAssertTrue(pairedFake.submissions.last?.1.contains(second.instructions) ?? false)
+        _ = await paired.cancel(jobID: second.id)
+        XCTAssertEqual(pairedFake.cancelled, ["rt-call", "rt-call"])
+        XCTAssertFalse(paired.jobs.contains { $0.status.isActive })
+        // The surface: the Watch for its call's job, else where a spoken message is.
+        XCTAssertEqual(TurnSurface.voiceJob(fromWatch: true, carPlay: true, device: .iphone), TurnSurface(place: .watch, input: .spoken))
+        XCTAssertEqual(TurnSurface.voiceJob(fromWatch: false, carPlay: true, device: .iphone), TurnSurface(place: .carplay, input: .spoken))
+        XCTAssertEqual(TurnSurface.voiceJob(fromWatch: false, carPlay: false, device: .ipad), TurnSurface(place: .ipad, input: .spoken))
+    }
+
     func testAStartedJobIsKeptInItsBotsWorkRegistry() async {
         let (supervisor, fake) = makeSupervisor()
         _ = await supervisor.performVoiceCommand(.start(instructions: "check why my server went down"))
@@ -827,6 +979,180 @@ extension VoiceConversationControllerTests {
         XCTAssertEqual(supervisor.jobs.first?.status, .finished)
     }
 
+    /// Issue 2639: a cancel stands when Hermes has no such session, and a
+    /// listed job keeps that across a relaunch.
+    func testAJobReapedBeforeItsFirstListingStillCancels() async throws {
+        let (cancelling, cancelFake) = makeSupervisor()
+        cancelFake.profileTargets = ["fam": .other("fam")]
+        _ = await cancelling.startJob(instructions: "check the router", profile: "fam")
+        let job = try XCTUnwrap(cancelling.jobs.first)
+        cancelFake.cancelError = RpcError(code: 4001, message: "Session not found")
+        _ = await cancelling.cancel(jobID: job.id)
+        XCTAssertEqual(cancelling.jobs.first(where: { $0.id == job.id })?.status ?? .cancelled, .cancelled,
+                       "Hermes has no such session: the cancel stands")
+
+        var listed = job
+        listed.listedByLivenessPoll = true
+        XCTAssertEqual(SavedVoiceJob(listed)?.job?.listedByLivenessPoll, true, "kept across a relaunch")
+        XCTAssertEqual(SavedVoiceJob(job)?.job?.listedByLivenessPoll, false)
+    }
+
+    private func savedRunningJob(_ runtimeID: String = "rt-gone") throws -> SavedVoiceJob {
+        try XCTUnwrap(SavedVoiceJob(VoiceBackgroundJob(
+            id: UUID(), title: "Router", instructions: "check the router", profile: "fam",
+            runtimeSessionID: runtimeID, storedSessionID: "st-\(runtimeID)", status: .running,
+            startedAt: Date().addingTimeInterval(-3_600)
+        )))
+    }
+
+    func testRestoredJobsReapedBeforeTheirFirstListingReleaseTheirSlots() async throws {
+        let (supervisor, fake) = makeSupervisor()
+        let saved = try (1...VoiceBackgroundJobSupervisor.maximumActiveJobs).map { try savedRunningJob("rt-gone-\($0)") }
+        supervisor.restore(saved)
+        fake.sessionRunningError = RpcError(code: 4001, message: "session not found", reason: "not_found")
+        XCTAssertEqual(supervisor.activeJobCount, VoiceBackgroundJobSupervisor.maximumActiveJobs)
+
+        await supervisor.pollOnce()
+        XCTAssertTrue(fake.sessionReads.isEmpty, "one missing registry row is not enough")
+        await supervisor.pollOnce()
+
+        XCTAssertEqual(fake.sessionReads.map { $0.0 }, saved.map(\.runtimeSessionID))
+        XCTAssertTrue(fake.sessionReads.allSatisfy { $0.1 == "fam" }, "probe the job's own profile")
+        XCTAssertEqual(supervisor.activeJobCount, 0)
+        XCTAssertTrue(supervisor.jobs.allSatisfy { $0.status == .failed(AppLocalization.string("That chat is no longer available.")) })
+        XCTAssertTrue(supervisor.savedLedger().allSatisfy { $0.state == .failed }, "never restore these as running again")
+        _ = await supervisor.startJob(instructions: "new work")
+        XCTAssertEqual(fake.created, 1, "a new job is admitted after the stale jobs settle")
+    }
+
+    func testAnUnlistedJobWithAReadOnlyIdleAnswerRecoversItsReply() async {
+        let (supervisor, fake) = makeSupervisor()
+        fake.profileTargets = ["fam": .other("fam")]
+        _ = await supervisor.startJob(instructions: "check the router", profile: "fam")
+        fake.sessionRunningResult = false
+        fake.threadReply = "The router is fine."
+
+        await supervisor.pollOnce()
+        await supervisor.pollOnce()
+
+        XCTAssertEqual(supervisor.jobs.first?.status, .finished)
+        XCTAssertEqual(supervisor.jobs.first?.result, "The router is fine.")
+        XCTAssertEqual(fake.replyReads.first?.runtimeSessionID, "rt-1")
+        XCTAssertEqual(fake.replyReads.first?.storedSessionID, "st-1")
+        XCTAssertEqual(fake.replyReads.first?.profile, "fam")
+    }
+
+    func testAReapedRuntimeStillRecoversTheReplyKeptInItsStoredChat() async throws {
+        let (supervisor, fake) = makeSupervisor()
+        supervisor.restore([try savedRunningJob()])
+        fake.sessionRunningError = RpcError(code: 4001, message: "session not found")
+        fake.threadReply = "The check finished before the runtime was reaped."
+
+        await supervisor.pollOnce()
+        await supervisor.pollOnce()
+
+        XCTAssertEqual(supervisor.jobs.first?.status, .finished)
+        XCTAssertEqual(supervisor.jobs.first?.result, fake.threadReply)
+        XCTAssertEqual(supervisor.savedLedger().first?.state, .finished)
+    }
+
+    func testRunningOrUnknownSessionChecksKeepAnUnlistedJobSupervised() async throws {
+        for running in [true, nil] as [Bool?] {
+            let (supervisor, fake) = makeSupervisor()
+            supervisor.restore([try savedRunningJob()])
+            fake.sessionRunningResult = running
+            await supervisor.pollOnce()
+            await supervisor.pollOnce()
+            await supervisor.pollOnce()
+            XCTAssertEqual(supervisor.jobs.first?.status, .running)
+            XCTAssertEqual(supervisor.activeJobCount, 1)
+            XCTAssertTrue(fake.replyReads.isEmpty)
+        }
+    }
+
+    func testAnUnreachableOrUnsupportedSessionCheckIsNotAnEndedJob() async throws {
+        let errors: [Error] = [
+            URLError(.timedOut), HermesError.notConnected,
+            RpcError(code: -32601, message: "method not found"),
+            RpcError(code: 4001, message: "permission_denied", reason: "permission_denied"),
+        ]
+        for error in errors {
+            let (supervisor, fake) = makeSupervisor()
+            supervisor.restore([try savedRunningJob()])
+            fake.sessionRunningError = error
+            await supervisor.pollOnce()
+            await supervisor.pollOnce()
+            XCTAssertEqual(supervisor.jobs.first?.status, .running)
+            XCTAssertEqual(fake.sessionReads.count, 1)
+        }
+        let (supervisor, fake) = makeSupervisor()
+        supervisor.restore([try savedRunningJob()])
+        fake.failingLiveProfiles = ["fam"]
+        fake.sessionRunningError = RpcError(code: 4001, message: "session not found")
+        await supervisor.pollOnce()
+        await supervisor.pollOnce()
+        XCTAssertTrue(fake.sessionReads.isEmpty, "a failed registry read is not a missing row")
+        XCTAssertEqual(supervisor.jobs.first?.status, .running)
+    }
+
+    func testAListingOvertakesAMissingSessionCheck() async throws {
+        let (supervisor, fake) = makeSupervisor()
+        supervisor.restore([try savedRunningJob()])
+        fake.sessionRunningError = RpcError(code: 4001, message: "session not found")
+        await supervisor.pollOnce()
+        fake.parksSessionRead = true
+        let checking = Task { await supervisor.pollOnce() }
+        await fake.sessionReadParked.waitUntil(1)
+
+        fake.liveRows = [LiveSessionStatus(runtimeSessionId: "rt-gone", storedSessionId: "st-rt-gone", status: "working")]
+        await supervisor.pollOnce()
+        fake.releaseSessionRead()
+        await checking.value
+
+        XCTAssertEqual(supervisor.jobs.first?.status, .running)
+        XCTAssertEqual(supervisor.jobs.first?.consecutiveMissedPolls, 0)
+        XCTAssertTrue(supervisor.jobs.first?.listedByLivenessPoll == true)
+    }
+
+    func testAWorkPanelStopOvertakesAMissingSessionCheck() async throws {
+        let (supervisor, fake) = makeSupervisor()
+        supervisor.restore([try savedRunningJob()])
+        fake.sessionRunningError = RpcError(code: 4001, message: "session not found")
+        await supervisor.pollOnce()
+        fake.parksSessionRead = true
+        let checking = Task { await supervisor.pollOnce() }
+        await fake.sessionReadParked.waitUntil(1)
+
+        XCTAssertTrue(supervisor.stoppedFromWorkPanel(sessionID: "rt-gone"))
+        fake.releaseSessionRead()
+        await checking.value
+
+        XCTAssertEqual(supervisor.jobs.first?.status, .cancelled)
+        XCTAssertEqual(supervisor.activeJobCount, 0)
+        XCTAssertTrue(supervisor.savedLedger().isEmpty)
+        XCTAssertTrue(fake.replyReads.isEmpty, "never turn the Work panel's stop into a finished job")
+    }
+
+    func testAMissingSessionCheckCannotSettleARestoredJobAfterReset() async throws {
+        let (supervisor, fake) = makeSupervisor()
+        let saved = try savedRunningJob()
+        supervisor.restore([saved])
+        fake.sessionRunningError = RpcError(code: 4001, message: "session not found")
+        await supervisor.pollOnce()
+        fake.parksSessionRead = true
+        let checking = Task { await supervisor.pollOnce() }
+        await fake.sessionReadParked.waitUntil(1)
+
+        supervisor.reset()
+        supervisor.restore([saved])
+        fake.releaseSessionRead()
+        await checking.value
+
+        XCTAssertEqual(supervisor.jobs.first?.status, .running)
+        XCTAssertEqual(supervisor.jobs.first?.consecutiveMissedPolls, 0)
+        XCTAssertTrue(fake.replyReads.isEmpty)
+    }
+
     func testAWatchCallHearsTheReplyOfAJobThePollSettled() async {
         let (supervisor, fake) = makeSupervisor()
         supervisor.readsRepliesWhenSettling = true
@@ -1054,7 +1380,7 @@ extension VoiceConversationControllerTests {
         supervisor.observe(.messageInterrupted(sessionId: "rt-1"))
         XCTAssertNil(supervisor.takePendingNotice(), "the user already heard the cancellation")
         let again = await supervisor.cancelAll()
-        XCTAssertEqual(again, AppLocalization.string("There are no background jobs to cancel."))
+        XCTAssertEqual(again, AppLocalization.string("There are no background jobs to cancel.", table: .voice))
     }
 
     func testAFailedHermesCancelIsReportedAndTheJobStaysSupervised() async throws {
@@ -1072,13 +1398,46 @@ extension VoiceConversationControllerTests {
         XCTAssertFalse(all.contains("Cancelled"), all)
     }
 
+    func testCancelAndCancelAllAcceptAReapedSessionAsAlreadyStopped() async throws {
+        let (supervisor, fake) = makeSupervisor()
+        let first = try savedRunningJob("rt-gone-1")
+        supervisor.restore([first, try savedRunningJob("rt-gone-2")])
+        fake.cancelError = RpcError(code: 4001, message: "session not found", reason: "not_found")
+
+        let one = await supervisor.cancel(jobID: first.id)
+        XCTAssertEqual(one, AppLocalization.string("\(first.title) was cancelled."))
+        _ = await supervisor.cancelAll()
+
+        XCTAssertTrue(supervisor.jobs.allSatisfy { $0.status == .cancelled && $0.outcomeDelivered })
+        XCTAssertEqual(supervisor.activeJobCount, 0)
+        XCTAssertTrue(supervisor.savedLedger().isEmpty)
+    }
+
+    func testAMissingCancelReplyAfterResetCannotCancelTheNewLedger() async throws {
+        let (supervisor, fake) = makeSupervisor()
+        let saved = try savedRunningJob()
+        supervisor.restore([saved])
+        fake.parksCancel = true
+        fake.cancelError = RpcError(code: 4001, message: "session not found")
+        let cancelling = Task { await supervisor.cancel(jobID: saved.id) }
+        await fake.cancelParked.waitUntil(1)
+
+        supervisor.reset()
+        supervisor.restore([saved])
+        fake.releaseCancel()
+        _ = await cancelling.value
+
+        XCTAssertEqual(supervisor.jobs.first?.status, .running)
+        XCTAssertFalse(supervisor.jobs.first?.outcomeDelivered ?? true)
+    }
+
     func testFailedStartIsReportedInlineOnly() async {
         let (supervisor, fake) = makeSupervisor()
         fake.createError = HermesError.notConnected
 
         let reply = await supervisor.startJob(instructions: "anything")
 
-        XCTAssertEqual(reply, AppLocalization.string("Couldn't start the background job."))
+        XCTAssertEqual(reply, AppLocalization.string("Couldn't start the background job.", table: .voice))
         XCTAssertEqual(supervisor.activeJobCount, 0)
         XCTAssertNil(supervisor.takePendingNotice(), "the failure was already spoken as the reply")
     }
@@ -1107,7 +1466,7 @@ extension VoiceConversationControllerTests {
 
         let reply = await supervisor.startJob(instructions: "doomed")
 
-        XCTAssertEqual(reply, AppLocalization.string("Couldn't start the background job."))
+        XCTAssertEqual(reply, AppLocalization.string("Couldn't start the background job.", table: .voice))
         XCTAssertNil(supervisor.takePendingNotice(), "the failure was the reply; it is not announced twice")
     }
 
@@ -1117,7 +1476,7 @@ extension VoiceConversationControllerTests {
 
         let reply = await supervisor.startJob(instructions: "lost ack")
 
-        XCTAssertEqual(reply, AppLocalization.string("Couldn't start the background job."))
+        XCTAssertEqual(reply, AppLocalization.string("Couldn't start the background job.", table: .voice))
         XCTAssertEqual(fake.cancelled, ["rt-1"], "a turn Hermes may have accepted is interrupted, not left unmonitored")
         XCTAssertNil(supervisor.takePendingNotice())
     }
@@ -1295,7 +1654,7 @@ extension VoiceConversationControllerTests {
 
         supervisor.noticeSent(jobID: taken.jobID)
         XCTAssertTrue(supervisor.listedJobs.isEmpty)
-        XCTAssertEqual(supervisor.statusSummary(), AppLocalization.string("No background jobs are running."))
+        XCTAssertEqual(supervisor.statusSummary(), AppLocalization.string("No background jobs are running.", table: .voice))
     }
 
     func testResetForgetsJobsAndIgnoresTheirLateEvents() async {
@@ -1306,7 +1665,7 @@ extension VoiceConversationControllerTests {
 
         XCTAssertTrue(supervisor.jobs.isEmpty)
         XCTAssertNil(supervisor.takePendingNotice())
-        XCTAssertEqual(supervisor.statusSummary(), AppLocalization.string("No background jobs are running."))
+        XCTAssertEqual(supervisor.statusSummary(), AppLocalization.string("No background jobs are running.", table: .voice))
     }
 
     func testJobTitlesAreCutAtAWordBoundary() {
@@ -1364,6 +1723,85 @@ extension VoiceConversationControllerTests {
         XCTAssertTrue(context?.contains("<typed_message>\nwhat's left on the release?\n</typed_message>") == true)
         XCTAssertTrue(context?.contains("<latest_reply>\nTwo PRs.\n</latest_reply>") == true)
         XCTAssertNil(supervisor.takePendingChatContext())
+    }
+
+    /// A thread turn said while a continued job of the call submits in the
+    /// same chat waits until that submit and its repeated cancel are over,
+    /// so the repeat can't stop it (review of #2310).
+    func testAThreadTurnWaitsForAContinuedJobsSubmitAndItsRepeatedCancel() async {
+        let (supervisor, fake) = makeThreadSupervisor()
+        let chat = VoiceThreadTarget(runtimeSessionID: "rt-chat", storedSessionID: "st-chat", title: "Build")
+        var sentWhileSubmitting = -1
+        var cancelsAtThreadSubmit = -1
+        fake.onThreadSubmit = { [weak fake] in cancelsAtThreadSubmit = fake?.cancelled.count ?? -1 }
+        fake.duringSubmit = { [weak supervisor, weak fake] in
+            guard let supervisor, let fake, let id = supervisor.jobs.first?.id else { return }
+            _ = supervisor.startThreadTurn(request: "check the build")
+            try? await Task.sleep(for: .milliseconds(100))
+            sentWhileSubmitting = fake.threadSubmissions.count
+            _ = await supervisor.cancel(jobID: id)
+        }
+        _ = await supervisor.continueJob(instructions: "and the logs", in: chat)
+        guard await waitFor({ !fake.threadSubmissions.isEmpty }) else { return }
+        XCTAssertEqual(sentWhileSubmitting, 0, "the thread turn waits while the continued job submits")
+        XCTAssertEqual(fake.cancelled, ["rt-chat", "rt-chat"], "both cancels landed before the thread turn went")
+        XCTAssertEqual(cancelsAtThreadSubmit, 2, "counted as the thread turn was sent")
+        XCTAssertEqual(fake.threadSubmissions.count, 1)
+    }
+
+    /// The shared hold the other way (issue 2325): a continued job waits
+    /// behind a thread turn of the call sent in the chat, then goes.
+    func testAContinuedJobWaitsBehindASentThreadTurn() async {
+        let (supervisor, fake) = makeThreadSupervisor()
+        _ = supervisor.startThreadTurn(request: "check the build")
+        guard await waitFor({ supervisor.jobs.first?.status == .running }) else { return }
+        let chat = VoiceThreadTarget(runtimeSessionID: "rt-chat", storedSessionID: "st-chat", title: "Build")
+        _ = await supervisor.continueJob(instructions: "and the logs", in: chat)
+        try? await Task.sleep(for: .milliseconds(100))
+        XCTAssertTrue(fake.submissions.isEmpty, "the thread turn still runs there")
+        supervisor.observe(.messageComplete(sessionId: "rt-chat", messageId: nil, content: "Green.", reasoning: nil))
+        guard await waitFor({ fake.submissions.count == 1 }) else { return }
+        XCTAssertEqual(fake.submissions.first?.0, "rt-chat")
+    }
+
+    /// A thread turn said between a continued job's claim and its submit
+    /// waits for the submit (issue 2325).
+    func testAThreadTurnWaitsBetweenAContinuedJobsClaimAndSubmit() async {
+        let (supervisor, fake) = makeThreadSupervisor()
+        var sentBeforeSubmit = -1
+        fake.onSurfaceReport = { [weak supervisor, weak fake] in
+            guard let supervisor, let fake else { return }
+            _ = supervisor.startThreadTurn(request: "check the build")
+            try? await Task.sleep(for: .milliseconds(100))
+            sentBeforeSubmit = fake.threadSubmissions.count
+        }
+        let chat = VoiceThreadTarget(runtimeSessionID: "rt-chat", storedSessionID: "st-chat", title: "Build")
+        _ = await supervisor.continueJob(instructions: "and the logs", in: chat)
+        guard await waitFor({ fake.submissions.count == 1 }) else { return }
+        XCTAssertEqual(sentBeforeSubmit, 0, "held from the claim until the submit")
+    }
+
+    /// A cancel that fails after the submit returned puts the job back to
+    /// starting; it doesn't keep holding the chat, so a thread turn of the
+    /// call still goes (issue 2325).
+    func testAFailedCancelAfterTheSubmitDoesntHoldTheChat() async throws {
+        let (supervisor, fake) = makeThreadSupervisor()
+        fake.parksCancel = true
+        fake.cancelError = URLError(.timedOut)
+        var cancelling: Task<String?, Never>?
+        fake.duringSubmit = { [weak supervisor, weak fake] in
+            guard let supervisor, let fake, let id = supervisor.jobs.first?.id else { return }
+            cancelling = Task { await supervisor.cancel(jobID: id) }
+            await fake.cancelParked.waitUntil(1)
+        }
+        let chat = VoiceThreadTarget(runtimeSessionID: "rt-chat", storedSessionID: "st-chat", title: "Build")
+        _ = await supervisor.continueJob(instructions: "and the logs", in: chat)
+        guard await waitFor({ fake.submissions.count == 1 && supervisor.jobs.first?.submitInFlight == false }) else { return }
+        fake.releaseCancel()
+        _ = await cancelling?.value
+        XCTAssertEqual(supervisor.jobs.first?.status, .starting, "the failed cancel put it back")
+        _ = supervisor.startThreadTurn(request: "check the build")
+        guard await waitFor({ fake.threadSubmissions.count == 1 }) else { return }
     }
 
     func testAVoiceTurnsReplyIsNotAlsoTypedContext() async {
@@ -1754,9 +2192,9 @@ extension VoiceConversationControllerTests {
 
         XCTAssertEqual(supervisor.activeJobCount, 0)
         XCTAssertTrue(supervisor.backgroundJobs.isEmpty)
-        XCTAssertEqual(supervisor.statusSummary(), AppLocalization.string("No background jobs are running."))
+        XCTAssertEqual(supervisor.statusSummary(), AppLocalization.string("No background jobs are running.", table: .voice))
         let cancelled = await supervisor.cancelAll()
-        XCTAssertEqual(cancelled, AppLocalization.string("There are no background jobs to cancel."))
+        XCTAssertEqual(cancelled, AppLocalization.string("There are no background jobs to cancel.", table: .voice))
         XCTAssertEqual(supervisor.jobs.first?.status, .starting)
         supervisor.detachLiveThread()
     }

@@ -589,7 +589,7 @@ extension NotificationDashboardOwnershipTests {
         XCTAssertFalse(quieted)
         XCTAssertEqual(appState.activeDashboardID, dashboardA)
         XCTAssertEqual(appState.pinSyncNotice?.message,
-                       AppLocalization.string("Pulse goes quiet in the other workspace when the call ends."))
+                       AppLocalization.string("Pulse goes quiet in the other workspace when the call ends.", table: .pulse))
         XCTAssertNil(appState.errorMessage, "nothing stale for the composer to show later")
         XCTAssertTrue(appState.isVoiceCallInProgress)
         XCTAssertEqual(notifications.pendingPulseQuiet, target)
@@ -727,5 +727,45 @@ extension NotificationDashboardOwnershipTests {
         XCTAssertFalse(AppState.notificationOpenNeedsAuthoritativeRead(
             target: target("hidden-work", call: nil), catalog: catalog, isWorkstream: true),
             "a workstream is hidden from the list, so reading it can't find its row")
+    }
+}
+
+/// A profile or dashboard picked by hand during a call asks first, since the
+/// switch ends the call; with no call it goes at once (issue 2390).
+extension NotificationDashboardOwnershipTests {
+    func testAHandPickedSwitchAsksFirstOnlyDuringACall() {
+        let savedA = SavedDashboard(id: dashboardA, label: "VPS", normalizedURL: "https://vps.tailnet.ts.net")
+        let appState = makeAppState(registry: SavedDashboardRegistry(activeDashboardID: dashboardA, dashboards: [savedA]))
+        var pending: CallEndingSwitch?
+        var switches = 0
+
+        appState.switchEndingCall(to: "Mac", pending: &pending) { switches += 1 }
+        XCTAssertEqual(switches, 1, "no call: the switch goes at once")
+        XCTAssertNil(pending)
+
+        appState.showVoiceSheet = true
+        appState.switchEndingCall(to: "Mac", pending: &pending) { switches += 1 }
+        XCTAssertEqual(switches, 1, "a call: nothing switches until the user answers")
+        XCTAssertEqual(pending?.destination, "Mac")
+        pending?.perform()
+        XCTAssertEqual(switches, 2)
+
+        // A minimised call counts too, as every surface does.
+        appState.showVoiceSheet = false
+        pending = nil
+        appState.minimisedLiveVoice = .geminiLive
+        appState.switchEndingCall(to: "Mac", pending: &pending) { switches += 1 }
+        XCTAssertEqual(switches, 2)
+        XCTAssertNotNil(pending)
+
+        // The call asked about ends while the question is open: it closes
+        // with nothing switched, so a call that starts next isn't ended by
+        // the old answer (issue 2460).
+        appState.closeCallEndingSwitchOnceCallsEnd(&pending)
+        XCTAssertNotNil(pending, "the call still runs: the question stays")
+        appState.minimisedLiveVoice = nil
+        appState.closeCallEndingSwitchOnceCallsEnd(&pending)
+        XCTAssertNil(pending)
+        XCTAssertEqual(switches, 2)
     }
 }

@@ -162,7 +162,7 @@ extension GroupChatModelsTests {
 
         // Without words of its own, a 502 is still the dashboard not reaching
         // Hermes, as everywhere else.
-        for detail in ["Bad Gateway", "", AppLocalization.string("Dashboard request failed (\(String(502))).")] {
+        for detail in ["Bad Gateway", "", AppLocalization.string("Dashboard request failed (\(String(502))).", table: .connection)] {
             let error = DashboardTicketBridgeError.http(status: 502, detail: detail)
             XCTAssertEqual(RoomLinksClient.message(for: error), UserFacingError.message(for: error))
             XCTAssertNil(DashboardTicketBridgeError.meaningfulDetail(detail, status: 502))
@@ -187,16 +187,98 @@ extension GroupChatModelsTests {
 
     func testALinksStatusSaysWhatToDo() {
         let mona = RoomLink(id: "lk1", name: "Mona", status: "linked", words: Self.peopleWords, createdAt: nil)
-        XCTAssertEqual(PeopleSettingsText.status(of: mona), AppLocalization.string("Linked"))
+        XCTAssertEqual(PeopleSettingsText.status(of: mona), AppLocalization.string("Linked", table: .rooms))
         let waiting = RoomLink(id: "lk2", name: "Laifu", status: "waiting", words: Self.peopleWords, createdAt: nil)
-        XCTAssertEqual(PeopleSettingsText.status(of: waiting), AppLocalization.string("Waiting for \("Laifu")'s Hermes to confirm"))
+        XCTAssertEqual(PeopleSettingsText.status(of: waiting), AppLocalization.string("Waiting for \("Laifu")'s Hermes to confirm", table: .rooms))
         let unanswered = RoomLink(id: "lk3", name: "Kazuha", status: "unanswered", words: Self.peopleWords, createdAt: nil)
         XCTAssertEqual(PeopleSettingsText.status(of: unanswered),
-                       AppLocalization.string("\("Kazuha")'s Hermes never confirmed. Ask them for a new invite."))
+                       AppLocalization.string("\("Kazuha")'s Hermes never confirmed. Ask them for a new invite.", table: .rooms))
         // A status this build doesn't know shows none.
         let paused = RoomLink(id: "lk4", name: "Venti", status: "paused", words: Self.peopleWords, createdAt: nil)
         XCTAssertNil(PeopleSettingsText.status(of: paused))
         XCTAssertEqual(PeopleSettingsText.words(Self.peopleWords), "amber · birch · cedar · delta")
+
+        // Plugins that differ say whose to update; matching ones, older plugins and waiting Links say nothing.
+        let parsed = RoomLinksClient.link(["id": "lk1", "name": "Mona", "status": "linked", "words": Self.peopleWords,
+                                           "plugin": "0.167.4", "behind": "theirs"])
+        XCTAssertEqual(parsed?.plugin, "0.167.4")
+        XCTAssertEqual(parsed.flatMap(PeopleSettingsText.update(for:)), AppLocalization.string(
+            "\("Mona")'s Conduit plugin is older than yours, so some of what your rooms share won't reach them. Ask them to update it.",
+            table: .rooms))
+        var newer = mona
+        newer.behind = "yours"
+        XCTAssertEqual(PeopleSettingsText.update(for: newer), AppLocalization.string(
+            "\("Mona")'s Conduit plugin is newer than yours, so some of what they share isn't reaching you. Update your Conduit plugin.",
+            table: .rooms))
+        XCTAssertNil(PeopleSettingsText.update(for: mona))
+        var waitingBehind = waiting
+        waitingBehind.behind = "theirs"
+        XCTAssertNil(PeopleSettingsText.update(for: waitingBehind))
+        XCTAssertNil(RoomLinksClient.link(["id": "lk1", "name": "Mona", "status": "linked", "words": Self.peopleWords])?.behind)
+    }
+
+    @MainActor
+    func testAnOwnLinkReadsBothSidesAndMarksOneLink() async throws {
+        // Multi-instance plan, Rooms 1: only a Link both sides marked lifts the room rules.
+        // No setting shows it (Eric 2026-11-13): Conduit marks Links between Hermes it holds.
+        let parsed = RoomLinksClient.link(["id": "lk1", "name": "Work", "status": "linked", "words": Self.peopleWords,
+                                           "own": true, "their_own": false, "own_link": false])
+        XCTAssertEqual(parsed.map { [$0.own, $0.theirOwn, $0.ownLink] }, [true, false, false])
+        // A plugin before 0.169 says nothing: neither side marked it.
+        let older = RoomLinksClient.link(["id": "lk2", "name": "Mona", "status": "linked", "words": Self.peopleWords])
+        XCTAssertEqual(older.map { [$0.own, $0.theirOwn, $0.ownLink] }, [false, false, false])
+
+        var asked: [(path: String, method: String, body: [String: Any]?, timeout: Int?)] = []
+        let client = RoomLinksClient { path, method, body, timeout in
+            asked.append((path, method, body, timeout))
+            return ["ok": true, "link": ["id": "lk1", "name": "Work", "status": "linked", "words": Self.peopleWords,
+                                         "own": true, "their_own": true, "own_link": true]]
+        }
+        let marked = try await client.setOwn("lk1", own: true)
+        XCTAssertTrue(marked.ownLink)
+        XCTAssertEqual(asked.map(\.path), ["/api/plugins/conduit_push/rooms/links/own"])
+        XCTAssertEqual(asked.first?.method, "PUT")
+        XCTAssertEqual(asked.first?.body?["link_id"] as? String, "lk1")
+        XCTAssertEqual(asked.first?.body?["own"] as? Bool, true)
+        // It tells the other side through the rooms mailbox.
+        XCTAssertEqual(asked.first?.timeout, 55_000)
+        let refusing = RoomLinksClient { _, _, _, _ in ["ok": true] }
+        do {
+            _ = try await refusing.setOwn("lk1", own: false)
+            XCTFail("an answer without the Link isn't one")
+        } catch {}
+    }
+
+    @MainActor
+    func testYourOtherHermesBotsAreReadByLink() async throws {
+        let answer: [String: Any] = ["ok": true, "links": [
+            "own2": ["name": "Lab", "brings": true, "bots": [
+                ["profile": "yelan", "handle": "yelan", "display_name": "Yelan", "ready": true],
+                ["profile": "codex", "handle": "codex", "display_name": "Codex", "ready": false],
+                ["profile": "", "handle": "x", "display_name": "X", "ready": true],
+            ]],
+            "own1": ["name": "Work", "brings": true, "bots": [
+                ["profile": "default", "handle": "hermes", "display_name": "Default", "ready": true],
+            ]],
+            // A Hermes on an older plugin lists its bots but can't be brought.
+            "own3": ["name": "Old", "brings": false, "bots": [
+                ["profile": "default", "handle": "hermes", "display_name": "Default", "ready": true],
+            ]],
+        ]]
+        var asked: [(path: String, method: String)] = []
+        let client = RoomLinksClient { path, method, _, _ in
+            asked.append((path, method))
+            return answer
+        }
+        let bots = try await client.ownBots()
+        XCTAssertEqual(asked.map(\.path), ["/api/plugins/conduit_push/rooms/own-bots"])
+        XCTAssertEqual(asked.first?.method, "GET")
+        XCTAssertEqual(bots.map(\.id), ["own1/default", "own2/yelan", "own2/codex"])
+        XCTAssertEqual(bots.map(\.linkName), ["Work", "Lab", "Lab"])
+        XCTAssertEqual(bots.map(\.ready), [true, true, false])
+        XCTAssertEqual(bots.first?.handle, "hermes")
+        XCTAssertThrowsError(try RoomLinksClient.parseOwnBots(["ok": true]))
+        XCTAssertThrowsError(try RoomLinksClient.parseOwnBots(["ok": false, "links": [String: Any]()]))
     }
 
     // MARK: - Host setup
@@ -265,12 +347,62 @@ extension GroupChatModelsTests {
         XCTAssertEqual(state.customChoices.map(\.id), ["skills", "terminal", "vision"])
         XCTAssertEqual(state.customChoices.first?.never, ["skill_manage"])
         XCTAssertEqual(PeopleSettingsText.never(state.customChoices[0]),
-                       AppLocalization.string("Never in rooms: \("skill_manage")"))
+                       AppLocalization.string("Never in rooms: \("skill_manage")", table: .rooms))
         XCTAssertNil(PeopleSettingsText.never(state.customChoices[1]))
         // The folded group still says which of its tools are on.
         XCTAssertNil(PeopleSettingsText.customOn(state, picked: ["web"]))
         XCTAssertEqual(PeopleSettingsText.customOn(state, picked: ["web", "terminal"]),
-                       AppLocalization.string("On: \("Terminal")"))
+                       AppLocalization.string("On: \("Terminal")", table: .rooms))
+    }
+
+    func testChangingRoomToolsNamesTheRoomsThatHoldTheAgent() throws {
+        func member(_ profile: String?, peer: Bool) -> GroupMember {
+            GroupMember(memberID: "m-\(profile ?? "peer")", profile: profile, handle: profile ?? "laifu",
+                        displayName: nil, target: ["kind": .string(peer ? "peer" : "local")], extra: [:])
+        }
+        func room(_ name: String, _ members: [GroupMember], disbanded: Bool = false) -> GroupRoom {
+            GroupRoom(roomID: name, name: name, members: members, authorityGatewayID: "gw", authorityEpoch: 1, revision: 1,
+                      createdAt: 0, updatedAt: 0, disbandedAt: disbanded ? 1 : nil, latestSeq: 0)
+        }
+        let rooms = [
+            room("Zoo trip", [member("research", peer: false), member(nil, peer: true)]),
+            // Only your own agents: it pins nothing.
+            room("Just us", [member("research", peer: false), member("default", peer: false)]),
+            room("Old", [member("research", peer: false), member(nil, peer: true)], disbanded: true),
+            room("Theirs", [member("default", peer: false), member(nil, peer: true)]),
+        ]
+        var going = copiesCopy(room: "conduit-1")
+        going["name"] = "Book club"
+        let copies = [try XCTUnwrap(RoomCopiesClient.copy(going)),
+                      try XCTUnwrap(RoomCopiesClient.copy(copiesCopy(room: "conduit-2", status: "ended")))]
+        XCTAssertEqual(RoomSetupRooms.holding(profile: "research", rooms: rooms, copies: copies), ["Book club", "Zoo trip"])
+        XCTAssertEqual(RoomSetupRooms.holding(profile: "writer", rooms: rooms, copies: copies), [])
+        XCTAssertNil(RoomSetupRooms.holding(profile: "research", rooms: nil, copies: copies), "not read yet")
+        var takenOut = copies[0]
+        takenOut.out = ["m-kuro": .removed]
+        XCTAssertEqual(RoomSetupRooms.holding(profile: "research", rooms: rooms, copies: [takenOut]), ["Zoo trip"],
+                       "taken out of a copy that goes on, it doesn't answer there already")
+        XCTAssertEqual(RoomSetupRooms.message(profileName: "Kuro", rooms: ["Book club"]),
+                       AppLocalization.string("\("Kuro") then stops answering in \("Book club"), which holds it to the tools it had when it started. New rooms use these.", table: .rooms))
+        let both = ["Book club", "Zoo trip"].formatted(.list(type: .and).locale(AppLocalization.formattingLocale))
+        XCTAssertEqual(RoomSetupRooms.message(profileName: "Kuro", rooms: ["Book club", "Zoo trip"]),
+                       AppLocalization.string("\("Kuro") then stops answering in \(both), which hold it to the tools it had when they started. New rooms use these.", table: .rooms))
+        XCTAssertEqual(RoomSetupRooms.message(profileName: "Kuro", rooms: nil),
+                       AppLocalization.string("\("Kuro") then stops answering in rooms already started with other people's agents, which hold it to the tools it had when they started. New rooms use these.", table: .rooms))
+    }
+
+    @MainActor
+    func testOnlyACompleteRoomListSaysNoRoomHoldsTheAgent() {
+        let suite = "GroupChatModelsTests.People.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suite) else { return XCTFail("No test defaults") }
+        addTeardownBlock { defaults.removePersistentDomain(forName: suite) }
+        let appState = AppState(defaults: defaults, loadSavedConnection: false)
+        XCTAssertNil(appState.roomsHoldingTools(of: "research"), "not read yet")
+        appState.groupRoomsListed = true
+        appState.groupRoomsComplete = false
+        XCTAssertNil(appState.roomsHoldingTools(of: "research"), "more pages: a room on one of them may hold it")
+        appState.groupRoomsComplete = true
+        XCTAssertEqual(appState.roomsHoldingTools(of: "research"), [])
     }
 
     @MainActor
@@ -395,7 +527,7 @@ extension GroupChatModelsTests {
         // Ready names only the one whose tools can run.
         let list = ["github"].formatted(.list(type: .and).locale(AppLocalization.formattingLocale))
         XCTAssertEqual(PeopleSettingsText.mcpServers(state, profileName: "Furina"),
-                       AppLocalization.string("MCP servers too: \(list), in rooms whose Custom choice names their tools."))
+                       AppLocalization.string("MCP servers too: \(list), in rooms whose Custom choice names their tools.", table: .rooms))
     }
 
     func testChangingTheMCPServersOfASavedCeilingAsksFirst() throws {
@@ -435,7 +567,7 @@ extension GroupChatModelsTests {
         let two = try RoomSetupClient.parseState(peopleSetupAnswerWithServers(saved: ["github", "notes"]))
         let list = ["github", "notes"].formatted(.list(type: .and).locale(AppLocalization.formattingLocale))
         XCTAssertEqual(PeopleSettingsText.mcpServers(two, profileName: "Furina"),
-                       AppLocalization.string("MCP servers too: \(list), in rooms whose Custom choice names their tools."))
+                       AppLocalization.string("MCP servers too: \(list), in rooms whose Custom choice names their tools.", table: .rooms))
     }
 
     @MainActor
@@ -467,11 +599,11 @@ extension GroupChatModelsTests {
     func testSetUpSaysWhatItChanges() throws {
         let state = try RoomSetupClient.parseState(peopleSetupAnswer())
         XCTAssertEqual(PeopleSettingsText.setupLines(state, profileName: "Furina"), [
-            AppLocalization.string("Turn on Hermes' API server at \("127.0.0.1:8642"), with a new key that stays on your Hermes"),
-            AppLocalization.string("Give \("Furina") its own key for the API server, which serves a profile's agent only with that profile's key"),
-            AppLocalization.string("Save the tools rooms may let \("Furina") use"),
-            AppLocalization.string("Keep tools that plugins and Hermes updates add out of rooms until you add them here"),
-            AppLocalization.string("Restart the gateway, which starts the API server"),
+            AppLocalization.string("Turn on Hermes' API server at \("127.0.0.1:8642"), with a new key that stays on your Hermes", table: .rooms),
+            AppLocalization.string("Give \("Furina") its own key for the API server, which serves a profile's agent only with that profile's key", table: .rooms),
+            AppLocalization.string("Save the tools rooms may let \("Furina") use", table: .rooms),
+            AppLocalization.string("Keep tools that plugins and Hermes updates add out of rooms until you add them here", table: .rooms),
+            AppLocalization.string("Restart the gateway, which starts the API server", table: .rooms),
         ])
 
         // A key it has, a port that moved, approvals that were off, and an
@@ -481,16 +613,16 @@ extension GroupChatModelsTests {
         answer["needs"] = ["api_server", "approvals"]
         let other = try RoomSetupClient.parseState(answer)
         XCTAssertEqual(PeopleSettingsText.setupLines(other, profileName: "Furina"), [
-            AppLocalization.string("Turn on Hermes' API server at \("127.0.0.1:8642"), with the key it has"),
-            AppLocalization.string("Turn \("Furina")'s approvals back on, since rooms refuse an agent that runs tools without asking"),
+            AppLocalization.string("Turn on Hermes' API server at \("127.0.0.1:8642"), with the key it has", table: .rooms),
+            AppLocalization.string("Turn \("Furina")'s approvals back on, since rooms refuse an agent that runs tools without asking", table: .rooms),
         ])
 
         XCTAssertEqual(PeopleSettingsText.tools(state, profileName: "Furina"), AppLocalization.string(
-            "Rooms may let \("Furina") use \(["Vision", "Web search"].formatted(.list(type: .and).locale(AppLocalization.formattingLocale)))."
+            "Rooms may let \("Furina") use \(["Vision", "Web search"].formatted(.list(type: .and).locale(AppLocalization.formattingLocale))).", table: .rooms
         ))
         answer["ceiling"] = [String]()
         XCTAssertEqual(PeopleSettingsText.tools(try RoomSetupClient.parseState(answer), profileName: "Furina"),
-                       AppLocalization.string("Rooms can't let \("Furina") use tools: it only talks there."))
+                       AppLocalization.string("Rooms can't let \("Furina") use tools: it only talks there.", table: .rooms))
     }
 
     // MARK: - Invites (C2b)
@@ -646,15 +778,15 @@ extension GroupChatModelsTests {
 
         // What the sheet says in place of Link.
         XCTAssertEqual(RoomLinkSheetText.stop(.own, name: "Eric", existing: nil),
-                       AppLocalization.string("This invite is from your own Hermes. Send it to the person you're linking with."))
+                       AppLocalization.string("This invite is from your own Hermes. Send it to the person you're linking with.", table: .rooms))
         XCTAssertEqual(RoomLinkSheetText.stop(.expired, name: "Eric", existing: nil),
-                       AppLocalization.string("This invite has run out. Ask \("Eric") for a new one."))
+                       AppLocalization.string("This invite has run out. Ask \("Eric") for a new one.", table: .rooms))
         // The Link's own name, as this Hermes keeps it, where the list has it.
         let existing = RoomLink(id: "lk1", name: "Eric M.", status: "linked", words: Self.peopleWords, createdAt: nil)
         XCTAssertEqual(RoomLinkSheetText.stop(.linked("lk1"), name: "Eric", existing: existing),
-                       AppLocalization.string("Your Hermes is already linked with \("Eric M.")."))
+                       AppLocalization.string("Your Hermes is already linked with \("Eric M.").", table: .rooms))
         XCTAssertEqual(RoomLinkSheetText.stop(.linked("lk1"), name: "Eric", existing: nil),
-                       AppLocalization.string("Your Hermes is already linked with \("Eric")."))
+                       AppLocalization.string("Your Hermes is already linked with \("Eric").", table: .rooms))
     }
 
     @MainActor
@@ -770,6 +902,58 @@ extension GroupChatModelsTests {
     }
 
     @MainActor
+    func testBlockListsThePeopleInTheRoomYoureLinkedWith() throws {
+        // A copy: its host. A room hosted here: each person it invited, once, by name.
+        let copy = try XCTUnwrap(RoomCopiesClient.copy(copiesCopy(room: "conduit-1", link: "lk-mona", from: "Mona")))
+        XCTAssertEqual(RoomBlock.targets(copy: copy, draft: nil), [RoomBlockTarget(id: "lk-mona", name: "Mona")])
+        let draft = RoomDraft(
+            id: "conduit-2", name: "Zoo trip", status: "started", reason: nil, createdAt: nil, expiresAt: nil,
+            agents: ["Furina"],
+            people: [RoomDraft.Person(id: "lk-zed", name: "Zed", status: "joined", agents: ["Scout"]),
+                     RoomDraft.Person(id: "lk-ann", name: "Ann", status: "declined", agents: [])]
+        )
+        XCTAssertEqual(RoomBlock.targets(copy: nil, draft: draft).map(\.name), ["Ann", "Zed"])
+        XCTAssertEqual(RoomBlock.targets(copy: nil, draft: nil), [])
+        // Each carries the open room's own dashboard, so block(_:) refuses it
+        // once that isn't the active one.
+        let room = GroupRoom(roomID: "conduit-1", name: "Zoo trip", members: [], authorityGatewayID: "gw-a",
+                             authorityEpoch: 1, revision: 1, createdAt: 0, updatedAt: 0, disbandedAt: nil, latestSeq: 0)
+        let dashboard = UUID()
+        let copySurface = AppState.GroupRoomSurface(dashboardID: dashboard, room: room, copy: copy)
+        XCTAssertEqual(RoomBlock.targets(for: copySurface, draft: draft).map(\.dashboardID), [dashboard], "a copy lists its host, not a draft's people")
+        let hostedSurface = AppState.GroupRoomSurface(dashboardID: dashboard, room: room)
+        XCTAssertEqual(RoomBlock.targets(for: hostedSurface, draft: draft).map(\.dashboardID), [dashboard, dashboard])
+        // A Link with no name reads as "this person", never a stand-in in a name's place.
+        let unnamed = try XCTUnwrap(RoomCopiesClient.copy(copiesCopy(room: "conduit-3", link: "lk-anon", from: "")))
+        XCTAssertEqual(RoomBlock.targets(copy: unnamed, draft: nil).map(\.name), [""])
+        XCTAssertEqual(RoomBlock.title(""), AppLocalization.string("Block this person?", table: .rooms))
+        XCTAssertEqual(RoomBlock.button(""), AppLocalization.string("Block this person", table: .rooms))
+        XCTAssertEqual(RoomBlock.message(""), AppLocalization.string("This unlinks their Hermes from yours, on both sides: nothing more from them reaches your Hermes, and the rooms you share with them stop. Linking again takes a new invite.", table: .rooms))
+        XCTAssertEqual(RoomBlock.refusalTitle(""), AppLocalization.string("Could not block this person", table: .rooms))
+        XCTAssertEqual(RoomBlock.button("Mona"), AppLocalization.string("Block \("Mona")", table: .rooms))
+        let quiet = RoomDraft(
+            id: "conduit-4", name: "Picnic", status: "started", reason: nil, createdAt: nil, expiresAt: nil,
+            agents: ["Furina"], people: [RoomDraft.Person(id: "lk-q", name: " ", status: "joined", agents: [])]
+        )
+        XCTAssertEqual(RoomBlock.targets(copy: nil, draft: quiet).map(\.name), [""])
+        XCTAssertEqual(RoomBlock.title("Mona"), AppLocalization.string("Block \("Mona")?", table: .rooms))
+    }
+
+    @MainActor
+    func testABlockListedOnAnotherDashboardIsRefused() async {
+        let suite = "GroupChatModelsTests.People.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suite) else { return XCTFail("No test defaults") }
+        addTeardownBlock { defaults.removePersistentDomain(forName: suite) }
+        let appState = AppState(defaults: defaults, loadSavedConnection: false)
+        let target = RoomBlockTarget(id: "lk-mona", name: "Mona", dashboardID: UUID())
+        do {
+            _ = try await appState.block(target)
+            XCTFail("a Block from another dashboard went through")
+        } catch {
+            XCTAssertTrue(error is CancellationError, "\(error)")
+        }
+    }
+
     func testWhatTheyCanAskSaysWhoAnswersAndThatQuestionsWaitForYou() {
         let asking = LinkAskRules(freeOn: "ask", questions: "ask", profile: "default")
         let caption = LinkAskText.caption(asking, name: "Laifu", profileName: "Furina")

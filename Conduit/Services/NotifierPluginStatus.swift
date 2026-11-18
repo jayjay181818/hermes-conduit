@@ -47,6 +47,15 @@ struct NotifierPluginStatus: Equatable {
         var restartNeeded: Bool
         /// New with every dashboard process.
         var bootID: String?
+        /// The host keeps a disbanded room's hidden sessions
+        /// (cleanup_disbanded_rooms: off, notifier #443), so Disband's
+        /// warning doesn't say they're deleted.
+        var roomChatsKept = false
+        /// What the plugin can't do on this Hermes right now (plugin
+        /// 0.177.16+, its `degraded` codes; notifier issue 834), which only
+        /// the host's log said before. Settings > Conduit plugin shows a
+        /// line for each (`degradedText`).
+        var degraded: [String] = []
     }
 
     /// The plugin version this Conduit build was made against: the least it
@@ -330,8 +339,17 @@ struct NotifierPluginStatus: Equatable {
         return Runtime(
             loadedVersion: response["loaded_version"] as? String,
             restartNeeded: response["restart_needed"] as? Bool ?? false,
-            bootID: response["boot_id"] as? String
+            bootID: response["boot_id"] as? String,
+            roomChatsKept: response["room_chats_kept"] as? Bool == true,
+            degraded: degraded(from: response)
         )
+    }
+
+    /// The plugin's `degraded` codes in its order, each once: they are
+    /// the rows' identities in Settings.
+    private static func degraded(from response: [String: Any]) -> [String] {
+        var seen = Set<String>()
+        return (response["degraded"] as? [Any] ?? []).compactMap { $0 as? String }.filter { seen.insert($0).inserted }
     }
 
     /// Who manages the plugin on each saved dashboard's host, as it last
@@ -351,6 +369,33 @@ struct NotifierPluginStatus: Equatable {
             guard all[dashboardID.uuidString] != managedBy else { return }
             all[dashboardID.uuidString] = managedBy
             defaults.set(all, forKey: key)
+        }
+
+        static let capabilitiesKey = "notifierPluginCapabilities"
+
+        /// What the dashboard's plugin last reported serving, so Settings
+        /// lists its pages from the start of a switch instead of adding
+        /// them, and moving the rows below, once the plugin answers.
+        static func capabilities(for dashboardID: UUID?, in defaults: UserDefaults) -> Set<String> {
+            guard let dashboardID,
+                  let all = defaults.dictionary(forKey: capabilitiesKey) as? [String: [String]] else { return [] }
+            return Set(all[dashboardID.uuidString] ?? [])
+        }
+
+        /// Kept from each answer that says what the plugin serves; one
+        /// without the route forgets it.
+        static func remember(_ state: State, for dashboardID: UUID?, in defaults: UserDefaults) {
+            guard let dashboardID else { return }
+            var all = defaults.dictionary(forKey: capabilitiesKey) as? [String: [String]] ?? [:]
+            let kept: [String]?
+            switch state {
+            case .unknown: return
+            case .predatesCapabilities: kept = nil
+            case .reported(_, let capabilities): kept = capabilities.sorted()
+            }
+            guard all[dashboardID.uuidString] != kept else { return }
+            all[dashboardID.uuidString] = kept
+            defaults.set(all, forKey: capabilitiesKey)
         }
     }
 
@@ -436,11 +481,24 @@ extension NotifierPluginStatus {
 
 extension NotifierPluginStatus {
     /// What Settings and Finish setting up say for a managed plugin.
+    /// One line for a state the plugin lists under `degraded`. A code a
+    /// newer plugin added is still shown, by its code.
+    static func degradedText(_ code: String) -> String {
+        switch code {
+        case "workstream-recovery":
+            return AppLocalization.string("A workstream that a Hermes restart stops stays interrupted instead of picking up again, because the plugin couldn't find how this Hermes stops its turns.", table: .notifications)
+        case "workspace-files":
+            return AppLocalization.string("The Folder is closed: Hermes couldn't say which folder it keeps files in. Check the files settings on the host.", table: .notifications)
+        default:
+            return AppLocalization.string("The plugin reports a limit on this host that this version of Conduit doesn't know (\(code)).", table: .notifications)
+        }
+    }
+
     static func managedText(_ managedBy: String?) -> String {
         guard let managedBy, !managedBy.isEmpty else {
-            return AppLocalization.string("This dashboard's host keeps the plugin up to date.")
+            return AppLocalization.string("This dashboard's host keeps the plugin up to date.", table: .notifications)
         }
-        return AppLocalization.string("\(managedBy) keeps the plugin up to date.")
+        return AppLocalization.string("\(managedBy) keeps the plugin up to date.", table: .notifications)
     }
 }
 
@@ -478,7 +536,7 @@ enum PluginUpdateAsk {
 
     /// What a host managed by `managedBy` says in place of the ask.
     static func managedAsk(by managedBy: String) -> String {
-        AppLocalization.string("The Conduit plugin on this host doesn't have this yet.")
+        AppLocalization.string("The Conduit plugin on this host doesn't have this yet.", table: .notifications)
             + " " + NotifierPluginStatus.managedText(managedBy)
     }
 

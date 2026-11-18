@@ -5,7 +5,9 @@ import UserNotifications
 /// launch and when the app's language changes, so their buttons read in it.
 enum NotificationCategories {
     static func register(center: UNUserNotificationCenter = .current()) {
-        center.setNotificationCategories([HermesCallNotifications.category(), PulseNotifications.category()])
+        center.setNotificationCategories([
+            HermesCallNotifications.category(), HermesCallNotifications.missedCategory(), PulseNotifications.category()
+        ])
     }
 }
 
@@ -24,8 +26,8 @@ extension PulseNotifications {
     /// notification saying so, whose tap tries again with Conduit open.
     static func retryRequest(target: PulseQuietTarget?) -> UNNotificationRequest {
         let content = UNMutableNotificationContent()
-        content.title = AppLocalization.string("Pulse isn't quiet yet")
-        content.body = AppLocalization.string("Tap to try again in Conduit.")
+        content.title = AppLocalization.string("Pulse isn't quiet yet", table: .notifications)
+        content.body = AppLocalization.string("Tap to try again in Conduit.", table: .notifications)
         content.threadIdentifier = "pulse"
         var userInfo: [String: String] = [:]
         if let dashboard = target?.dashboardID { userInfo[retryDashboardKey] = dashboard }

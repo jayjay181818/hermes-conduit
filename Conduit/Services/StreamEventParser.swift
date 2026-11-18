@@ -99,7 +99,7 @@ enum StreamEventParser {
             return .sessionsChanged
 
         case "error":
-            return .messageError(sessionId: sessionId, message: payload?["message"]?.stringValue ?? AppLocalization.string("Hermes reported an error."))
+            return .messageError(sessionId: sessionId, message: payload?["message"]?.stringValue ?? AppLocalization.string("Hermes reported an error.", table: .chat))
 
         case "message.interrupted", "session.interrupted":
             return .messageInterrupted(sessionId: sessionId)
@@ -137,10 +137,15 @@ enum StreamEventParser {
             )
 
         case "tool.start", "tool_call":
-            let name = Self.liveToolName(payload)
             let toolID = ["tool_id", "tool_call_id", "call_id"]
                 .compactMap { payload?[$0]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines) }
                 .first { !$0.isEmpty }
+            // A wrapper resolved here shows the tool's own arguments, as saved
+            // history does, not the envelope (whose `name` read as the subject).
+            if let call = Self.wrappedCall(payload) {
+                return .toolStart(sessionId: sessionId, toolName: call.name, toolInput: call.arguments, toolID: toolID)
+            }
+            let name = payload?["name"]?.stringValue ?? ""
             let input = payload?["args_text"]?.descriptiveStringValue
                 ?? payload?["context"]?.descriptiveStringValue
                 ?? payload?["input"]?.descriptiveStringValue
@@ -230,6 +235,10 @@ enum StreamEventParser {
             let percent = usage["context_percent"]?.doubleValue ?? (Double(used) / Double(max) * 100)
             return .contextUpdate(sessionId: sessionId, percent: percent, used: used, max: max)
 
+        case "session.control.update":
+            guard !sessionId.isEmpty, let snapshot = SessionControlSnapshot(obj["payload"]) else { return nil }
+            return .sessionControl(sessionId: sessionId, snapshot: snapshot)
+
         case "cwd.update", "workspace.update":
             let cwd = payload?["cwd"]?.stringValue ?? ""
             return .cwdUpdate(sessionId: sessionId, cwd: cwd)
@@ -265,12 +274,13 @@ enum StreamEventParser {
     /// Tool Search `tool_call` ran; a wrapper name is resolved from its
     /// envelope in case a gateway sends it unresolved.
     private static func liveToolName(_ payload: [String: AnyCodable]?) -> String {
-        let name = payload?["name"]?.stringValue ?? ""
-        guard ToolSearchBridge.isWrapper(name),
-              let call = ToolSearchBridge.underlyingCall((payload?["args"] ?? payload?["arguments"])?.anyValue) else {
-            return name
-        }
-        return call.name
+        wrappedCall(payload)?.name ?? payload?["name"]?.stringValue ?? ""
+    }
+
+    /// The tool a wrapper-named live event ran, from its envelope.
+    private static func wrappedCall(_ payload: [String: AnyCodable]?) -> ToolSearchBridge.Call? {
+        guard ToolSearchBridge.isWrapper(payload?["name"]?.stringValue) else { return nil }
+        return ToolSearchBridge.underlyingCall((payload?["args"] ?? payload?["arguments"])?.anyValue)
     }
 
     private static func delegateAgentActivity(from payload: [String: AnyCodable], eventType: String, sessionId: String) -> DelegateAgentActivity {
@@ -310,7 +320,7 @@ enum StreamEventParser {
         let text = payload["text"]?.stringValue ?? payload["message"]?.stringValue ?? payload["summary"]?.stringValue ?? ""
         let kind: DelegateAgentActivity.StreamLine.Kind = eventType.contains("tool") ? .tool : eventType.contains("thinking") ? .thinking : eventType.contains("progress") ? .progress : .summary
         let lines = text.isEmpty ? [] : [DelegateAgentActivity.StreamLine(kind: kind, text: text, isError: status == .failed)]
-        return DelegateAgentActivity(
+        var activity = DelegateAgentActivity(
             id: id,
             // Empty when the event names no goal: the card says "Delegate agent".
             goal: goal,
@@ -323,5 +333,13 @@ enum StreamEventParser {
             stream: lines,
             hasGatewayID: subagentID != nil
         )
+        // A running agent's first event is about when it started (the
+        // card keeps the first one, `merged`); an end says how long it ran
+        // when Hermes counts it (`duration_seconds`, issue 1553).
+        if status == .running { activity.startedAt = activity.updatedAt }
+        if !status.isActive, let seconds = payload["duration_seconds"]?.doubleValue, seconds.isFinite, seconds >= 0 {
+            activity.duration = seconds
+        }
+        return activity
     }
 }

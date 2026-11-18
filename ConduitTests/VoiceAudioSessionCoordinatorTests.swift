@@ -9,6 +9,7 @@
 //
 
 import AVFAudio
+import os
 import XCTest
 @testable import Conduit
 
@@ -101,6 +102,65 @@ final class VoiceAudioSessionCoordinatorTests: XCTestCase {
         XCTAssertEqual(session.categoryCalls.last?.mode, .spokenAudio)
         XCTAssertEqual(coordinator.appliedPolicy, .standalonePlayback)
         XCTAssertEqual(session.activationCount, 1)
+    }
+
+    func testCardMediaPausesOtherMediaAndHandsItBack() throws {
+        // A card's audio or video plays like a player: not mixable, so
+        // music pauses, and its end resumes it (issue 826).
+        let lease = try coordinator.acquire(.mediaPlayback)
+
+        XCTAssertEqual(session.categoryCalls.last?.category, .playback)
+        XCTAssertEqual(session.categoryCalls.last?.mode, .default)
+        XCTAssertEqual(session.categoryCalls.last?.options, [])
+        XCTAssertEqual(coordinator.appliedPolicy, .mediaPlayback)
+
+        coordinator.release(lease)
+        XCTAssertEqual(session.lastDeactivationOptions, .notifyOthersOnDeactivation)
+        XCTAssertNil(coordinator.appliedPolicy)
+    }
+
+    func testCardMediaPlaysWithinAConversationAndReadAloud() throws {
+        let conversation = try coordinator.acquire(.conversationCapture)
+        let readAloud = try coordinator.acquire(.standalonePlayback)
+        session.resetRecordings()
+
+        let card = try coordinator.acquire(.mediaPlayback)
+        XCTAssertEqual(session.categoryCalls.count, 0, "a card never reconfigures a session someone else holds")
+        coordinator.release(conversation)
+        XCTAssertEqual(coordinator.appliedPolicy, .standalonePlayback)
+        session.resetRecordings()
+
+        coordinator.release(readAloud)
+        XCTAssertEqual(coordinator.appliedPolicy, .mediaPlayback, "the card still playing keeps the session")
+        XCTAssertEqual(session.deactivationCount, 0)
+        coordinator.release(card)
+        XCTAssertEqual(session.deactivationCount, 1)
+    }
+
+    func testCardMediaInACallFromHermesLeavesCallKitsSession() throws {
+        coordinator.configureForIncomingCall()
+        coordinator.nativeCallAudioActivated()
+        session.resetRecordings()
+
+        let card = try coordinator.acquire(.mediaPlayback)
+        coordinator.release(card)
+
+        XCTAssertEqual(session.categoryCalls.count, 0)
+        XCTAssertEqual(session.activationCount, 0)
+        XCTAssertEqual(session.deactivationCount, 0)
+    }
+
+    func testCardMediaGivesWayToTheMicrophone() async throws {
+        var stopped = 0
+        let card = try coordinator.acquire(.mediaPlayback) { stopped += 1 }
+
+        let dictation = try coordinator.acquire(.conversationCapture)
+        await Task.yield()
+        await Task.yield()
+
+        XCTAssertEqual(stopped, 1)
+        coordinator.release(card)
+        coordinator.release(dictation)
     }
 
     func testStandalonePlaybackCannotDowngradeActiveConversation() throws {
@@ -373,6 +433,97 @@ final class VoiceAudioSessionCoordinatorTests: XCTestCase {
         XCTAssertEqual(session.categoryCalls.last?.category, .playback)
         XCTAssertEqual(session.deactivationCount, 1, "the failure must release the acquired lease")
         XCTAssertNil(coordinator.appliedPolicy)
+    }
+
+    // MARK: Interruptions (issue 826)
+
+    /// Systems before 27 post interruptionNotification; every observer
+    /// reads it as one shape, the system's advice to resume included.
+    func testLegacyInterruptionNotificationsReadAsOneShape() {
+        func legacy(_ userInfo: [AnyHashable: Any]) -> AudioSessionInterruption? {
+            AudioSessionInterruption.legacy(Notification(name: AVAudioSession.interruptionNotification, object: nil, userInfo: userInfo))
+        }
+        let began = AVAudioSession.InterruptionType.began.rawValue
+        let ended = AVAudioSession.InterruptionType.ended.rawValue
+        let resume = AVAudioSession.InterruptionOptions.shouldResume.rawValue
+        XCTAssertEqual(legacy([AVAudioSessionInterruptionTypeKey: began]), .began)
+        XCTAssertEqual(legacy([AVAudioSessionInterruptionTypeKey: ended, AVAudioSessionInterruptionOptionKey: resume]), .ended(shouldResume: true))
+        XCTAssertEqual(legacy([AVAudioSessionInterruptionTypeKey: ended]), .ended(shouldResume: false))
+        XCTAssertNil(legacy([:]))
+    }
+
+    /// The ringtone a pick previews in Settings > Calls from Hermes (issue
+    /// 2445) holds the audio session only while it plays: an interruption
+    /// beginning ends it, one ending alone doesn't.
+    func testARingtonePreviewGivesUpTheSessionWhenInterrupted() async throws {
+        let center = NotificationCenter()
+        let preview = HermesRingtonePreview(coordinator: coordinator, center: center, isPhoneCallInProgress: { false })
+        preview.play(.chime, voiceInUse: false)
+        guard preview.isPlaying else { throw XCTSkip("no audio output to play the tone on") }
+        XCTAssertEqual(coordinator.appliedPolicy, .standalonePlayback)
+
+        AudioSessionInterruption.ended(shouldResume: true).post(on: center)
+        for _ in 0..<5 { await Task.yield() }
+        XCTAssertTrue(preview.isPlaying, "an interruption ending is not one beginning")
+        XCTAssertEqual(coordinator.appliedPolicy, .standalonePlayback)
+
+        AudioSessionInterruption.began.post(on: center)
+        for _ in 0..<200 where preview.isPlaying { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertFalse(preview.isPlaying)
+        XCTAssertNil(coordinator.appliedPolicy, "the preview's lease is released")
+
+        preview.stop()
+        XCTAssertEqual(session.deactivationCount, 1, "stopping twice releases once")
+    }
+
+    /// Nothing plays, and the session isn't taken, over voice or over a
+    /// phone call of any app's.
+    func testARingtonePreviewStaysQuietOverACall() {
+        var onCall = true
+        let preview = HermesRingtonePreview(coordinator: coordinator, center: NotificationCenter(), isPhoneCallInProgress: { onCall })
+        preview.play(.chime, voiceInUse: false)
+        XCTAssertFalse(preview.isPlaying)
+        onCall = false
+        preview.play(.chime, voiceInUse: true)
+        XCTAssertFalse(preview.isPlaying)
+        preview.play(.system, voiceInUse: false)
+        XCTAssertFalse(preview.isPlaying, "iOS's own ringtone isn't Conduit's to play")
+        XCTAssertEqual(session.activationCount, 0)
+        XCTAssertNil(coordinator.appliedPolicy)
+    }
+
+    /// What the forwarder posts is what observers read back.
+    func testAnInterruptionReadsBackFromItsNotification() {
+        let center = NotificationCenter()
+        let read = OSAllocatedUnfairLock<[AudioSessionInterruption?]>(initialState: [])
+        let observer = center.addObserver(forName: .audioSessionInterruption, object: nil, queue: nil) { note in
+            read.withLock { $0.append(AudioSessionInterruption(note)) }
+        }
+        defer { center.removeObserver(observer) }
+        AudioSessionInterruption.began.post(on: center)
+        AudioSessionInterruption.ended(shouldResume: false).post(on: center)
+        XCTAssertEqual(read.withLock { $0 }, [.began, .ended(shouldResume: false)])
+        XCTAssertNil(AudioSessionInterruption(Notification(name: .audioSessionInterruption)))
+    }
+
+    /// iOS 27's notifications without their contexts say nothing, so the
+    /// forwarder posts nothing: not "ended, don't resume", which would
+    /// leave paused observers parked, and not "began" for an inactive
+    /// session it can't attribute to the system.
+    func testIOS27NotificationsWithoutTheirContextsForwardNothing() throws {
+        guard #available(iOS 27, *) else { throw XCTSkip("the iOS 27 notifications need iOS 27") }
+        let center = NotificationCenter.default
+        let read = OSAllocatedUnfairLock<[AudioSessionInterruption?]>(initialState: [])
+        let observer = center.addObserver(forName: .audioSessionInterruption, object: nil, queue: nil) { note in
+            read.withLock { $0.append(AudioSessionInterruption(note)) }
+        }
+        defer { center.removeObserver(observer) }
+        center.post(name: AVAudioSession.resumptionRecommendationNotification, object: nil)
+        center.post(name: AVAudioSession.didBecomeInactiveNotification, object: nil)
+        XCTAssertEqual(read.withLock { $0 }, [])
+        // The forwarder is listening: what it reposts arrives here.
+        AudioSessionInterruption.began.post()
+        XCTAssertEqual(read.withLock { $0 }, [.began])
     }
 }
 

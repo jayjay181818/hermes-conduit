@@ -18,17 +18,34 @@ name: Nightly
 #
 # Runs on main every night and on demand (Actions > Nightly > Run workflow).
 # A release is validated by dispatching it on the release ref before a
-# TestFlight upload. A failed scheduled run emails the repository owner.
+# TestFlight upload. A failed nightly run emails the repository owner.
+#
+# The nightly run starts at 3:17 AM ET from a systemd timer on the Hermes host
+# (scripts/nightly-timer/), which dispatches this workflow on main with
+# `nightly: true`. GitHub's own cron created its events 7 to 10 hours late
+# (2026-11-09..14: 15:07-18:50 UTC), so the run held the macOS runners through
+# Eric's mornings and his PRs' Smoke jobs queued behind it. The cron stays as
+# a backup, after the timer in both EDT and EST: it skips itself when Nightly already ran
+# on main in the last 20 hours, and warns when it has to run instead.
 #
 # A run schedules 8 macOS jobs (2 unit shards + 3 timing repeats + 3 UI
 # shards) against GitHub's 5-concurrent-macOS-jobs-per-account ceiling, so
 # some queue behind the others. That is accepted at night: nothing waits on
 # these results.
 
+run-name: "${{ inputs.nightly && 'Nightly (overnight)' || 'Nightly' }}"
+
 on:
   schedule:
-    - cron: "17 8 * * *"
+    # 09:47 UTC: after the timer's 3:17 AM ET in both EDT (07:17 UTC) and EST
+    # (08:17 UTC), so even an on-time cron finds the overnight run and skips.
+    - cron: "47 9 * * *"
   workflow_dispatch:
+    inputs:
+      nightly:
+        description: "The overnight nightly run (the Hermes host's timer sets this; leave it off for a release candidate, whose result must not be rerun)"
+        type: boolean
+        default: false
 
 concurrency:
   group: nightly-${{ github.ref }}
@@ -38,28 +55,62 @@ permissions:
   contents: read
 
 env:
-  SIMULATOR_NAME: "iPhone 17 Pro"
+  SIMULATOR_NAME: "iPhone 18 Pro"
   DERIVED_DATA_PATH: "${{ github.workspace }}/ci-derived-data"
-  # Build budget for scripts/ci-hosted-build.sh. Up to five macOS jobs run
-  # side by side here, so builds run slower than in PR CI: builds of 850-890 s
-  # were common, and UI shard 3 hit 900 s on 2026-10-11. PR CI uses 1200 s too
-  # since 2026-10-13.
-  BUILD_TIMEOUT_SECS: "1200"
+  # Build budget for scripts/ci-hosted-build.sh. Every build step below pins
+  # 1800 s (Xcode 27, 2026-11-13: up to five macOS jobs build side by side
+  # from a day-old cache); this default only covers a new step that forgets to.
+  BUILD_TIMEOUT_SECS: "1800"
 
 jobs:
   plan:
     name: Plan
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
     outputs:
+      skip: "${{ steps.backup.outputs.skip }}"
       unit-shards: "${{ steps.hosted.outputs.unit-shards }}"
       timing-csv: "${{ steps.hosted.outputs.timing-csv }}"
       ui-shards: "${{ steps.hosted.outputs.ui-shards }}"
     steps:
+      - name: Skip the backup cron when the overnight run happened
+        # The cron is the timer's backup (see the top of this file). A
+        # dispatched Nightly run on main in the last 20 hours, the timer's or a
+        # manual one, covers today; without one the backup runs and says why.
+        # Cron runs never count: yesterday's late backup that skipped itself
+        # would otherwise hide a timer that missed today.
+        id: backup
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          since=$(date -u -d '20 hours ago' +%Y-%m-%dT%H:%M:%SZ)
+          # A failed lookup runs the backup: missing a night is worse than
+          # running one twice.
+          if ! others=$(gh api "repos/$REPO/actions/workflows/nightly.yml/runs?branch=main&created=%3E%3D$since&per_page=20" \
+            --jq "[.workflow_runs[] | select(.id != $RUN_ID and .event != \"schedule\")] | length"); then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Couldn't list Nightly runs, so it's unknown whether the overnight timer ran; the backup cron runs."
+          elif [ "$others" -gt 0 ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::A dispatched Nightly ran on main since $since; the backup cron skips."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::No dispatched Nightly run on main since $since: the overnight timer on the Hermes host missed (scripts/nightly-timer/README.md). The backup cron runs instead."
+          fi
+
       - uses: actions/checkout@v7
+        if: steps.backup.outputs.skip != 'true'
 
       - name: Select the nightly classes
         id: hosted
+        if: steps.backup.outputs.skip != 'true'
         run: |
           set -euo pipefail
           mkdir -p ci-artifacts
@@ -83,8 +134,12 @@ jobs:
     # families, in balanced shards.
     name: Unit suite (shard ${{ matrix.shard }})
     needs: plan
-    runs-on: macos-26
-    timeout-minutes: 45
+    if: needs.plan.outputs.skip != 'true'
+    runs-on: xcode-27
+    # A shard that builds clean on Xcode 27 spends about 31 minutes before
+    # its first test (shard 2 on 2026-11-13 was cancelled at 45 minutes
+    # with its tests still passing), so it gets the UI shards' hour.
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -93,7 +148,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Select Xcode
-        run: sudo xcode-select -s /Applications/Xcode.app
+        run: sudo --preserve-env=GITHUB_ENV bash scripts/ci-select-xcode.sh
 
       - name: Pick the build cache
         # DerivedData from the newest main build of the same project and
@@ -142,6 +197,10 @@ jobs:
         # hides behind the build. Exports XCRUN_FILE, DESTINATION and
         # SIMULATOR_UDID for the steps below.
         env:
+          # Always 1800: the restored cache is the last Nightly's, so the day's
+          # main recompiles beside four other jobs; on Xcode 27 a cached unit
+          # build outran 1200 s (2026-11-13, #2337's Nightly).
+          BUILD_TIMEOUT_SECS: "1800"
           # Named in the build's timing notice, to explain a clean build.
           BUILD_CACHE: ${{ steps.cache.outputs.cache-matched-key || format('none saved under {0}', steps.cache-key.outputs.prefix) }}
         run: bash scripts/ci-hosted-build.sh
@@ -218,6 +277,16 @@ jobs:
               echo "::notice title=unit batch $batch_no took ${total}s::its output has no test totals"
             fi
           }
+          run_batch_once() {
+            xcodebuild test-without-building \
+              -xctestrun "$XCRUN_FILE" \
+              -destination "$DESTINATION" \
+              -parallel-testing-enabled NO \
+              -collect-test-diagnostics never \
+              -test-timeouts-enabled YES \
+              -default-test-execution-time-allowance "${UNIT_TEST_ALLOWANCE_S:-180}" \
+              "${batch_args[@]}" 2>&1 | tee ${1:+-a} "$batch_log"
+          }
           run_batch() {
             batch_no="$1"
             shift
@@ -231,14 +300,18 @@ jobs:
             batch_log="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/unit-batch-$batch_no.log"
             batch_start=$(date +%s)
             echo "::group::unit batch $batch_no ($# classes)"
-            if ! xcodebuild test-without-building \
-              -xctestrun "$XCRUN_FILE" \
-              -destination "$DESTINATION" \
-              -parallel-testing-enabled NO \
-              -collect-test-diagnostics never \
-              -test-timeouts-enabled YES \
-              -default-test-execution-time-allowance "${UNIT_TEST_ALLOWANCE_S:-180}" \
-              "${batch_args[@]}" 2>&1 | tee "$batch_log"; then
+            batch_ok=true
+            if ! run_batch_once; then
+              # A runtime lost before any test ran (2026-11-17) gets one more
+              # attempt after a reboot; any other failure stands.
+              if bash scripts/ci-recover-lost-runtime.sh "$batch_log"; then
+                echo "::warning title=unit batch $batch_no::its simulator runtime was lost before any test ran; running the batch once more"
+                run_batch_once append || batch_ok=false
+              else
+                batch_ok=false
+              fi
+            fi
+            if [ "$batch_ok" != true ]; then
               echo "::endgroup::"
               batch_timing_notice "$batch_start"
               echo "::error::unit batch $batch_no failed: $*"
@@ -287,7 +360,7 @@ jobs:
       - name: Save the build cache
         # Main's builds only, one job per project kind: shard 1 saves the
         # app-only (slim) build the nightly unit shards restore; ci.yml's
-        # smoke job saves the full app, which PRs restore, on every push.
+        # smoke job saves the full app, which PRs restore, on every push and PR run.
         # After the tests, so a test failure still saves a good build.
         if: >-
           always() && steps.build.outcome == 'success'
@@ -325,8 +398,12 @@ jobs:
     # a sane ceiling, and a cancelled job loses which pass failed.
     name: Timing families (repeat ${{ matrix.repeat }})
     needs: plan
-    runs-on: macos-26
-    timeout-minutes: 55
+    if: needs.plan.outputs.skip != 'true'
+    runs-on: xcode-27
+    # Setup (~5 min), an 1800 s build, then the tests (~6 min on 2026-11-13):
+    # the unit and UI shards' hour. A clean retry after a failed incremental
+    # build (rare) can run past it and reads as a cancelled repeat.
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -335,7 +412,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Select Xcode
-        run: sudo xcode-select -s /Applications/Xcode.app
+        run: sudo --preserve-env=GITHUB_ENV bash scripts/ci-select-xcode.sh
 
       - name: Pick the build cache
         # The timing families are ConduitTests classes, so they build the
@@ -377,6 +454,10 @@ jobs:
 
       - name: Build and boot the simulator in parallel
         env:
+          # Always 1800: a restored slim cache is often a day of main behind,
+          # and on Xcode 27 beside the other nightly jobs a cached build took
+          # 1213 s and another outran 1200 s (2026-11-13, #2331's Nightly).
+          BUILD_TIMEOUT_SECS: "1800"
           BUILD_CACHE: ${{ steps.cache.outputs.cache-matched-key || format('none saved under {0}', steps.cache-key.outputs.prefix) }}
         run: bash scripts/ci-hosted-build.sh
 
@@ -397,19 +478,30 @@ jobs:
           # Per-test allowance only, no wall-clock watchdog: a hang past the
           # allowance is killed by xcodebuild, and a wedged simulator ends at
           # the job timeout. Same accepted tradeoff as the unit shards.
-          xcodebuild test-without-building \
-            -xctestrun "$XCRUN_FILE" \
-            -destination "$DESTINATION" \
-            -parallel-testing-enabled NO \
-            -collect-test-diagnostics never \
-            -test-timeouts-enabled YES \
-            -default-test-execution-time-allowance 900 \
-            "${args[@]}"
+          timing_log="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/timing-families.log"
+          run_timing_once() {
+            xcodebuild test-without-building \
+              -xctestrun "$XCRUN_FILE" \
+              -destination "$DESTINATION" \
+              -parallel-testing-enabled NO \
+              -collect-test-diagnostics never \
+              -test-timeouts-enabled YES \
+              -default-test-execution-time-allowance 900 \
+              "${args[@]}" 2>&1 | tee ${1:+-a} "$timing_log"
+          }
+          if ! run_timing_once; then
+            # A runtime lost before any test ran (2026-11-17) gets one more
+            # attempt after a reboot, as the unit batches do.
+            bash scripts/ci-recover-lost-runtime.sh "$timing_log" || exit 1
+            echo "::warning title=timing families::the simulator runtime was lost before any test ran; running them once more"
+            run_timing_once append
+          fi
 
   ui:
     name: UI suite (shard ${{ matrix.shard }})
     needs: plan
-    runs-on: macos-26
+    if: needs.plan.outputs.skip != 'true'
+    runs-on: xcode-27
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -419,7 +511,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Select Xcode
-        run: sudo xcode-select -s /Applications/Xcode.app
+        run: sudo --preserve-env=GITHUB_ENV bash scripts/ci-select-xcode.sh
 
       - name: Install xcodegen
         run: brew install xcodegen
@@ -428,10 +520,16 @@ jobs:
         run: xcodegen generate
 
       - name: Build and boot the simulator in parallel
+        env:
+          # The UI shards never restore a cache, so every build is clean: the
+          # clean-build budget, as in PR CI (#2319).
+          BUILD_TIMEOUT_SECS: "1800"
         run: bash scripts/ci-hosted-build.sh
 
       - name: Run this shard's UI classes
-        # No retry here on purpose: this run exists to surface UI flakes.
+        # No retry here on purpose: this run exists to surface UI flakes. The
+        # one exception is a simulator runtime lost before any test ran
+        # (scripts/ci-recover-lost-runtime.sh), where nothing was tested.
         env:
           UI_CLASSES: "${{ matrix.classes }}"
         run: |
@@ -445,11 +543,19 @@ jobs:
           for cls in "${CLASSES[@]}"; do
             args+=("-only-testing:ConduitUITests/${cls}")
           done
-          xcodebuild test-without-building \
-            -xctestrun "$XCRUN_FILE" \
-            -destination "$DESTINATION" \
-            -parallel-testing-enabled NO \
-            -collect-test-diagnostics never \
-            -test-timeouts-enabled YES \
-            -default-test-execution-time-allowance 600 \
-            "${args[@]}"
+          ui_log="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/ui-shard.log"
+          run_ui_once() {
+            xcodebuild test-without-building \
+              -xctestrun "$XCRUN_FILE" \
+              -destination "$DESTINATION" \
+              -parallel-testing-enabled NO \
+              -collect-test-diagnostics never \
+              -test-timeouts-enabled YES \
+              -default-test-execution-time-allowance 600 \
+              "${args[@]}" 2>&1 | tee ${1:+-a} "$ui_log"
+          }
+          if ! run_ui_once; then
+            bash scripts/ci-recover-lost-runtime.sh "$ui_log" || exit 1
+            echo "::warning title=UI shard::the simulator runtime was lost before any test ran; running the shard once more"
+            run_ui_once append
+          fi

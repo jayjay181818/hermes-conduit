@@ -59,7 +59,7 @@ struct V2ArtifactsPage: View {
         .navigationTitle(Text("Artifacts"))
         .navigationBarTitleDisplayMode(.large)
         .safeAreaInset(edge: .bottom, spacing: 0) {
-            MinimisedLiveVoiceBar()
+            V2ListCallBar()
         }
     }
 }
@@ -169,6 +169,9 @@ private struct ArtifactsList: View {
 
     @AppStorage(ArtifactsClient.showMissingKey) private var showMissing = false
     @State private var filter: ArtifactFilter = .all
+    /// With other combined dashboards' artifacts in All: the one dashboard
+    /// shown (nil for the one on screen's own), or every one while unset.
+    @State private var onlyDashboard: UUID??
     @State private var query = ""
     @State private var feed: ArtifactFeed?
     @State private var loadedKey: ArtifactsListKey?
@@ -194,6 +197,23 @@ private struct ArtifactsList: View {
     /// The open in flight: a cancelled one finishing late can't clear a
     /// newer open's spinner, even of the same item.
     @State private var openToken: UUID?
+    /// Saved (issue 2467): showing the saved artifacts instead of the
+    /// feed, each read store's saved set (`savedRows[i]` for source i)
+    /// and what it was read for.
+    @State private var savedOnly = false
+    @State private var savedRows: [[ArtifactItem]?] = []
+    @State private var savedKey: SavedListKey?
+    @State private var savedFailure: String?
+    @State private var savedGeneration = 0
+    /// The artifact whose note is being written, and the note.
+    @State private var noting: ArtifactItem?
+    /// The store the note editor was opened on, so a profile or dashboard
+    /// switch while it's up can't write the note somewhere else.
+    @State private var notingStore: (profile: String, dashboard: UUID?)?
+    @State private var noteText = ""
+    @State private var saveFailure: String?
+    /// Whether `saveFailure` is from Remove from Saved.
+    @State private var removeFailed = false
 
     private struct OpenPage: Identifiable {
         let id = UUID()
@@ -211,11 +231,56 @@ private struct ArtifactsList: View {
 
     private var currentKey: ArtifactsListKey {
         ArtifactsListKey(dashboard: appState.activeDashboardID, profile: appState.activeProfile,
-                         sources: appState.artifactSources(for: scope), filter: filter,
+                         sources: shownSources(appState.artifactSources(for: scope)), filter: filter,
                          query: query.trimmingCharacters(in: .whitespacesAndNewlines), showMissing: showMissing)
     }
 
+    /// The dashboards whose artifacts the list can show, the one on screen
+    /// first (nil), when All reaches other combined dashboards too.
+    private var dashboardChoices: [UUID?] {
+        let sources = appState.artifactSources(for: scope)
+        var choices: [UUID?] = []
+        for source in sources where !choices.contains(source.dashboardID) { choices.append(source.dashboardID) }
+        return choices.count > 1 ? choices : []
+    }
+
+    /// The stores of the one dashboard picked, or every store; a pick no
+    /// longer offered (that dashboard left the group) shows them all.
+    private func shownSources(_ sources: [ArtifactSource]) -> [ArtifactSource] {
+        guard let only = onlyDashboard else { return sources }
+        let picked = sources.filter { $0.dashboardID == only }
+        return picked.isEmpty ? sources : picked
+    }
+
+    /// The stores Saved reads: this dashboard's, which keeps the pins,
+    /// whichever dashboard's chip the feed shows.
+    private var ownSources: [ArtifactSource] {
+        appState.artifactSources(for: scope).filter { $0.dashboardID == nil }
+    }
+
     private var items: [ArtifactItem] { feed?.items ?? [] }
+
+    /// What Saved is read for: the stores the list reads, on this
+    /// dashboard, once the plugin says it keeps them.
+    private var currentSavedKey: SavedListKey {
+        SavedListKey(dashboard: appState.activeDashboardID, sources: ownSources,
+                     served: appState.supportsArtifactPins)
+    }
+
+    /// Saved's rows as last read for this list's stores.
+    private var savedItems: [ArtifactItem] {
+        guard savedKey?.sameStores(as: currentSavedKey) == true else { return [] }
+        return ArtifactPinsClient.items(sources: ownSources, saved: savedRows, query: currentKey.query)
+    }
+
+    /// Every artifact saved in the stores read, so a row says whether
+    /// it's saved; by id and the profile it's saved in.
+    private var savedIDs: Set<String> {
+        guard savedKey?.sameStores(as: currentSavedKey) == true else { return [] }
+        return Set(ArtifactPinsClient.items(sources: ownSources, saved: savedRows).map(\.id))
+    }
+
+    private var offersSaved: Bool { appState.supportsArtifactPins }
     private var nextBefore: ArtifactFeed.Cursor? { feed?.nextCursor }
 
     var body: some View {
@@ -232,6 +297,7 @@ private struct ArtifactsList: View {
             }
             await reload()
         }
+        .task(id: currentSavedKey) { await reloadSaved() }
         .sheet(item: $page) { page in
             HTMLPreviewSheet(name: page.name, html: page.html)
         }
@@ -246,6 +312,36 @@ private struct ArtifactsList: View {
             Button("OK", role: .cancel) { missing = nil }
         } message: {
             Text(verbatim: missing?.path ?? "")
+        }
+        .alert(
+            Text("Note"),
+            isPresented: Binding(get: { noting != nil }, set: { if !$0 { noting = nil } })
+        ) {
+            TextField(AppLocalization.string("Note"), text: Binding(
+                get: { noteText },
+                // Match the host's code-point limit, keeping each character whole.
+                set: { noteText = ArtifactPinsClient.limitedNote($0) }
+            ))
+            Button("Save") {
+                if let item = noting, let store = notingStore {
+                    if store.dashboard == appState.activeDashboardID {
+                        Task { await save(item, note: noteText, profile: store.profile) }
+                    } else {
+                        noting = nil
+                    }
+                }
+            }
+            Button("Cancel", role: .cancel) { noting = nil }
+        } message: {
+            Text("A few words that show under it in Saved.")
+        }
+        .alert(
+            removeFailed ? Text("Couldn't Remove from Saved") : Text("Couldn't Save"),
+            isPresented: Binding(get: { saveFailure != nil }, set: { if !$0 { saveFailure = nil } })
+        ) {
+            Button("OK", role: .cancel) { saveFailure = nil }
+        } message: {
+            Text(verbatim: saveFailure ?? "")
         }
     }
 
@@ -264,7 +360,13 @@ private struct ArtifactsList: View {
             .padding(.bottom, 24)
         }
         .scrollDismissesKeyboard(.interactively)
-        .refreshable { await reload() }
+        .refreshable {
+            if savedOnly {
+                await reloadSaved()
+            } else {
+                await reload()
+            }
+        }
     }
 
     // MARK: - Chips
@@ -273,27 +375,37 @@ private struct ArtifactsList: View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 8) {
                 ForEach(ArtifactFilter.allCases) { option in
-                    let isOn = option == filter
-                    Button {
-                        Haptics.selection()
-                        withAnimation(ConduitMotion.ease(reduceMotion: reduceMotion)) { filter = option }
-                    } label: {
-                        Text(option.title)
-                            .scaledFont(.subheadline.weight(.semibold))
-                            .foregroundStyle(isOn ? Color.conduitAccent : Color.primary.opacity(0.75))
-                            .padding(.horizontal, 14)
-                            .frame(minHeight: 36)
-                            .background(
-                                isOn ? Color.conduitAccent.opacity(0.18) : Color.primary.opacity(0.06),
-                                in: Capsule()
-                            )
-                            .overlay {
-                                Capsule().strokeBorder(isOn ? Color.conduitAccent.opacity(0.45) : Color.primary.opacity(0.08))
-                            }
-                            .contentShape(Capsule())
+                    chip(Text(option.title), isOn: !savedOnly && option == filter) {
+                        savedOnly = false
+                        filter = option
                     }
-                    .buttonStyle(PressableButtonStyle())
-                    .accessibilityAddTraits(isOn ? .isSelected : [])
+                    // Saved stands beside All: everything kept, whatever
+                    // its kind.
+                    // Kept rows show it before the plugin has answered
+                    // (offline, just launched); Save itself waits for it.
+                    if option == .all, offersSaved || savedOnly
+                        || savedKey != nil && appState.notifierPlugin.mayServe(ArtifactPinsClient.capability) {
+                        let count = savedIDs.count
+                        chip(Text("Saved") + Text(verbatim: count == 0 ? "" : " \(count)"),
+                             isOn: savedOnly) {
+                            savedOnly = true
+                            filter = .all
+                        }
+                    }
+                }
+                // Each combined dashboard's own chip, once All reaches
+                // theirs: it shows that dashboard's alone, and again every
+                // one (Eric, 2026-11-16).
+                if !savedOnly, !dashboardChoices.isEmpty {
+                    Divider()
+                        .frame(height: 22)
+                        .accessibilityHidden(true)
+                    ForEach(dashboardChoices, id: \.self) { choice in
+                        let isOn = onlyDashboard == .some(choice)
+                        chip(dashboardChipTitle(choice), isOn: isOn) {
+                            onlyDashboard = isOn ? nil : .some(choice)
+                        }
+                    }
                 }
                 if inPanel, appState.supportsArtifacts {
                     Button {
@@ -317,6 +429,35 @@ private struct ArtifactsList: View {
         .dynamicTypeSize(...DynamicTypeSize.pinnedChromeCap)
     }
 
+    /// A dashboard's chip: its name, as its badge gives it.
+    private func dashboardChipTitle(_ id: UUID?) -> Text {
+        let badge = (id ?? appState.activeDashboardID).flatMap { appState.combinedDashboardBadge($0) }
+        return Text(verbatim: badge?.name ?? "")
+    }
+
+    private func chip(_ title: Text, isOn: Bool, select: @escaping () -> Void) -> some View {
+        Button {
+            Haptics.selection()
+            withAnimation(ConduitMotion.ease(reduceMotion: reduceMotion)) { select() }
+        } label: {
+            title
+                .scaledFont(.subheadline.weight(.semibold))
+                .foregroundStyle(isOn ? Color.conduitAccent : Color.primary.opacity(0.75))
+                .padding(.horizontal, 14)
+                .frame(minHeight: 36)
+                .background(
+                    isOn ? Color.conduitAccent.opacity(0.18) : Color.primary.opacity(0.06),
+                    in: Capsule()
+                )
+                .overlay {
+                    Capsule().strokeBorder(isOn ? Color.conduitAccent.opacity(0.45) : Color.primary.opacity(0.08))
+                }
+                .contentShape(Capsule())
+        }
+        .buttonStyle(PressableButtonStyle())
+        .accessibilityAddTraits(isOn ? .isSelected : [])
+    }
+
     // MARK: - Content
 
     @ViewBuilder
@@ -325,10 +466,12 @@ private struct ArtifactsList: View {
         // old to say), never while Conduit hasn't heard from it: kept rows
         // show meanwhile, and with none kept, the loader, or offline, why
         // nothing can load yet.
-        if !appState.notifierPlugin.mayServe(ArtifactsClient.capability) {
+        if savedOnly {
+            savedContent
+        } else if !appState.notifierPlugin.mayServe(ArtifactsClient.capability) {
             unavailable(
                 title: Text(PluginUpdateAsk.title(AppLocalization.string("Update the Conduit plugin"))),
-                detail: Text(PluginUpdateAsk.text(AppLocalization.string("Update the Conduit plugin on your Hermes host to see artifacts here. Settings › Conduit plugin can update it."))),
+                detail: Text(PluginUpdateAsk.text(AppLocalization.string("Update the Conduit plugin on your Hermes host to see artifacts here. Settings › Conduit plugin can update it.", table: .chat))),
                 symbol: "arrow.down.circle"
             )
         } else if items.isEmpty, loadedKey != currentKey, !appState.supportsArtifacts, !appState.isConnected,
@@ -403,6 +546,82 @@ private struct ArtifactsList: View {
         }
     }
 
+    /// Saved: everything kept in the stores the list reads, the one saved
+    /// last first, missing files included (that's what keeping them is
+    /// for), searched like the list.
+    @ViewBuilder
+    private var savedContent: some View {
+        let items = savedItems
+        if items.isEmpty, savedKey == nil, appState.notifierPlugin.state != .unknown, !appState.supportsArtifactPins {
+            // Kept by a plugin from before saved artifacts: nothing to
+            // read, so the update notice, as the list gives its own.
+            unavailable(
+                title: Text(PluginUpdateAsk.title(AppLocalization.string("Update the Conduit plugin"))),
+                detail: Text(PluginUpdateAsk.text(AppLocalization.string("Update the Conduit plugin on your Hermes host to see artifacts here. Settings › Conduit plugin can update it.", table: .chat))),
+                symbol: "arrow.down.circle"
+            )
+        } else if items.isEmpty, let savedFailure {
+            ContentUnavailableView {
+                Label("Saved artifacts couldn't load", systemImage: "exclamationmark.triangle")
+            } description: {
+                Text(verbatim: savedFailure)
+            } actions: {
+                Button("Try Again") { Task { await reloadSaved() } }
+            }
+            .frame(maxWidth: .infinity, minHeight: 280)
+        } else if items.isEmpty, savedKey == nil, !appState.supportsArtifactPins, !appState.isConnected,
+                  !appState.isRecoveringConnection {
+            // Nothing kept, and nothing can be read until Conduit connects.
+            unavailable(
+                title: Text("Saved artifacts couldn't load"),
+                detail: Text("Conduit isn't connected to Hermes right now. It reconnects on its own, so try again in a moment."),
+                symbol: "wifi.slash"
+            )
+        } else if items.isEmpty, savedKey?.sameStores(as: currentSavedKey) != true {
+            ProgressView()
+                .frame(maxWidth: .infinity, minHeight: 200)
+        } else if items.isEmpty, !currentKey.query.isEmpty {
+            unavailable(title: Text("No Results"), detail: Text("Nothing here matches."), symbol: "magnifyingglass")
+        } else if items.isEmpty {
+            unavailable(
+                title: Text("Nothing Saved Yet"),
+                detail: Text("Long-press an artifact and choose Save to keep it here. Hermes keeps a copy of each file, so it still opens after its chat is gone."),
+                symbol: "bookmark"
+            )
+        } else {
+            // In the order saved: a run of pictures shares a grid, so a
+            // grid never puts an older picture above a newer file.
+            VStack(alignment: .leading, spacing: 8) {
+                ForEach(ArtifactPinsClient.runs(items)) { run in
+                    if run.isVisual {
+                        LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 6), count: 3), spacing: 6) {
+                            ForEach(run.items) { item in
+                                // A picture's note under it, as a row shows its own.
+                                VStack(alignment: .leading, spacing: 3) {
+                                    tile(item)
+                                    if let note = item.note {
+                                        Text(verbatim: note)
+                                            .scaledFont(.caption)
+                                            .foregroundStyle(.secondary)
+                                            .lineLimit(2)
+                                            .frame(maxWidth: .infinity, alignment: .leading)
+                                            .accessibilityHidden(true)
+                                    }
+                                }
+                                .frame(maxHeight: .infinity, alignment: .top)
+                            }
+                        }
+                    } else {
+                        ForEach(run.items) { item in
+                            row(item)
+                        }
+                    }
+                }
+            }
+            .padding(.top, 10)
+        }
+    }
+
     private func unavailable(title: Text, detail: Text, symbol: String, retry: Bool = false,
                              showMissingAction: Bool = false) -> some View {
         ContentUnavailableView {
@@ -447,8 +666,8 @@ private struct ArtifactsList: View {
 
     static func dayTitle(_ day: Date) -> String {
         let calendar = Calendar.current
-        if calendar.isDateInToday(day) { return AppLocalization.string("Today") }
-        if calendar.isDateInYesterday(day) { return AppLocalization.string("Yesterday") }
+        if calendar.isDateInToday(day) { return AppLocalization.string("Today", table: .chat) }
+        if calendar.isDateInYesterday(day) { return AppLocalization.string("Yesterday", table: .chat) }
         let sameYear = calendar.isDate(day, equalTo: Date(), toGranularity: .year)
         return day.formatted(sameYear
             ? .dateTime.weekday(.wide).month(.wide).day()
@@ -462,7 +681,8 @@ private struct ArtifactsList: View {
             open(item)
         } label: {
             ArtifactThumbnail(item: item, resolver: resolver(for: item),
-                              dashboard: appState.activeDashboardID, profile: item.otherProfile ?? appState.activeProfile)
+                              dashboard: item.dashboardID ?? appState.activeDashboardID,
+                              profile: item.otherProfile ?? appState.activeProfile)
                 .aspectRatio(1, contentMode: .fit)
                 .overlay {
                     if openingID == item.id {
@@ -473,11 +693,22 @@ private struct ArtifactsList: View {
                 .overlay {
                     RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(Color.primary.opacity(0.08))
                 }
-                .opacity(item.exists ? 1 : 0.45)
+                .opacity(item.canOpen ? 1 : 0.45)
+                .overlay(alignment: .topTrailing) {
+                    if savedIDs.contains(item.id) {
+                        Image(systemName: "bookmark.fill")
+                            .scaledFont(.caption.weight(.semibold))
+                            .foregroundStyle(.white)
+                            .padding(5)
+                            .background(.black.opacity(0.5), in: Circle())
+                            .padding(5)
+                            .accessibilityHidden(true)
+                    }
+                }
                 .overlay(alignment: .topLeading) {
                     // Over the dimming, which alone reads as a dark picture,
                     // and clear of the name along the bottom.
-                    if !item.exists {
+                    if !item.canOpen {
                         Label("Missing", systemImage: "exclamationmark.circle.fill")
                             .scaledFont(.caption2.weight(.semibold))
                             .foregroundStyle(.white)
@@ -504,11 +735,25 @@ private struct ArtifactsList: View {
             HStack(spacing: 12) {
                 ArtifactIcon(kind: item.kind)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(verbatim: item.name)
-                        .scaledFont(.body.weight(.semibold))
-                        .foregroundStyle(.primary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
+                    HStack(spacing: 5) {
+                        Text(verbatim: item.name)
+                            .scaledFont(.body.weight(.semibold))
+                            .foregroundStyle(.primary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        if savedIDs.contains(item.id) {
+                            Image(systemName: "bookmark.fill")
+                                .scaledFont(.caption)
+                                .foregroundStyle(Color.conduitAccent)
+                                .accessibilityHidden(true)
+                        }
+                    }
+                    if let note = item.note {
+                        Text(verbatim: note)
+                            .scaledFont(.subheadline)
+                            .foregroundStyle(Color.primary.opacity(0.8))
+                            .lineLimit(2)
+                    }
                     Text(verbatim: detail(item))
                         .scaledFont(.caption)
                         .foregroundStyle(.secondary)
@@ -526,7 +771,7 @@ private struct ArtifactsList: View {
             .overlay {
                 RoundedRectangle(cornerRadius: 16, style: .continuous).strokeBorder(Color.primary.opacity(0.08))
             }
-            .opacity(item.exists ? 1 : 0.55)
+            .opacity(item.canOpen ? 1 : 0.55)
             .contentShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
         }
         .buttonStyle(PressableButtonStyle())
@@ -541,10 +786,39 @@ private struct ArtifactsList: View {
         } label: {
             Label("Open", systemImage: "arrow.up.left.and.arrow.down.right")
         }
-        Button {
-            showInChat(item)
-        } label: {
-            Label("Show in Chat", systemImage: "text.bubble")
+        // Another dashboard's chat and pins are on that dashboard.
+        if item.dashboardID == nil {
+            Button {
+                showInChat(item)
+            } label: {
+                Label("Show in Chat", systemImage: "text.bubble")
+            }
+        }
+        if offersSaved, item.dashboardID == nil {
+            if let saved = savedItem(item) {
+                Button {
+                    noteText = saved.note ?? ""
+                    notingStore = (saved.otherProfile ?? appState.activeProfile, appState.activeDashboardID)
+                    noting = saved
+                } label: {
+                    if saved.note == nil {
+                        Label("Add Note", systemImage: "square.and.pencil")
+                    } else {
+                        Label("Edit Note", systemImage: "square.and.pencil")
+                    }
+                }
+                Button {
+                    Task { await unsave(saved) }
+                } label: {
+                    Label("Remove from Saved", systemImage: "bookmark.slash")
+                }
+            } else {
+                Button {
+                    Task { await save(item, note: nil) }
+                } label: {
+                    Label("Save", systemImage: "bookmark")
+                }
+            }
         }
         if let url = item.url {
             ShareLink(item: url) {
@@ -566,9 +840,10 @@ private struct ArtifactsList: View {
 
     private func detail(_ item: ArtifactItem) -> String {
         var parts = [Self.kindLabel(item.kind)]
-        if item.source == .attached { parts.append(AppLocalization.string("You sent")) }
+        if item.source == .attached { parts.append(AppLocalization.string("You sent", table: .chat)) }
         if !item.exists {
-            parts.append(AppLocalization.string("No longer on the host"))
+            parts.append(AppLocalization.string("No longer on the host", table: .chat))
+            if item.keptPath != nil { parts.append(AppLocalization.string("Kept copy", table: .chat)) }
         } else if let size = item.size, item.kind != .link {
             parts.append(ByteCountFormatter.string(fromByteCount: size, countStyle: .file))
         }
@@ -593,11 +868,18 @@ private struct ArtifactsList: View {
 
     /// Another profile's files are read through that profile.
     private func resolver(for item: ArtifactItem) -> GatewayMediaDataURLResolver {
-        item.otherProfile.map { appState.gatewayMediaResolver(for: $0) } ?? appState.gatewayMediaResolver
+        // Another combined dashboard's are read through its kept connection.
+        if let dashboard = item.dashboardID {
+            return appState.keptGatewayMediaResolver(dashboardID: dashboard, profile: item.otherProfile ?? "default")
+        }
+        return item.otherProfile.map { appState.gatewayMediaResolver(for: $0) } ?? appState.gatewayMediaResolver
     }
 
     private func accessibilityName(_ item: ArtifactItem) -> String {
-        [item.name, Self.kindLabel(item.kind), item.exists ? "" : AppLocalization.string("No longer on the host"),
+        [item.name, item.note ?? "", Self.kindLabel(item.kind),
+         savedIDs.contains(item.id) ? AppLocalization.string("Saved") : "",
+         item.exists ? "" : AppLocalization.string("No longer on the host", table: .chat),
+         item.exists || item.keptPath == nil ? "" : AppLocalization.string("Kept copy", table: .chat),
          chatIsOpen ? "" : chatName(item) ?? ""]
             .filter { !$0.isEmpty }
             .joined(separator: ", ")
@@ -606,12 +888,12 @@ private struct ArtifactsList: View {
     static func kindLabel(_ kind: ArtifactItem.Kind) -> String {
         switch kind {
         case .image: return AppLocalization.string("Image")
-        case .video: return AppLocalization.string("Video")
+        case .video: return AppLocalization.string("Video", table: .chat)
         case .audio: return AppLocalization.string("Audio")
-        case .page: return AppLocalization.string("Page")
+        case .page: return AppLocalization.string("Page", table: .chat)
         case .document: return AppLocalization.string("Document")
-        case .file: return AppLocalization.string("File")
-        case .link: return AppLocalization.string("Link")
+        case .file: return AppLocalization.string("File", table: .chat)
+        case .link: return AppLocalization.string("Link", table: .chat)
         }
     }
 
@@ -622,8 +904,9 @@ private struct ArtifactsList: View {
             openURL(url)
             return
         }
-        guard let path = item.path, openingID == nil else { return }
-        guard item.exists else {
+        guard item.path != nil, openingID == nil else { return }
+        // A saved file whose original is gone opens its kept copy.
+        guard let path = item.openPath else {
             missingIsTooLarge = false
             missing = item
             return
@@ -729,8 +1012,9 @@ private struct ArtifactsList: View {
     /// and swipes to the next one.
     private func openImage(_ item: ArtifactItem, path: String) {
         let tapped = galleryItem(item, path: path)
-        let images = ArtifactsClient.days(items).flatMap(\.items).compactMap { other -> ImageGalleryItem? in
-            guard other.kind == .image, other.exists, let path = other.path else { return nil }
+        let shown = savedOnly ? savedItems : ArtifactsClient.days(items).flatMap(\.items)
+        let images = shown.compactMap { other -> ImageGalleryItem? in
+            guard other.kind == .image, let path = other.openPath else { return nil }
             return other.id == item.id ? tapped : galleryItem(other, path: path)
         }
         if !ImageGallery.open(tapped, in: ImageGallerySource { images }) {
@@ -783,10 +1067,10 @@ private struct ArtifactsList: View {
         // its loader until the next connect.
         if !appState.supportsArtifacts, appState.isConnected, appState.notifierPlugin.state == .unknown {
             isLoading = true
-            await appState.refreshNotifierPluginStatus()
+            await appState.refreshNotifierPluginStatusOnce()
             guard ticket == generation else { return }
             if appState.notifierPlugin.state == .unknown, loadedKey != key {
-                failure = AppLocalization.string("Couldn't reach this dashboard's notifier.")
+                failure = AppLocalization.string("Couldn't reach this dashboard's notifier.", table: .chat)
                 feed = nil
                 loadedKey = key
             }
@@ -803,7 +1087,7 @@ private struct ArtifactsList: View {
         var pages: [ArtifactPage?] = []
         for (index, source) in key.sources.enumerated() {
             do {
-                pages.append(try await appState.artifactsClient.page(
+                pages.append(try await appState.artifactsClient(for: source).page(
                     source, filter: key.filter, query: key.query, showMissing: key.showMissing,
                     keptIn: answers(for: source)
                 ))
@@ -849,14 +1133,158 @@ private struct ArtifactsList: View {
     }
 
     private func keptPage(_ source: ArtifactSource, for key: ArtifactsListKey) -> ArtifactPage? {
-        ArtifactsClient.keptPage(source, filter: key.filter, query: key.query, showMissing: key.showMissing,
-                                 in: answers(for: source))
+        guard let answers = answers(for: source) else { return nil }
+        return ArtifactsClient.keptPage(source, filter: key.filter, query: key.query, showMissing: key.showMissing,
+                                        in: answers)
     }
 
     /// Where a store's list is kept: on the dashboard open, for the
-    /// store's profile.
-    private func answers(for source: ArtifactSource) -> KeptAnswers {
-        appState.screenAnswers(profile: source.profile)
+    /// store's profile. Another combined dashboard's isn't kept here.
+    private func answers(for source: ArtifactSource) -> KeptAnswers? {
+        source.dashboardID == nil ? appState.screenAnswers(profile: source.profile) : nil
+    }
+
+    /// Reads each store's saved set (once per profile), showing what was
+    /// read last time while Hermes is asked, offline too.
+    private func reloadSaved() async {
+        let key = currentSavedKey
+        savedGeneration &+= 1
+        let ticket = savedGeneration
+        let profiles = key.sources.map(\.profile)
+        if savedKey?.sameStores(as: key) != true {
+            savedFailure = nil
+            let kept = profiles.map { ArtifactPinsClient.kept(profile: $0, in: appState.screenAnswers(profile: $0)) }
+            if kept.contains(where: { $0 != nil }) {
+                savedRows = kept
+                savedKey = key
+            } else {
+                savedRows = []
+                savedKey = nil
+            }
+        }
+        guard key.served else {
+            // Connected, and the plugin never said what it serves: asked
+            // again, as the feed's refresh asks, so pulling Saved isn't a
+            // no-op until the next connect.
+            if appState.isConnected, appState.notifierPlugin.state == .unknown {
+                await appState.refreshNotifierPluginStatusOnce()
+                guard ticket == savedGeneration else { return }
+                if currentSavedKey.served {
+                    await reloadSaved()
+                } else if appState.notifierPlugin.state == .unknown, savedKey == nil {
+                    // Still no answer: say so, as the feed does, with Try
+                    // Again, rather than leave Saved on its loader.
+                    savedFailure = AppLocalization.string("Couldn't reach this dashboard's notifier.", table: .chat)
+                }
+            }
+            return
+        }
+        var read: [String: [ArtifactItem]] = [:]
+        var rows: [[ArtifactItem]?] = []
+        for (index, profile) in profiles.enumerated() {
+            if let done = read[profile] {
+                rows.append(done)
+                continue
+            }
+            do {
+                let pins = try await appState.artifactPinsClient.list(
+                    profile: profile, keptIn: appState.screenAnswers(profile: profile))
+                read[profile] = pins
+                rows.append(pins)
+            } catch is CancellationError {
+                return
+            } catch {
+                guard ticket == savedGeneration else { return }
+                // The list's own store is Saved itself; another keeps
+                // what it read last time.
+                if index == 0, savedKey?.sameStores(as: key) != true {
+                    savedFailure = UserFacingError.message(for: error)
+                    savedKey = nil
+                    return
+                }
+                rows.append(savedKey?.sameStores(as: key) == true && index < savedRows.count ? savedRows[index] : nil)
+            }
+        }
+        guard ticket == savedGeneration else { return }
+        savedRows = rows
+        savedKey = key
+        savedFailure = nil
+    }
+
+    /// The saved row for `item`, as Saved lists it: tagged with the store
+    /// that holds the pin, so Edit Note and Remove act there even when the
+    /// list showed it from another profile.
+    private func savedItem(_ item: ArtifactItem) -> ArtifactItem? {
+        guard savedKey?.sameStores(as: currentSavedKey) == true else { return nil }
+        return ArtifactPinsClient.items(sources: ownSources, saved: savedRows).first { $0.id == item.id }
+    }
+
+    /// Saves `item` in the profile its store reads (or changes its note),
+    /// then reads Saved again so every list shows it.
+    private func save(_ item: ArtifactItem, note: String?, profile store: String? = nil) async {
+        let profile = store ?? item.otherProfile ?? appState.activeProfile
+        let dashboard = appState.activeDashboardID
+        noting = nil
+        do {
+            let saved = try await appState.artifactPinsClient.save(item, note: note, profile: profile)
+            guard appState.activeDashboardID == dashboard else { return }
+            Haptics.success()
+            // Shown at once, and kept if reading Saved again fails.
+            changeSavedRows(profile: profile, seeding: true) { rows in
+                rows.removeAll { $0.id == saved.id }
+                rows.insert(saved, at: 0)
+            }
+            appState.screenAnswers(profile: profile).noteWrite(ArtifactPinsClient.listPath(profile: profile))
+            await reloadSaved()
+        } catch is CancellationError {
+            return
+        } catch {
+            guard appState.activeDashboardID == dashboard else { return }
+            Haptics.error()
+            removeFailed = false
+            saveFailure = UserFacingError.message(for: error)
+        }
+    }
+
+    private func unsave(_ item: ArtifactItem) async {
+        let profile = item.otherProfile ?? appState.activeProfile
+        let dashboard = appState.activeDashboardID
+        do {
+            try await appState.artifactPinsClient.remove(item, profile: profile)
+            guard appState.activeDashboardID == dashboard else { return }
+            Haptics.success()
+            changeSavedRows(profile: profile) { rows in rows.removeAll { $0.id == item.id } }
+            appState.screenAnswers(profile: profile).noteWrite(ArtifactPinsClient.listPath(profile: profile))
+            await reloadSaved()
+        } catch is CancellationError {
+            return
+        } catch {
+            guard appState.activeDashboardID == dashboard else { return }
+            Haptics.error()
+            removeFailed = true
+            saveFailure = UserFacingError.message(for: error)
+        }
+    }
+
+    /// A save or removal the host took, applied to every store of
+    /// `profile` before Saved is read again. A save also lands in a store
+    /// Saved hasn't read yet (its read failed or hasn't answered), so it
+    /// shows at once and stays if reading again fails; a removal there
+    /// has nothing to take out.
+    private func changeSavedRows(profile: String, seeding: Bool = false,
+                                 _ change: (inout [ArtifactItem]) -> Void) {
+        let key = currentSavedKey
+        if savedKey?.sameStores(as: key) != true {
+            guard seeding else { return }
+            savedRows = Array(repeating: nil, count: ownSources.count)
+            savedKey = key
+            savedFailure = nil
+        }
+        for (index, source) in ownSources.enumerated() where source.profile == profile && index < savedRows.count {
+            guard var rows = savedRows[index] ?? (seeding ? [] : nil) else { continue }
+            change(&rows)
+            savedRows[index] = rows
+        }
     }
 
     private func loadMore() async {
@@ -866,8 +1294,9 @@ private struct ArtifactsList: View {
         loadingBefore = cursor
         defer { if loadingBefore == cursor { loadingBefore = nil } }
         do {
-            let result = try await appState.artifactsClient.page(
-                key.sources[cursor.source], filter: key.filter, query: key.query,
+            let source = key.sources[cursor.source]
+            let result = try await appState.artifactsClient(for: source).page(
+                source, filter: key.filter, query: key.query,
                 showMissing: key.showMissing, before: cursor.before
             )
             guard ticket == generation else { return }
@@ -905,6 +1334,19 @@ struct ArtifactsListKey: Equatable {
     /// server.
     static func thumbnailCacheKey(dashboard: UUID?, profile: String, path: String) -> NSString {
         NSString(string: "\(dashboard?.uuidString ?? "")\u{0}\(profile)\u{0}\(path)")
+    }
+}
+
+/// What a list's Saved was read for: its stores on a dashboard, and
+/// whether the plugin keeps saved artifacts.
+struct SavedListKey: Equatable {
+    let dashboard: UUID?
+    let sources: [ArtifactSource]
+    let served: Bool
+
+    /// The same stores, whether or not the plugin had said so yet.
+    func sameStores(as other: SavedListKey) -> Bool {
+        dashboard == other.dashboard && sources == other.sources
     }
 }
 
@@ -954,7 +1396,7 @@ private struct ArtifactThumbnail: View {
     @State private var image: UIImage?
 
     private var cacheKey: NSString {
-        ArtifactsListKey.thumbnailCacheKey(dashboard: dashboard, profile: profile, path: item.path ?? "")
+        ArtifactsListKey.thumbnailCacheKey(dashboard: dashboard, profile: profile, path: item.openPath ?? item.path ?? "")
     }
 
     var body: some View {
@@ -1003,7 +1445,7 @@ private struct ArtifactThumbnail: View {
             image = thumbnail
             return
         }
-        guard item.exists, let path = item.path else { return }
+        guard let path = item.openPath else { return }
         if let cached = ArtifactThumbnailCache.shared.object(forKey: cacheKey) {
             image = cached
             return
@@ -1022,18 +1464,32 @@ private struct ArtifactThumbnail: View {
             return UIImage(cgImage: cgImage)
         }.value
         guard let thumbnail, !Task.isCancelled else { return }
-        ArtifactThumbnailCache.shared.setObject(thumbnail, forKey: cacheKey)
+        ArtifactThumbnailCache.store(thumbnail, forKey: cacheKey)
         image = thumbnail
     }
 }
 
 /// Thumbnails by host path, so scrolling back doesn't read them again.
-private enum ArtifactThumbnailCache {
+/// They go with the chats' pictures at Sign Out and Remove Dashboard
+/// (`wipeOfflineChatCache`, issue 2512): the next sign-in may be another
+/// account.
+enum ArtifactThumbnailCache {
     static let shared: NSCache<NSString, UIImage> = {
         let cache = NSCache<NSString, UIImage>()
         cache.countLimit = 300
+        // About 50 thumbnails of 360 pixels at full size.
+        cache.totalCostLimit = 32 * 1024 * 1024
         return cache
     }()
+
+    static func store(_ image: UIImage, forKey key: NSString) {
+        let pixels = image.size.width * image.scale * image.size.height * image.scale
+        shared.setObject(image, forKey: key, cost: Int(pixels) * 4)
+    }
+
+    /// Every dashboard's: NSCache can't list its keys, as
+    /// TranscriptImageCache can't tell its files apart by server.
+    static func purge() { shared.removeAllObjects() }
 }
 
 /// The list's search and its Show Missing Files toggle: in the navigation

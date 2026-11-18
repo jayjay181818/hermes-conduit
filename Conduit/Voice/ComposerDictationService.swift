@@ -125,7 +125,7 @@ final class ComposerDictationService: ObservableObject {
         guard !audioCoordinator.hasCaptureOwner else {
             recognizer.cancel()
             clearCallbacks()
-            throw DictationError.message(AppLocalization.string("The microphone is not available right now."))
+            throw DictationError.message(AppLocalization.string("The microphone is not available right now.", table: .voice))
         }
         generation &+= 1
         let generation = generation
@@ -142,7 +142,7 @@ final class ComposerDictationService: ObservableObject {
             recognizer.cancel()
             releaseAudio()
             clearCallbacks()
-            throw DictationError.message(AppLocalization.string("The microphone is not available right now."))
+            throw DictationError.message(AppLocalization.string("The microphone is not available right now.", table: .voice))
         }
         let input: any DictationAudioInput
         do {
@@ -182,7 +182,7 @@ final class ComposerDictationService: ObservableObject {
                 _ = await AVAudioApplication.requestRecordPermission()
             }
             guard AVAudioApplication.shared.recordPermission == .granted else {
-                throw DictationError.message(AppLocalization.string("Dictation needs microphone access. You can allow it in Settings."))
+                throw DictationError.message(AppLocalization.string("Dictation needs microphone access. You can allow it in Settings.", table: .voice))
             }
             guard let gateway = hermesGateway() else {
                 throw DictationError.message(AppLocalization.string("Dictation with Hermes needs a connection to Hermes."))
@@ -190,7 +190,7 @@ final class ComposerDictationService: ObservableObject {
             return HermesDictationRecognizer(gateway: gateway, clips: clips)
         case .apple, .appleSpeechAnalyzer:
             guard await AppleSpeechWakeWordService.requestPermissions() else {
-                throw DictationError.message(AppLocalization.string("Dictation needs microphone and speech recognition access. You can allow them in Settings."))
+                throw DictationError.message(AppLocalization.string("Dictation needs microphone and speech recognition access. You can allow them in Settings.", table: .voice))
             }
             if choice == .appleSpeechAnalyzer, #available(iOS 26.0, *), SpeechTranscriber.isAvailable {
                 return try await SpeechAnalyzerDictationRecognizer.make(words: words)
@@ -269,10 +269,8 @@ final class ComposerDictationService: ObservableObject {
             Task { @MainActor [weak self] in self?.audioWasLost(generation: generation) }
         }
         audioObservers = [
-            center.addObserver(forName: AVAudioSession.interruptionNotification, object: nil, queue: nil) { note in
-                let type = (note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt)
-                    .flatMap(AVAudioSession.InterruptionType.init(rawValue:))
-                if type == .began { lost(note) }
+            center.addObserver(forName: .audioSessionInterruption, object: nil, queue: nil) { note in
+                if AudioSessionInterruption(note) == .began { lost(note) }
             },
             center.addObserver(forName: AVAudioSession.mediaServicesWereResetNotification, object: nil, queue: nil, using: lost),
             center.addObserver(forName: .AVAudioEngineConfigurationChange, object: engine, queue: nil, using: lost),

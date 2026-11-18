@@ -35,25 +35,26 @@ struct LocalLiveSettingsSection: View {
 
     var body: some View {
         ConduitSettingsSection(
-            title: agent ? AppLocalization.string("Local") : AppLocalization.string("Your speech server"),
+            title: agent ? AppLocalization.string("Local") : AppLocalization.string("Your speech server", table: .voice),
             symbol: "server.rack",
             tint: .conduitAccent
         ) {
             Text(agent
-                ? AppLocalization.string("Talk through a speech server you run, with a fast model of your choosing answering right away. Real work goes to Hermes as jobs, with their cards in the call's chat, like the other live modes.")
-                : AppLocalization.string("A hands-free call through a speech server you run, such as Hugging Face speech-to-speech. Everything you say goes to Hermes as a turn in the call's chat, and Hermes' reply is spoken as it is written."))
+                ? AppLocalization.string("Talk through a speech server you run, with a fast model of your choosing answering right away. Real work goes to Hermes as jobs, with their cards in the call's chat, like the other live modes.", table: .voice)
+                : AppLocalization.string("A hands-free call through a speech server you run, such as Hugging Face speech-to-speech. Everything you say goes to Hermes as a turn in the call's chat, and Hermes' reply is spoken as it is written.", table: .voice))
                 .scaledFont(.footnote)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
-            Text(AppLocalization.string("1. Your speech server"))
+            Text(AppLocalization.string("1. Your speech server", table: .voice))
                 .scaledFont(.subheadline.weight(.semibold))
             SpeechServerSettingsView(service: service)
-            Text(AppLocalization.string("2. Point the server at Hermes"))
+            Text(AppLocalization.string("2. Point the server at Hermes", table: .voice))
                 .scaledFont(.subheadline.weight(.semibold))
             SpeechServerVoiceSettingsView(service: service, showsIntro: false)
             if agent {
-                Text(AppLocalization.string("3. Your fast model"))
+                Text(AppLocalization.string("3. Your fast model", table: .voice))
                     .scaledFont(.subheadline.weight(.semibold))
+                LocalLiveOwnModelToggle(service: service)
                 LocalLiveFrontModelSettingsView(service: service)
                 if let model {
                     LocalLivePersonalityToggle(model: model)
@@ -82,10 +83,84 @@ struct LocalLivePersonalityToggle: View {
                 model.setPersonality(requested)
             }
         ))
-        Text(AppLocalization.string("Your fast model talks with the personality in this profile's SOUL.md, without reading out actions or emoji. SOUL.md is sent to your fast model's server with the conversation, and a long one can slow a small model's first words. Applies to the next call."))
+        Text(AppLocalization.string("Your fast model talks with the personality in this profile's SOUL.md, without reading out actions or emoji. SOUL.md is sent to your fast model's server with the conversation, and a long one can slow a small model's first words. Applies to the next call.", table: .voice))
             .scaledFont(.caption)
             .foregroundStyle(.secondary)
             .onChange(of: model.personality) { _, newValue in personality = newValue }
+    }
+}
+
+/// A speech server whose own model holds Live > Local's calls
+/// (voice.speech_server.own_model) instead of the fast model: a hosted
+/// realtime model gets the call's instructions and tools, as Grok Live's
+/// does (issue 2438). Saves by itself, like the Hermes answers switch;
+/// hidden with a plugin before the setting.
+struct LocalLiveOwnModelToggle: View {
+    @ObservedObject var service: HermesVoiceConfigurationService
+    /// The switch as tapped, while its save is on the way.
+    @State private var draft: Bool?
+    @State private var isSaving = false
+    @State private var errorMessage: String?
+    /// The read after a save failed: the page's next check asks again.
+    @State private var readFailed = false
+
+    var body: some View {
+        if let ownModel = service.speechServerVoice?.ownModel {
+            VStack(alignment: .leading, spacing: 4) {
+                Toggle(AppLocalization.string("The speech server's own model answers", table: .voice), isOn: Binding(
+                    get: { draft ?? ownModel },
+                    set: { on in
+                        draft = on
+                        Task { await save(on) }
+                    }
+                ))
+                .disabled(isSaving)
+                .accessibilityIdentifier("voice.localLive.ownModel")
+                Text(AppLocalization.string("For a hosted realtime model, such as OpenAI Realtime or Qwen: it holds the call itself with Conduit's instructions and tools, and hands the work to Hermes as jobs. The call's instructions are sent to that server, with this profile's SOUL.md when the personality switch below is on. Classic voice and Apple Watch calls still get Hermes' replies, read aloud by it. Off, your fast model answers.", table: .voice))
+                    .scaledFont(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                if let errorMessage {
+                    Label(errorMessage, systemImage: "exclamationmark.triangle.fill")
+                        .scaledFont(.footnote)
+                        .foregroundStyle(.orange)
+                        .accessibilityIdentifier("voice.localLive.ownModel.saveError")
+                }
+            }
+            .onChange(of: service.isLoading) { _, loading in
+                guard !loading, readFailed else { return }
+                Task {
+                    let status = await service.speechServerVoiceStatus()
+                    if !status.readFailed {
+                        readFailed = false
+                        errorMessage = nil
+                    }
+                }
+            }
+        }
+    }
+
+    private func save(_ on: Bool) async {
+        isSaving = true
+        defer {
+            // Whatever happened, the switch goes back to what the host has.
+            // (A profile switch resets Settings' stack, so this view and its
+            // service never outlive the profile they were opened for.)
+            isSaving = false
+            draft = nil
+        }
+        errorMessage = nil
+        let saved = await service.saveSpeechServerOwnModel(on)
+        if !saved {
+            errorMessage = service.errorMessage ?? AppLocalization.string("Could not load voice settings to save this change.", table: .voice)
+        }
+        // A save that landed with a read that failed says why, rather than
+        // the switch going back to the old value without a word.
+        let status = await service.speechServerVoiceStatus()
+        readFailed = status.readFailed
+        if status.readFailed, saved {
+            errorMessage = status.reason
+        }
     }
 }
 
@@ -118,12 +193,12 @@ struct LocalLiveFrontModelSettingsView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text(AppLocalization.string("Any OpenAI-compatible server works, on your network (llama.cpp, Ollama, vLLM, LM Studio) or a hosted one. A small, quick model is best: it only talks and hands the work to Hermes."))
+            Text(AppLocalization.string("Any OpenAI-compatible server works, on your network (llama.cpp, Ollama, vLLM, LM Studio) or a hosted one. A small, quick model is best: it only talks and hands the work to Hermes.", table: .voice))
                 .scaledFont(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             if loaded && status == nil {
-                Text(pluginOffReason ?? PluginUpdateAsk.text(AppLocalization.string("Update the Conduit plugin on your Hermes host to use a fast model.")))
+                Text(pluginOffReason ?? PluginUpdateAsk.text(AppLocalization.string("Update the Conduit plugin on your Hermes host to use a fast model.", table: .voice)))
                     .scaledFont(.footnote)
                     .foregroundStyle(.orange)
             } else {
@@ -139,7 +214,7 @@ struct LocalLiveFrontModelSettingsView: View {
                             .scaledFont(.caption)
                             .foregroundStyle(.secondary)
                     }
-                    SecureField(AppLocalization.string("Optional, for a hosted model"), text: $keyDraft)
+                    SecureField(AppLocalization.string("Optional, for a hosted model", table: .voice), text: $keyDraft)
                         .accessibilityLabel(Text("Key"))
                         .textContentType(.password)
                         .autocorrectionDisabled()
@@ -178,15 +253,19 @@ struct LocalLiveFrontModelSettingsView: View {
             Label(errorMessage, systemImage: "exclamationmark.triangle.fill")
                 .scaledFont(.footnote)
                 .foregroundStyle(.orange)
+        } else if service.speechServerVoice?.ownModel == true {
+            // The switch above says who answers: the server's own model, so
+            // nothing about the fast model applies.
+            EmptyView()
         } else if let status {
             if status.available {
-                Label(AppLocalization.string("Calls answer with \(status.model ?? "") and hand the work to Hermes."), systemImage: "checkmark.circle.fill")
+                Label(AppLocalization.string("Calls answer with \(status.model ?? "") and hand the work to Hermes.", table: .voice), systemImage: "checkmark.circle.fill")
                     .scaledFont(.footnote)
                     .foregroundStyle(.green)
                     .accessibilityIdentifier("voice.localLive.frontModel.status")
             } else {
                 // Without one, the call still works: Hermes answers each turn.
-                Label(status.reason ?? AppLocalization.string("No fast model is set, so Hermes answers each turn itself, which is slower to start talking."),
+                Label(status.reason ?? AppLocalization.string("No fast model is set, so Hermes answers each turn itself, which is slower to start talking.", table: .voice),
                       systemImage: status.configured ? "exclamationmark.triangle.fill" : "info.circle")
                     .scaledFont(.footnote)
                     .foregroundStyle(status.configured ? .orange : .secondary)
@@ -306,7 +385,7 @@ struct LocalLiveFrontModelSettingsView: View {
     private func save(_ value: String, for key: String) async -> Bool {
         let saved = await service.save(value: value, for: key)
         if !saved {
-            errorMessage = service.errorMessage ?? AppLocalization.string("Could not load voice settings to save this change.")
+            errorMessage = service.errorMessage ?? AppLocalization.string("Could not load voice settings to save this change.", table: .voice)
         }
         return saved
     }

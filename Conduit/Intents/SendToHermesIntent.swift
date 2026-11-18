@@ -64,10 +64,10 @@ enum ShortcutSendOutcome: Equatable {
         switch self {
         case .answered(let reply): return reply
         case .sent: return AppLocalization.string("Sent to Hermes.")
-        case .stillWorking: return AppLocalization.string("Hermes is still working on it. The answer will be in the chat in Conduit.")
-        case .needsInput: return AppLocalization.string("Hermes needs your answer. Open the chat in Conduit.")
-        case .queued: return AppLocalization.string("Hermes is busy in that chat, so it will read this when its current reply finishes.")
-        case .joinedRunningReply: return AppLocalization.string("Hermes added this to the reply already running in that chat.")
+        case .stillWorking: return AppLocalization.string("Hermes is still working on it. The answer will be in the chat in Conduit.", table: .phone)
+        case .needsInput: return AppLocalization.string("Hermes needs your answer. Open the chat in Conduit.", table: .phone)
+        case .queued: return AppLocalization.string("Hermes is busy in that chat, so it will read this when its current reply finishes.", table: .phone)
+        case .joinedRunningReply: return AppLocalization.string("Hermes added this to the reply already running in that chat.", table: .phone)
         }
     }
 }
@@ -77,11 +77,11 @@ struct ShortcutSendError: LocalizedError, Equatable {
     var errorDescription: String? { message }
 
     static var empty: ShortcutSendError {
-        ShortcutSendError(message: AppLocalization.string("There's no text to send. Give Send to Hermes a message."))
+        ShortcutSendError(message: AppLocalization.string("There's no text to send. Give Send to Hermes a message.", table: .phone))
     }
 
     static var outOfTime: ShortcutSendError {
-        ShortcutSendError(message: AppLocalization.string("Conduit ran out of time before it could send this. Nothing was sent; try again."))
+        ShortcutSendError(message: AppLocalization.string("Conduit ran out of time before it could send this. Nothing was sent; try again.", table: .phone))
     }
 
     static var notConnected: ShortcutSendError {
@@ -90,23 +90,23 @@ struct ShortcutSendError: LocalizedError, Equatable {
 
     /// The picked chat isn't on Hermes any more (deleted, or a bot removed).
     static var chatUnavailable: ShortcutSendError {
-        ShortcutSendError(message: AppLocalization.string("Conduit couldn't find that chat on Hermes, so nothing was sent. Pick another chat."))
+        ShortcutSendError(message: AppLocalization.string("Conduit couldn't find that chat on Hermes, so nothing was sent. Pick another chat.", table: .phone))
     }
 
     /// Hermes didn't confirm the picked bot's chat either way: worth a retry.
     static var chatUnconfirmed: ShortcutSendError {
-        ShortcutSendError(message: AppLocalization.string("Conduit couldn't confirm that chat on Hermes, so nothing was sent. Try again."))
+        ShortcutSendError(message: AppLocalization.string("Conduit couldn't confirm that chat on Hermes, so nothing was sent. Try again.", table: .phone))
     }
 
     /// The picked chat is on a dashboard Conduit isn't connected to.
     static var chatOnAnotherDashboard: ShortcutSendError {
-        ShortcutSendError(message: AppLocalization.string("That chat is on another Hermes dashboard. Switch to it in Conduit first, then run this again."))
+        ShortcutSendError(message: AppLocalization.string("That chat is on another Hermes dashboard. Switch to it in Conduit first, then run this again.", table: .phone))
     }
 
     /// The chat's runtime was gone and reopening it failed too: Hermes's
     /// own error ("session not found") would mean nothing to the listener.
     static var reopenFailed: ShortcutSendError {
-        ShortcutSendError(message: AppLocalization.string("Conduit couldn't reopen that chat, so nothing was sent. Open it in Conduit and try again."))
+        ShortcutSendError(message: AppLocalization.string("Conduit couldn't reopen that chat, so nothing was sent. Open it in Conduit and try again.", table: .phone))
     }
 }
 
@@ -115,6 +115,9 @@ struct ShortcutSendError: LocalizedError, Equatable {
 struct ShortcutSendBackend {
     /// Waits for the connection; false when Hermes can't be reached in time.
     var connect: @MainActor (_ deadline: Date) async -> Bool
+    /// Waits for the connection again after a step found it dropped, once
+    /// that drop has been seen; `connect` when nil.
+    var reconnect: (@MainActor (_ deadline: Date) async -> Bool)? = nil
     var activeProfile: @MainActor () -> String
     /// The picked chat as a chat to send to: a Bot Chat is its bot's chat
     /// now, found as its Bots row finds it.
@@ -228,6 +231,7 @@ struct ShortcutSender {
     var chats = ShortcutChatStore()
 
     func send(_ request: ShortcutSendRequest, deadline: Date) async throws -> ShortcutSendOutcome {
+        let drops = DropBudget()
         let text = String(request.text.trimmingCharacters(in: .whitespacesAndNewlines).prefix(Self.maximumTextLength))
         guard !text.isEmpty else { throw ShortcutSendError.empty }
         guard await backend.connect(deadline) else { throw ShortcutSendError.notConnected }
@@ -239,16 +243,19 @@ struct ShortcutSender {
         var runtimeID: String
         var reused = false
         if let picked = request.chat {
-            var target = try await backend.pickedChat(picked)
+            var target = try await overDrops(deadline, drops) { try await backend.pickedChat(picked) }
             // Never a new chat in its place: the run says the chat is gone,
             // or that Hermes couldn't be reached, which isn't the same.
             let resumed: String
             do {
-                resumed = try await backend.resumeChat(target)
+                resumed = try await overDrops(deadline, drops) { try await backend.resumeChat(target) }
             } catch is CancellationError {
                 throw CancellationError()
             } catch HermesError.notConnected, HermesError.connectionClosed, HermesError.timeout {
                 throw ShortcutSendError.notConnected
+            } catch let error as ShortcutSendError {
+                // A reconnect after a drop that didn't land.
+                throw error
             } catch {
                 throw ShortcutSendError.chatUnavailable
             }
@@ -257,15 +264,16 @@ struct ShortcutSender {
             chat = target
             runtimeID = resumed
             reused = true
-        } else if let name, var saved = chats.chat(named: name, profile: profile), let resumed = try await resume(saved),
+        } else if let name, var saved = chats.chat(named: name, profile: profile),
+                  let resumed = try await resume(saved, deadline: deadline, drops: drops),
            !resumed.isEmpty {
             saved.runtimeSessionID = resumed
             chat = saved
             runtimeID = resumed
             reused = true
         } else {
-            chat = try await backend.createChat(profile, name ?? Self.cleaned(request.newChatTitle)
-                .map { String($0.prefix(80)) } ?? Self.title(for: text))
+            let title = name ?? Self.cleaned(request.newChatTitle).map { String($0.prefix(80)) } ?? Self.title(for: text)
+            chat = try await overDrops(deadline, drops) { try await backend.createChat(profile, title) }
             runtimeID = chat.runtimeSessionID
         }
         if let name { chats.save(chat, named: name, profile: profile, at: backend.now()) }
@@ -278,7 +286,7 @@ struct ShortcutSender {
         if reused && request.waitsForAnswer { earlier = await backend.latestReply(chat) }
         let outcome: PromptSubmissionOutcome
         do {
-            outcome = try await backend.submit(chat, runtimeID, text)
+            outcome = try await overDrops(deadline, drops, unsent: true) { try await backend.submit(chat, runtimeID, text) }
         } catch let error where HermesClient.isSessionNotFoundError(error) {
             // Hermes no longer has that runtime, so nothing was sent, and the
             // reply read before the first try still marks what came before.
@@ -286,11 +294,13 @@ struct ShortcutSender {
             // before, until the chat's own resume: reopen the chat and send
             // once more.
             do {
-                runtimeID = try await backend.reopenChat(chat)
+                runtimeID = try await overDrops(deadline, drops) { try await backend.reopenChat(chat) }
             } catch is CancellationError {
                 throw CancellationError()
-            } catch HermesError.notConnected {
+            } catch HermesError.notConnected, HermesError.connectionClosed {
                 throw ShortcutSendError.notConnected
+            } catch let error as ShortcutSendError {
+                throw error
             } catch {
                 throw ShortcutSendError.reopenFailed
             }
@@ -299,7 +309,7 @@ struct ShortcutSender {
             if let name { chats.save(chat, named: name, profile: profile, at: backend.now()) }
             guard backend.now() < deadline else { throw ShortcutSendError.outOfTime }
             do {
-                outcome = try await backend.submit(chat, runtimeID, text)
+                outcome = try await overDrops(deadline, drops, unsent: true) { try await backend.submit(chat, runtimeID, text) }
             } catch let error where HermesClient.isSessionNotFoundError(error) {
                 // The reopened runtime is gone too: nothing was sent.
                 throw ShortcutSendError.reopenFailed
@@ -316,14 +326,71 @@ struct ShortcutSender {
     }
 
     /// The saved chat's runtime, or nil when Hermes no longer has it (a new
-    /// chat then takes the name). Cancellation still ends the run.
-    private func resume(_ chat: VoiceThreadTarget) async throws -> String? {
+    /// chat then takes the name). Cancellation still ends the run, and a
+    /// dropped connection is waited out: it says nothing about the chat, so
+    /// it never makes a second chat under the name.
+    private func resume(_ chat: VoiceThreadTarget, deadline: Date, drops: DropBudget) async throws -> String? {
         do {
-            return try await backend.resumeChat(chat)
+            return try await overDrops(deadline, drops) { try await backend.resumeChat(chat) }
         } catch is CancellationError {
             throw CancellationError()
+        } catch let error where Self.isDrop(error) {
+            throw ShortcutSendError.notConnected
+        } catch let error as ShortcutSendError {
+            throw error
         } catch {
             return nil
+        }
+    }
+
+    /// How many times a run reconnects after its connection dropped under
+    /// it, across all its steps.
+    static let maximumReconnects = 2
+
+    /// The reconnects a run has used, shared by its steps.
+    final class DropBudget {
+        var reconnects = 0
+    }
+
+    /// The connection dropped under a step: the socket closed, or was found
+    /// closed before the request went out.
+    static func isDrop(_ error: Error) -> Bool {
+        switch error {
+        case HermesError.connectionClosed, HermesError.notConnected: return true
+        default: return false
+        }
+    }
+
+    /// A drop found before the request went out (`rpc`'s `notConnected`):
+    /// Hermes never got it.
+    static func isUnsentDrop(_ error: Error) -> Bool {
+        if case HermesError.notConnected = error { return true }
+        return false
+    }
+
+    /// Runs `step`, and when the connection dropped under it, waits for the
+    /// reconnect and runs it again, while the run has time (issue 2473).
+    /// Off screen a run often starts on a socket iOS let die while Conduit
+    /// was suspended: it still looks open, so the first request finds it
+    /// dead, and the reconnect that follows is the one the run goes on with.
+    /// With `unsent` only a drop that kept the request from going out is
+    /// tried again (a prompt Hermes may have taken is never sent twice).
+    private func overDrops<T>(_ deadline: Date, _ drops: DropBudget, unsent: Bool = false,
+                              _ step: () async throws -> T) async throws -> T {
+        while true {
+            do {
+                return try await step()
+            } catch let error where unsent ? Self.isUnsentDrop(error) : Self.isDrop(error) {
+                // Out of time: nothing was sent, as when the wait below uses it up.
+                guard backend.now() < deadline else { throw ShortcutSendError.outOfTime }
+                guard drops.reconnects < Self.maximumReconnects else { throw error }
+                drops.reconnects += 1
+                try Task.checkCancellation()
+                guard await (backend.reconnect ?? backend.connect)(deadline) else { throw ShortcutSendError.notConnected }
+                // The wait may have used up the run: nothing more goes.
+                try Task.checkCancellation()
+                guard backend.now() < deadline else { throw ShortcutSendError.outOfTime }
+            }
         }
     }
 
@@ -401,7 +468,7 @@ struct ShortcutSender {
         let line = text.split(whereSeparator: \.isNewline).first.map(String.init) ?? text
         let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
         let short = trimmed.count > 60 ? String(trimmed.prefix(59)) + "…" : trimmed
-        return AppLocalization.string("Shortcut: \(short)")
+        return AppLocalization.string("Shortcut: \(short)", table: .phone)
     }
 
     private static func cleaned(_ value: String?) -> String? {

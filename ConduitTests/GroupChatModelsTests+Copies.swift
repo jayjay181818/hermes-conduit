@@ -94,6 +94,27 @@ extension GroupChatModelsTests {
         let unnamed = try XCTUnwrap(RoomCopiesClient.copy(copiesCopy(from: "")))
         XCTAssertNil(unnamed.room.members[0].owner)
 
+        XCTAssertEqual(copy.out, [:], "an older plugin names nobody out")
+
+        // Who's out, as the home said (plugin 0.166): out of the To row and
+        // @mentions; a reason this app predates is left as in.
+        var object = copiesCopy()
+        object["out"] = ["m-laifu": "removed", "m-nahida": "gone"]
+        let told = try XCTUnwrap(RoomCopiesClient.copy(object))
+        XCTAssertEqual(told.out, ["m-laifu": .removed])
+        XCTAssertEqual(told.room.members.map(\.out), [nil, nil, .removed])
+        XCTAssertEqual(GroupRoomRecipients.pickable(told.room.members).compactMap(\.handle), ["nahida", "kuro"])
+
+        // In it with none of your agents (Just me): read it, post in it, leave it.
+        XCTAssertFalse(told.justMe)
+        var alone = copiesCopy()
+        alone["yours"] = [[String: Any]]()
+        alone["just_me"] = true
+        let justMe = try XCTUnwrap(RoomCopiesClient.copy(alone))
+        XCTAssertTrue(justMe.justMe)
+        XCTAssertEqual(RoomLeaveText.leaveMessage(justMe), AppLocalization.string(
+            "You stop getting this room, and \(justMe.from) is told. Your copy of it stays until you delete it.", table: .rooms))
+
         XCTAssertThrowsError(try RoomCopiesClient.parseList(["ok": false, "copies": [[String: Any]]()]))
         XCTAssertThrowsError(try RoomCopiesClient.parseList(["ok": true]))
     }
@@ -105,24 +126,32 @@ extension GroupChatModelsTests {
         let host = "Furina"
         let count = 3
         let members = AppLocalization.string("\(count) members")
-        let hostedBy = AppLocalization.string("Hosted by \(host)")
-        let elsewhere = AppLocalization.string("Hosted elsewhere")
+        let hostedBy = AppLocalization.string("Hosted by \(host)", table: .rooms)
+        let elsewhere = AppLocalization.string("Hosted elsewhere", table: .rooms)
         XCTAssertEqual(try line(copiesCopy()), AppLocalization.string("\(hostedBy) · \(members)"))
-        XCTAssertEqual(try line(copiesCopy(working: true)), AppLocalization.string("Hosted by \(host) · working…"))
+        XCTAssertEqual(try line(copiesCopy(working: true)), AppLocalization.string("Hosted by \(host) · working…", table: .rooms))
         XCTAssertEqual(try line(copiesCopy(from: "")), AppLocalization.string("\(elsewhere) · \(members)"))
-        XCTAssertEqual(try line(copiesCopy(from: "", working: true)), AppLocalization.string("Hosted elsewhere · working…"))
+        XCTAssertEqual(try line(copiesCopy(from: "", working: true)), AppLocalization.string("Hosted elsewhere · working…", table: .rooms))
         XCTAssertEqual(try line(copiesCopy(status: "ended", reason: "disbanded")), AppLocalization.string("Ended"))
-        XCTAssertEqual(try line(copiesCopy(status: "left", yours: [])), AppLocalization.string("Your agents left"))
+        XCTAssertEqual(try line(copiesCopy(status: "left", yours: [])), AppLocalization.string("Your agents left", table: .rooms))
+        var leftAlone = copiesCopy(status: "left", yours: [])
+        leftAlone["just_me"] = true
+        XCTAssertEqual(try line(leftAlone), AppLocalization.string("You left", table: .rooms), "a Just me guest brought no agents")
+        // Taken out, the room goes on without them: it didn't end.
+        XCTAssertEqual(try line(copiesCopy(status: "ended", reason: "removed", yours: [])),
+                       AppLocalization.string("\(host) took your agents out", table: .rooms))
+        XCTAssertEqual(try line(copiesCopy(status: "ended", reason: "removed", from: "", yours: [])),
+                       AppLocalization.string("Your agents were taken out", table: .rooms))
         XCTAssertTrue(try XCTUnwrap(RoomCopiesClient.copy(copiesCopy(status: "ended"))).isOver)
         XCTAssertTrue(try XCTUnwrap(RoomCopiesClient.copy(copiesCopy(status: "left"))).isOver)
 
         // In the composer's place, when it can't be posted in.
         let copy = try XCTUnwrap(RoomCopiesClient.copy(copiesCopy()))
         XCTAssertEqual(RoomCopyText.readOnly(for: copy, canPost: false),
-                       AppLocalization.string("Hosted by \(host). Update the Conduit plugin on your Hermes to post in it."))
+                       AppLocalization.string("Hosted by \(host). Update the Conduit plugin on your Hermes to post in it.", table: .rooms))
         XCTAssertEqual(RoomCopyText.readOnly(for: copy, canPost: true),
-                       AppLocalization.string("Hosted by \(host). You can read it here."))
-        XCTAssertEqual(RoomCopyText.host(for: copy), AppLocalization.string("Hosted by \(host)"))
+                       AppLocalization.string("Hosted by \(host). You can read it here.", table: .rooms))
+        XCTAssertEqual(RoomCopyText.host(for: copy), AppLocalization.string("Hosted by \(host)", table: .rooms))
         XCTAssertEqual(RoomCopyText.hostName(for: copy), "Furina")
     }
 
@@ -467,8 +496,8 @@ extension GroupChatModelsTests {
         })
         XCTAssertEqual(routes.peopleReads, ["/api/plugins/conduit_push/rooms/people?room_id=conduit-5"])
         XCTAssertEqual(appState.activeRoomMembers.map(\.owner), [nil, "Mona"])
-        XCTAssertEqual(appState.activeRoomMembers.map(GroupRoomTurns.ownerLine(of:)),
-                       [AppLocalization.string("Your agent"), AppLocalization.string("Mona's agent")])
+        XCTAssertEqual(appState.activeRoomMembers.map { GroupRoomTurns.ownerLine(of: $0) },
+                       [AppLocalization.string("Your agent", table: .rooms), AppLocalization.string("Mona's agent")])
 
         // A room of only your own agents reads nobody.
         appState.closeGroupRoom()
@@ -485,11 +514,21 @@ extension GroupChatModelsTests {
         XCTAssertNil(GroupRoomTurns.shownOwner(of: members[1]), "your own agent shows no owner")
         XCTAssertNil(GroupRoomTurns.shownOwner(of: nil))
         XCTAssertEqual(GroupRoomTurns.ownerLine(of: members[0]), AppLocalization.string("Furina's agent"))
-        XCTAssertEqual(GroupRoomTurns.ownerLine(of: members[1]), AppLocalization.string("Your agent"))
+        XCTAssertEqual(GroupRoomTurns.ownerLine(of: members[1]), AppLocalization.string("Your agent", table: .rooms))
         let unnamed = try XCTUnwrap(RoomCopiesClient.copy(copiesCopy(from: ""))).room.members[0]
-        XCTAssertEqual(GroupRoomTurns.ownerLine(of: unnamed), AppLocalization.string("On another Hermes"))
+        XCTAssertEqual(GroupRoomTurns.ownerLine(of: unnamed), AppLocalization.string("On another Hermes", table: .rooms))
         // Renamed by your roster, it keeps its owner.
         XCTAssertEqual(GroupRoomTurns.members(members, namedBy: []).map(\.owner), ["Furina", nil, "Mona"])
+        // A room of only your own Hermes draws every bot as yours: no owner
+        // chip, and Group Info names the Hermes it lives on.
+        XCTAssertNil(GroupRoomTurns.shownOwner(of: members[2], ownHermes: true))
+        XCTAssertEqual(GroupRoomTurns.ownerLine(of: members[0], ownHermes: true),
+                       AppLocalization.string("Your agent, on \("Furina")", table: .rooms))
+        XCTAssertEqual(GroupRoomTurns.ownerLine(of: members[1], ownHermes: true), AppLocalization.string("Your agent", table: .rooms))
+        XCTAssertEqual(GroupRoomTurns.ownerLine(of: unnamed, ownHermes: true),
+                       AppLocalization.string("Your agent, on your other Hermes", table: .rooms))
+        XCTAssertEqual(RoomLeaveText.takeOutOwnMessage("Laifu"),
+                       AppLocalization.string("\("Laifu") stops taking part, and your other Hermes is told.", table: .rooms))
     }
 
     @MainActor
@@ -535,7 +574,7 @@ extension GroupChatModelsTests {
         let copy = try XCTUnwrap(appState.linkedRoomCopyRows.first)
 
         let result = await appState.deleteLinkedRoomCopy(copy)
-        XCTAssertEqual(result, .refused(AppLocalization.string("Could not delete this room: \(CopiesRoutes.going)")))
+        XCTAssertEqual(result, .refused(AppLocalization.string("Could not delete this room: \(CopiesRoutes.going)", table: .rooms)))
         XCTAssertEqual(routes.deletes.count, 1, "the copy isn't deleted after a refusal")
         XCTAssertEqual(appState.linkedRoomCopyRows.map(\.id), [copy.id])
     }

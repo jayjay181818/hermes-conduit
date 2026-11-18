@@ -45,6 +45,9 @@ final class GPTLiveSession {
     private(set) var greetingApplied = false
     /// The path the host confirmed it billed this call on.
     private(set) var billing: GPTLiveBilling = .subscription
+    /// Whether the host answered this call's session request, so `billing`
+    /// is the path it confirmed rather than the default.
+    private var answered = false
     /// The event set the call speaks: the GA events on the API key or on
     /// Codex's GA endpoint, else the frameless ones (issue 2236).
     private(set) var dialect: GPTLiveProtocol.Dialect = .frameless
@@ -118,6 +121,7 @@ final class GPTLiveSession {
         self.initialCaptureAuthorization = initialCaptureAuthorization
         sessionID = nil
         billing = .subscription
+        answered = false
         dialect = .frameless
         turns = GPTLiveProtocol.TurnAssembler()
         state = .connecting
@@ -223,6 +227,7 @@ final class GPTLiveSession {
             onTrace?(Self.answerStep(answer))
             sessionID = answer.sessionID
             billing = answer.billing
+            answered = true
             dialect = GPTLiveProtocol.Dialect(answer.billing, gaEvents: answer.gaEvents)
             // Codex's GA endpoint drops the instructions the request
             // carried (its session.started brings its own), so whatever the
@@ -247,8 +252,19 @@ final class GPTLiveSession {
             guard let self, self.isCurrent(peer), self.state == .connecting else { return }
             gptLiveLogger.error("GPT-Live never reported session.started")
             self.onTrace?("No session.started in time")
-            self.fail(AppLocalization.string("GPT-Live didn't start the conversation. Try again."))
+            self.fail(Self.notStartedMessage(voice: self.voice, billing: self.billing))
         }
+    }
+
+    /// Why a call never started. On the ChatGPT plan a voice the account
+    /// doesn't offer gets its offer answered and then never connects, so a
+    /// chosen voice is named as a likely cause (issue 2388).
+    nonisolated static func notStartedMessage(voice: String?, billing: GPTLiveBilling) -> String {
+        guard billing == .subscription, let voice, !voice.isEmpty else {
+            return AppLocalization.string("GPT-Live didn't start the conversation. Try again.", table: .voice)
+        }
+        let name = GPTLiveVoice.displayName(voice)
+        return AppLocalization.string("GPT-Live didn't start the conversation. If your ChatGPT plan doesn't offer the voice \(name), pick another in GPT-Live's settings.", table: .voice)
     }
 
     /// True for a ChatGPT-plan call on Codex's GA endpoint, which replaces
@@ -262,11 +278,11 @@ final class GPTLiveSession {
     nonisolated static func voiceNote(requested: String?, applied: String?) -> String? {
         guard let requested, !requested.isEmpty else { return nil }
         guard let applied else {
-            return PluginUpdateAsk.text(AppLocalization.string("The Conduit plugin on your Hermes server didn't confirm the voice you chose. Update the plugin to pick a voice."),
-                                        lead: AppLocalization.string("The Conduit plugin on your Hermes server didn't confirm the voice you chose."))
+            return PluginUpdateAsk.text(AppLocalization.string("The Conduit plugin on your Hermes server didn't confirm the voice you chose. Update the plugin to pick a voice.", table: .voice),
+                                        lead: AppLocalization.string("The Conduit plugin on your Hermes server didn't confirm the voice you chose.", table: .voice))
         }
         guard applied.lowercased() != requested.lowercased() else { return nil }
-        return AppLocalization.string("Your Hermes server used the voice \(applied) instead of \(requested).")
+        return AppLocalization.string("Your Hermes server used the voice \(applied) instead of \(requested).", table: .voice)
     }
 
     // MARK: Call trace
@@ -358,8 +374,8 @@ final class GPTLiveSession {
             onTrace?("GPT-Live error\(Self.traceCode(code).map { ": \($0)" } ?? "")")
             if state == .connecting {
                 fail(message.isEmpty
-                    ? AppLocalization.string("GPT-Live didn't start the conversation. Try again.")
-                    : AppLocalization.string("GPT-Live refused the conversation: \(message)"))
+                    ? AppLocalization.string("GPT-Live didn't start the conversation. Try again.", table: .voice)
+                    : AppLocalization.string("GPT-Live refused the conversation: \(message)", table: .voice))
                 return
             }
         case .sessionClosed:
@@ -399,7 +415,11 @@ final class GPTLiveSession {
         guard state == .ready || state == .connecting else { return }
         gptLiveLogger.notice("GPT-Live connection lost")
         onTrace?("Connection lost")
-        fail(AppLocalization.string("The GPT-Live connection was lost."))
+        // A call that never started is the same failure as the start watchdog's.
+        // Before the answer the billing is only the default: no voice is named.
+        fail(state == .connecting && answered
+            ? Self.notStartedMessage(voice: voice, billing: billing)
+            : AppLocalization.string("The GPT-Live connection was lost.", table: .voice))
     }
 
     private func fail(_ message: String) {

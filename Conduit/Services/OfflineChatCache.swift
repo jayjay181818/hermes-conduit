@@ -44,6 +44,9 @@ struct OfflineCachedMessage: Codable, Equatable {
     /// equals the one drawn from the copy and isn't drawn again. Rows saved
     /// before it was kept have none.
     let rowId: Int?
+    /// A finished-agents notice's results (issue 1553). Rows saved before
+    /// it was kept have none and show the plain notice.
+    let delegationReport: DelegationReport?
 
     static let storableRoles: Set<MessageRole> = [.user, .assistant, .reasoning, .system, .tool]
 
@@ -64,6 +67,7 @@ struct OfflineCachedMessage: Codable, Equatable {
         reactions = message.reactions.isEmpty ? nil : message.reactions
         stepDuration = message.stepDuration
         rowId = message.rowId
+        delegationReport = message.delegationReport
     }
 
     var chatMessage: ChatMessage {
@@ -84,6 +88,7 @@ struct OfflineCachedMessage: Codable, Equatable {
             reactions: reactions ?? []
         )
         message.stepDuration = stepDuration
+        message.delegationReport = delegationReport
         return message
     }
 }
@@ -758,6 +763,7 @@ final class OfflineChatCacheStore {
         title: String,
         messages: [ChatMessage],
         sessions: [SessionSummary],
+        becomesLastOpened: Bool = true,
         now: Date = Date()
     ) {
         let rows = Self.keptRows(of: messages)
@@ -778,6 +784,7 @@ final class OfflineChatCacheStore {
                 identities: identities,
                 title: title,
                 catalogRows: catalogRows,
+                becomesLastOpened: becomesLastOpened,
                 now: now
             )
         }
@@ -791,6 +798,7 @@ final class OfflineChatCacheStore {
         identities: Set<String>,
         title: String,
         catalogRows: [OfflineCachedSession],
+        becomesLastOpened: Bool = true,
         now: Date
     ) {
         var snapshot = load(dashboardID: dashboardID, profile: profile)
@@ -828,7 +836,11 @@ final class OfflineChatCacheStore {
                 previouslySaved: snapshot.sessions
             )
         }
-        snapshot.lastSessionID = sessionID
+        // A chat followed in the background (BackgroundChat) saves its copy
+        // without becoming the one a cold launch shows first.
+        if becomesLastOpened {
+            snapshot.lastSessionID = sessionID
+        }
         // The same chat left again with nothing new: nothing to write, but a
         // copy an earlier failed index write left behind still goes.
         if snapshot != saved {

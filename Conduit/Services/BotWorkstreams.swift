@@ -225,12 +225,12 @@ struct BotWorkItem: Identifiable, Equatable {
         switch kind {
         case .askOut:
             switch status {
-            case "waiting": return AppLocalization.string("Waiting on \(otherBot)")
-            case "done": return AppLocalization.string("\(otherBot) answered")
+            case "waiting": return AppLocalization.string("Waiting on \(otherBot)", table: .bots)
+            case "done": return AppLocalization.string("\(otherBot) answered", table: .bots)
             default: return Self.statusWord(status)
             }
         case .askIn:
-            return status == "done" ? AppLocalization.string("Answered") : AppLocalization.string("\(otherBot) asks")
+            return status == "done" ? AppLocalization.string("Answered") : AppLocalization.string("\(otherBot) asks", table: .bots)
         case .workstream:
             return Self.statusWord(status)
         }
@@ -246,7 +246,7 @@ struct BotWorkItem: Identifiable, Equatable {
         case "failed": return AppLocalization.string("Failed")
         case "stopped": return AppLocalization.string("Stopped")
         case "interrupted": return AppLocalization.string("Interrupted")
-        case "waiting": return AppLocalization.string("Waiting")
+        case "waiting": return AppLocalization.string("Waiting", table: .bots)
         default: return status
         }
     }
@@ -270,11 +270,11 @@ struct BotWorkCoordination: Equatable {
         /// Who said it, for the line above its words.
         var saidBy: String {
             switch kind {
-            case "found": return AppLocalization.string("\(ref) found")
-            case "assumes": return AppLocalization.string("\(ref) relies on")
-            case "changed": return AppLocalization.string("\(ref) changed")
-            case "user": return AppLocalization.string("You told \(ref)")
-            default: return AppLocalization.string("Noticed about \(ref)")
+            case "found": return AppLocalization.string("\(ref) found", table: .bots)
+            case "assumes": return AppLocalization.string("\(ref) relies on", table: .bots)
+            case "changed": return AppLocalization.string("\(ref) changed", table: .bots)
+            case "user": return AppLocalization.string("You told \(ref)", table: .bots)
+            default: return AppLocalization.string("Noticed about \(ref)", table: .bots)
             }
         }
     }
@@ -300,9 +300,12 @@ struct BotWorkCoordination: Equatable {
         /// A send's state: "delivered", "waiting" or "not_arrived".
         let state: String
         /// A proposal's: "open", "approved" or "declined", and the user's words.
-        let status: String
+        private(set) var status: String
         let answer: String
         let why: [Line]
+        /// An open question the user can answer on its card (plugin
+        /// 0.168.0+ takes Approve and Decline for it).
+        private(set) var canAnswer: Bool
 
         init?(row: [String: Any]) {
             guard let id = row["id"] as? String, !id.isEmpty,
@@ -322,6 +325,8 @@ struct BotWorkCoordination: Equatable {
             state = row["state"] as? String ?? ""
             status = row["status"] as? String ?? ""
             answer = row["answer"] as? String ?? ""
+            let actions = row["actions"] as? [String] ?? []
+            canAnswer = kind == .proposal && status == "open" && actions.contains("approve") && actions.contains("decline")
             why = (row["why"] as? [[String: Any]] ?? []).enumerated().compactMap { index, line in
                 guard let text = line["text"] as? String, !text.isEmpty,
                       let at = (line["at"] as? NSNumber)?.doubleValue else { return nil }
@@ -330,16 +335,24 @@ struct BotWorkCoordination: Equatable {
             }
         }
 
+        /// The question as the user's tap answered it.
+        func answered(approved: Bool) -> Item {
+            var copy = self
+            copy.status = approved ? "approved" : "declined"
+            copy.canAnswer = false
+            return copy
+        }
+
         /// What happened, in a line.
         var headline: String {
             switch kind {
             case .flag:
-                return AppLocalization.string("\(ref) may affect \(with.joined(separator: ", "))")
+                return AppLocalization.string("\(ref) may affect \(with.joined(separator: ", "))", table: .bots)
             case .sent:
-                return AppLocalization.string("Sent to \(ref)")
+                return AppLocalization.string("Sent to \(ref)", table: .bots)
             case .proposal:
                 let about = refs.joined(separator: ", ")
-                return about.isEmpty ? AppLocalization.string("Asked you") : AppLocalization.string("Asked you about \(about)")
+                return about.isEmpty ? AppLocalization.string("Asked you", table: .bots) : AppLocalization.string("Asked you about \(about)", table: .bots)
             }
         }
 
@@ -347,18 +360,18 @@ struct BotWorkCoordination: Equatable {
         var stateText: String? {
             switch kind {
             case .flag:
-                return woke ? nil : AppLocalization.string("Kept on the board")
+                return woke ? nil : AppLocalization.string("Kept on the board", table: .bots)
             case .sent:
                 switch state {
-                case "delivered": return AppLocalization.string("In its chat")
-                case "not_arrived": return AppLocalization.string("Didn’t arrive")
-                default: return AppLocalization.string("Not in its chat yet")
+                case "delivered": return AppLocalization.string("In its chat", table: .bots)
+                case "not_arrived": return AppLocalization.string("Didn’t arrive", table: .bots)
+                default: return AppLocalization.string("Not in its chat yet", table: .bots)
                 }
             case .proposal:
                 switch status {
-                case "approved": return AppLocalization.string("You approved")
+                case "approved": return AppLocalization.string("You approved", table: .bots)
                 case "declined": return AppLocalization.string("You declined")
-                default: return AppLocalization.string("No answer yet")
+                default: return AppLocalization.string("No answer yet", table: .bots)
                 }
             }
         }
@@ -366,8 +379,8 @@ struct BotWorkCoordination: Equatable {
         /// What the lines behind it are, said above them.
         func whyCaption(botName: String) -> String? {
             switch kind {
-            case .flag: return AppLocalization.string("What a helper model read while the work ran.")
-            case .sent: return AppLocalization.string("What was on \(botName)’s board in the half hour before.")
+            case .flag: return AppLocalization.string("What a helper model read while the work ran.", table: .bots)
+            case .sent: return AppLocalization.string("What was on \(botName)’s board in the half hour before.", table: .bots)
             case .proposal: return nil
             }
         }
@@ -375,7 +388,18 @@ struct BotWorkCoordination: Equatable {
 
     /// "ask" or "auto"; "off" lists nothing.
     let mode: String
-    let items: [Item]
+    private(set) var items: [Item]
+
+    /// What the Bot Chat asked the user and still waits on, which they can
+    /// answer here, oldest first: the Work panel shows them above the work.
+    var openQuestions: [Item] { items.filter(\.canAnswer).sorted { $0.at < $1.at } }
+
+    /// The list with one question as the user's tap answered it.
+    func answering(_ id: String, approved: Bool) -> BotWorkCoordination {
+        var copy = self
+        copy.items = items.map { $0.id == id ? $0.answered(approved: approved) : $0 }
+        return copy
+    }
 
     init?(_ response: [String: Any]?) {
         guard let response, let mode = response["mode"] as? String else { return nil }
@@ -393,7 +417,12 @@ struct BotWorkSnapshot: Equatable {
     let botName: String
     var items: [BotWorkItem]
     private(set) var workingCount: Int
+    /// What waits on the user: workstreams that need them, and the
+    /// questions the Bot Chat asked and waits on (`questionCount`).
     private(set) var needsYouCount: Int
+    /// Open questions the user can answer on their cards (plugin 0.168.0+
+    /// counts them); they're part of `needsYouCount`.
+    private(set) var questionCount: Int
     private(set) var readyCount: Int
     private(set) var resolvedCount: Int
     /// Every workstream's chat the plugin knows, resolved ones too.
@@ -403,7 +432,15 @@ struct BotWorkSnapshot: Equatable {
     let screen: BotScreenUse?
     /// What the Bot Chat did to keep the work in step; nil from a plugin
     /// before the list (0.155).
-    let coordination: BotWorkCoordination?
+    private(set) var coordination: BotWorkCoordination?
+    /// How many background agents the Bot Chat itself started that still
+    /// run (a Bot Chat on Everything Here, or with its workstreams off,
+    /// delegates itself); 0 from a plugin before the count (app issue 2206).
+    let botChatAgentCount: Int
+    /// Shown from the phone's copy of an earlier read while the plugin is
+    /// asked again: its counts may be old, so the read that follows isn't
+    /// news (no finish ripple for what came back before it).
+    var isKept = false
 
     init?(response: [String: Any], profile: String) {
         guard response["ok"] as? Bool == true, let rows = response["work"] as? [[String: Any]] else { return nil }
@@ -413,12 +450,14 @@ struct BotWorkSnapshot: Equatable {
         items = rows.compactMap(BotWorkItem.init(row:))
         let counts = response["counts"] as? [String: Any] ?? [:]
         workingCount = (counts["working"] as? NSNumber)?.intValue ?? 0
-        needsYouCount = (counts["needs_you"] as? NSNumber)?.intValue ?? 0
+        questionCount = max(0, (counts["questions"] as? NSNumber)?.intValue ?? 0)
+        needsYouCount = ((counts["needs_you"] as? NSNumber)?.intValue ?? 0) + questionCount
         readyCount = (counts["ready"] as? NSNumber)?.intValue ?? 0
         resolvedCount = (response["resolved_count"] as? NSNumber)?.intValue ?? 0
         knownSessionIDs = Set((response["workstream_sessions"] as? [String] ?? []).filter { !$0.isEmpty })
         screen = BotScreenUse(response["screen"] as? [String: Any])
         coordination = BotWorkCoordination(response["coordination"] as? [String: Any])
+        botChatAgentCount = max(0, (response["bot_chat_agents"] as? NSNumber)?.intValue ?? 0)
     }
 
     var isOn: Bool { policy != "off" }
@@ -441,6 +480,19 @@ struct BotWorkSnapshot: Equatable {
         copy.workingCount = max(0, workingCount - Self.counts(old, "working") + Self.counts(item, "working"))
         copy.needsYouCount = max(0, needsYouCount - Self.counts(old, "needs_you") + Self.counts(item, "needs_you"))
         copy.readyCount = max(0, readyCount - Self.counts(old, "ready") + Self.counts(item, "ready"))
+        return copy
+    }
+
+    /// The list with a question as the user's tap answered it: it stops
+    /// waiting on them at once, as the plugin counts it.
+    func answering(_ id: String, approved: Bool) -> BotWorkSnapshot {
+        guard let coordination, coordination.items.contains(where: { $0.id == id && $0.canAnswer }) else { return self }
+        var copy = self
+        copy.coordination = coordination.answering(id, approved: approved)
+        if questionCount > 0 {
+            copy.questionCount = questionCount - 1
+            copy.needsYouCount = max(0, needsYouCount - 1)
+        }
         return copy
     }
 
@@ -473,7 +525,11 @@ struct BotWorkSnapshot: Equatable {
     /// The panel's sections: what the user pinned, then work still at it
     /// or waiting on them, then the rest, newest change first.
     var pinned: [BotWorkItem] { items.filter(\.isPinned) }
-    var active: [BotWorkItem] { items.filter { $0.isActive && !$0.isPinned } }
+    /// What waits on the user comes first, each group in the list's order.
+    var active: [BotWorkItem] {
+        let shown = items.filter { $0.isActive && !$0.isPinned }
+        return shown.filter(\.needsYou) + shown.filter { !$0.needsYou }
+    }
     var recent: [BotWorkItem] { items.filter { !$0.isActive && !$0.isPinned } }
 
     /// Every workstream's chat, so lists and search leave them to the bot.
@@ -493,9 +549,9 @@ struct BotWorkSnapshot: Equatable {
     /// or nil when there's no work to show.
     var stripText: String? {
         var parts: [String] = []
-        if workingCount > 0 { parts.append(AppLocalization.string("\(workingCount) working")) }
-        if needsYouCount > 0 { parts.append(AppLocalization.string("\(needsYouCount) needs you")) }
-        if readyCount > 0 { parts.append(AppLocalization.string("\(readyCount) ready")) }
+        if workingCount > 0 { parts.append(AppLocalization.string("\(workingCount) working", table: .bots)) }
+        if needsYouCount > 0 { parts.append(AppLocalization.string("\(needsYouCount) needs you", table: .bots)) }
+        if readyCount > 0 { parts.append(AppLocalization.string("\(readyCount) ready", table: .bots)) }
         // Resolved work alone still opens the panel, for its Resolved list.
         if parts.isEmpty, !items.isEmpty || resolvedCount > 0 { return AppLocalization.string("Work") }
         return parts.isEmpty ? nil : parts.joined(separator: " · ")
@@ -610,6 +666,18 @@ final class BotWorkstreamsClient {
         let response = try await request(path, "POST", body)
         guard response["ok"] as? Bool == true else { throw Failure.malformed }
         return (response["work"] as? [String: Any]).flatMap(BotWorkItem.init(row:))
+    }
+
+    /// The user's own answer to a question the Bot Chat asked them (`id`:
+    /// P1), tapped on its card: the plugin keeps it, and on a yes tells the
+    /// Bot Chat, which goes ahead.
+    @MainActor
+    func answer(question id: String, approved: Bool) async throws {
+        guard let encoded = DashboardPath.encodedQueryComponent(id) else { throw Failure.malformed }
+        let path = DashboardPath.withProfile("\(Self.path)/\(encoded)/\(approved ? "approve" : "decline")",
+                                             profile: profile, parameter: parameter)
+        let response = try await request(path, "POST", [:])
+        guard response["ok"] as? Bool == true else { throw Failure.malformed }
     }
 }
 
@@ -807,7 +875,7 @@ final class BotWorkSettingsClient {
 }
 
 /// A Bot Chat's work tool call, as its transcript card shows it ("Started
-/// W3: Login bug", "Asked Nahida"). A model behind Tool Search calls the
+/// W3: Login bug", "Asked Nahida", "Told Nahida"). A model behind Tool Search calls the
 /// tools through `tool_call`, which names the tool and its arguments.
 struct BotWorkCall: Equatable {
     enum Tool: String {
@@ -819,8 +887,10 @@ struct BotWorkCall: Equatable {
         case list = "work_list"
         case ask = "work_ask"
         case reply = "work_reply"
+        case tell = "work_tell"
         case note = "work_note"
         case progress = "work_progress"
+        case propose = "work_propose"
     }
 
     let tool: Tool
@@ -837,6 +907,8 @@ struct BotWorkCall: Equatable {
     let profile: String?
     /// False when the answer says nothing was done.
     let succeeded: Bool
+    /// A work_propose call that records the user's answer, not a question.
+    var answered = false
 
     static let scanLimit = 64 * 1024
 
@@ -873,7 +945,8 @@ struct BotWorkCall: Equatable {
             sessionID: text("link", answer).flatMap(sessionID(inLink:)),
             profile: text("link", answer).flatMap(profile(inLink:)),
             // An answer that can't be read keeps the step's own words.
-            succeeded: answer["ok"] as? Bool ?? !answer.isEmpty
+            succeeded: answer["ok"] as? Bool ?? !answer.isEmpty,
+            answered: tool == .propose && text("answer", arguments) != nil
         )
     }
 
@@ -882,8 +955,8 @@ struct BotWorkCall: Equatable {
         let ref = self.ref ?? ""
         if running {
             switch tool {
-            case .start: return AppLocalization.string("Starting work…")
-            case .ask: return bot.map { AppLocalization.string("Asking \($0)…") }
+            case .start: return AppLocalization.string("Starting work…", table: .bots)
+            case .ask: return bot.map { AppLocalization.string("Asking \($0)…", table: .bots) }
             default: return nil
             }
         }
@@ -893,12 +966,15 @@ struct BotWorkCall: Equatable {
             guard !ref.isEmpty else { return nil }
             let named = title.map { "\(ref): \($0)" } ?? ref
             return AppLocalization.string("Started \(named)")
-        case .send: return ref.isEmpty ? nil : AppLocalization.string("Sent to \(ref)")
-        case .stop: return ref.isEmpty ? nil : AppLocalization.string("Stopped \(ref)")
-        case .read: return ref.isEmpty ? nil : AppLocalization.string("Read \(ref)")
-        case .close: return ref.isEmpty ? nil : AppLocalization.string("Closed \(ref)")
-        case .ask: return bot.map { AppLocalization.string("Asked \($0)") }
-        case .reply: return ref.isEmpty ? nil : AppLocalization.string("Answered \(ref)")
+        case .send: return ref.isEmpty ? nil : AppLocalization.string("Sent to \(ref)", table: .bots)
+        case .stop: return ref.isEmpty ? nil : AppLocalization.string("Stopped \(ref)", table: .bots)
+        case .read: return ref.isEmpty ? nil : AppLocalization.string("Read \(ref)", table: .bots)
+        case .close: return ref.isEmpty ? nil : AppLocalization.string("Closed \(ref)", table: .bots)
+        case .ask: return bot.map { AppLocalization.string("Asked \($0)", table: .bots) }
+        case .reply: return ref.isEmpty ? nil : AppLocalization.string("Answered \(ref)", table: .bots)
+        case .tell: return bot.map { AppLocalization.string("Told \($0)", table: .bots) }
+        case .propose: return answered ? AppLocalization.string("Kept your answer", table: .bots)
+            : AppLocalization.string("Asked you", table: .bots)
         case .list, .note, .progress: return nil
         }
     }

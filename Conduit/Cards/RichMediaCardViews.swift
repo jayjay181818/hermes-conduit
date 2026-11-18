@@ -194,6 +194,8 @@ private struct RichMediaViewer: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.openURL) private var openURL
     @State private var player: AVPlayer?
+    @State private var resumes: AnyCancellable?
+    @State private var itemFailure: AnyCancellable?
 
     var body: some View {
         NavigationStack {
@@ -241,9 +243,46 @@ private struct RichMediaViewer: View {
             RichAudioPlayer.preparePlayback()
             let player = AVPlayer(url: item.url)
             self.player = player
+            // The lease follows the video: playing (again, after a pause or
+            // an interruption) takes it, and a pause, the end of the video
+            // or a failed load hands the audio back while the sheet stays
+            // up, so wake listening only steps aside while it plays.
+            resumes = player.publisher(for: \.timeControlStatus)
+                .dropFirst()
+                .removeDuplicates()
+                .receive(on: DispatchQueue.main)
+                .sink { status in
+                    MainActor.assumeIsolated {
+                        switch status {
+                        case .playing: RichAudioPlayer.preparePlayback()
+                        case .paused: RichAudioPlayer.endPlayback()
+                        default: break
+                        }
+                    }
+                }
+            // A load AVFoundation refuses outright may never leave
+            // `.paused`, so the item failing hands the audio back too.
+            itemFailure = player.currentItem?.publisher(for: \.status)
+                .filter { $0 == .failed }
+                .receive(on: DispatchQueue.main)
+                .sink { _ in MainActor.assumeIsolated { RichAudioPlayer.endPlayback() } }
             player.play()
         }
         .onDisappear {
+            resumes = nil
+            itemFailure = nil
+            guard let player else { return }
+            player.pause()
+            RichAudioPlayer.endPlayback()
+        }
+        // A call or Siri taking the audio pauses the video and lets its
+        // lease go, as it ends the audio row's item, so wake listening
+        // isn't held off while the sheet stays up.
+        .onReceive(
+            NotificationCenter.default.publisher(for: .audioSessionInterruption)
+                .filter { AudioSessionInterruption($0) == .began }
+                .receive(on: DispatchQueue.main)
+        ) { _ in
             guard let player else { return }
             player.pause()
             RichAudioPlayer.endPlayback()
@@ -292,10 +331,12 @@ final class RichAudioPlayer: ObservableObject {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in MainActor.assumeIsolated { if self?.playing == url { self?.stop() } } }
             .store(in: &endings)
-        NotificationCenter.default.publisher(for: AVAudioSession.interruptionNotification)
-            .filter { ($0.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt) == AVAudioSession.InterruptionType.began.rawValue }
+        // An interruption ends the item and lets its lease go, so nothing
+        // keeps holding the session (wake listening waits on that).
+        NotificationCenter.default.publisher(for: .audioSessionInterruption)
+            .filter { AudioSessionInterruption($0) == .began }
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] _ in MainActor.assumeIsolated { if self?.playing == url { self?.stop(endingSession: false) } } }
+            .sink { [weak self] _ in MainActor.assumeIsolated { if self?.playing == url { self?.stop() } } }
             .store(in: &endings)
         self.player = player
         playing = url
@@ -304,25 +345,28 @@ final class RichAudioPlayer: ObservableObject {
         player.play()
     }
 
-    /// Whether a call, a voice conversation or Read Aloud holds the audio
-    /// session, which a card then plays within and leaves alone.
-    private static var sessionIsOwnedElsewhere: Bool {
-        let coordinator = VoiceAudioSessionCoordinator.shared
-        return coordinator.appliedPolicy != nil || coordinator.isInNativeCall
-            || AVAudioSession.sharedInstance().category == .playAndRecord
-    }
+    /// The card media's hold on the audio session, one for the audio row
+    /// and the video player alike (one plays at a time). The coordinator
+    /// decides: alone it pauses other apps' media, as a player does; under
+    /// a call, a voice conversation or Read Aloud it plays within theirs and
+    /// changes nothing (issue 826).
+    private static var lease: VoiceAudioLease?
 
     /// Media plays even with the ringer switch off, as a player does.
+    /// Dictation or a voice message taking the microphone stops the audio
+    /// row, as it pauses a voice clip, so the recording never hears it.
     static func preparePlayback() {
-        guard !sessionIsOwnedElsewhere else { return }
-        VoiceAudioSessionCoordinator.shared.activateForCardPlayback()
+        guard lease == nil else { return }
+        lease = try? VoiceAudioSessionCoordinator.shared.acquire(.mediaPlayback) {
+            RichAudioPlayer.shared.stop()
+        }
     }
 
     /// Hands the audio back to whatever the card's media paused.
     static func endPlayback() {
-        let session = AVAudioSession.sharedInstance()
-        guard !sessionIsOwnedElsewhere, session.category == .playback else { return }
-        VoiceAudioSessionCoordinator.shared.deactivateAfterCardPlayback()
+        guard let lease else { return }
+        Self.lease = nil
+        VoiceAudioSessionCoordinator.shared.release(lease)
     }
 
     /// `endingSession` false: another item starts right away.
@@ -507,8 +551,8 @@ private struct RichPersonRow: View {
                 .ignoresSafeArea()
         }
         .sheet(isPresented: $composesText) {
-            if let dialable = person.dialable, let message = person.message {
-                RichTextComposeSheet(recipient: dialable, body: message) { result in
+            if let recipient = person.textRecipient, let message = person.message {
+                RichTextComposeSheet(recipient: recipient, body: message) { result in
                     guard result == .sent else { return }
                     textSent = true
                     UIAccessibility.post(notification: .announcement, argument: AppLocalization.string("Sent"))
@@ -521,14 +565,14 @@ private struct RichPersonRow: View {
     /// Messages filled in with Hermes' text, for the user to send. Without
     /// Messages here (an iPad with iMessage off), the text is copied and
     /// Messages opened for them to paste it.
-    private func sendText(to dialable: String, message: String) {
+    private func sendText(to recipient: String, message: String) {
         if MFMessageComposeViewController.canSendText() {
             composesText = true
         } else {
             UIPasteboard.general.string = message
             textCopied = true
             UIAccessibility.post(notification: .announcement, argument: AppLocalization.string("Copied"))
-            if let url = URL(string: "sms:\(dialable)") { openURL(url) }
+            if let url = RichPerson.smsURL(recipient) { openURL(url) }
         }
     }
 
@@ -562,13 +606,13 @@ private struct RichPersonRow: View {
     private var actions: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 8) {
-                if let dialable = person.dialable {
-                    if let message = person.message {
-                        RichPersonAction(title: textSent ? Text("Sent") : textCopied ? Text("Copied") : Text("Send text"),
-                                         symbol: textSent ? "checkmark" : "paperplane.fill", prominent: true) {
-                            sendText(to: dialable, message: message)
-                        }
+                if let recipient = person.textRecipient, let message = person.message {
+                    RichPersonAction(title: textSent ? Text("Sent") : textCopied ? Text("Copied") : Text("Send text"),
+                                     symbol: textSent ? "checkmark" : "paperplane.fill", prominent: true) {
+                        sendText(to: recipient, message: message)
                     }
+                }
+                if let dialable = person.dialable {
                     if let url = URL(string: "tel:\(dialable)") {
                         RichPersonAction(title: Text("Call"), symbol: "phone.fill") { openURL(url) }
                     }
@@ -615,8 +659,8 @@ private struct RichPersonAction: View {
     }
 }
 
-/// The system's Messages composer, filled in with the number and Hermes'
-/// text. Only the user's tap on Send sends it.
+/// The system's Messages composer, filled in with the number (or the email,
+/// for iMessage) and Hermes' text. Only the user's tap on Send sends it.
 private struct RichTextComposeSheet: UIViewControllerRepresentable {
     let recipient: String
     let body: String

@@ -82,7 +82,7 @@ struct GatewayDiagnosticsSheet: View {
                             Image(systemName: "arrow.clockwise")
                         }
                     }
-                    .accessibilityLabel(AppLocalization.string("Refresh gateway diagnostics"))
+                    .accessibilityLabel(AppLocalization.string("Refresh gateway diagnostics", table: .chat))
                 }
             }
         }
@@ -122,16 +122,16 @@ struct GatewayDiagnosticsSheet: View {
         let diagnostics = appState.gatewayDiagnostics
         let running = diagnostics?.gatewayRunning ?? appState.isConnected
         return ConduitSettingsSection(title: running ? AppLocalization.string("Connected") : AppLocalization.string("Disconnected"), symbol: "radio", tint: running ? .green : .red) {
-            SettingsMetricRow(label: AppLocalization.string("Gateway"), value: diagnostics?.gatewayState ?? (running ? AppLocalization.string("Online") : AppLocalization.string("Unavailable")))
+            SettingsMetricRow(label: AppLocalization.string("Gateway"), value: diagnostics?.gatewayState ?? (running ? AppLocalization.string("Online", table: .chat) : AppLocalization.string("Unavailable")))
             if let version = diagnostics?.version { SettingsMetricRow(label: AppLocalization.string("Version"), value: version) }
-            if let pid = diagnostics?.pid { SettingsMetricRow(label: AppLocalization.string("Process"), value: AppLocalization.string("PID \(String(pid))")) }
+            if let pid = diagnostics?.pid { SettingsMetricRow(label: AppLocalization.string("Process", table: .chat), value: AppLocalization.string("PID \(String(pid))", table: .chat)) }
             if let error = diagnostics?.error {
                 Text(error).scaledFont(.footnote).foregroundStyle(.red)
             }
             GatewayRestartStatusView()
             if !running && !appState.activeGatewayRestart.isInProgress {
                 Button { Task { await appState.reconnect() } } label: {
-                    Label(AppLocalization.string("Retry connection"), systemImage: "arrow.clockwise")
+                    Label(AppLocalization.string("Retry connection", table: .chat), systemImage: "arrow.clockwise")
                         .scaledFont(.subheadline.weight(.semibold))
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 6).frame(minHeight: 44)
@@ -145,7 +145,7 @@ struct GatewayDiagnosticsSheet: View {
     /// numbers someone on a slow network can paste into an issue. The report
     /// itself is an English diagnostic log, like the gateway logs below.
     private var lastConnection: some View {
-        ConduitSettingsSection(title: AppLocalization.string("Last connection"), symbol: "stopwatch", tint: .conduitAccent) {
+        ConduitSettingsSection(title: AppLocalization.string("Last connection", table: .chat), symbol: "stopwatch", tint: .conduitAccent) {
             // The timeline isn't @Published, so recording a step re-renders
             // nothing. Re-read it every second while this sheet is open, so
             // steps still landing during a slow start show up, and Copy takes
@@ -221,7 +221,7 @@ struct GatewayDiagnosticsSheet: View {
     }
 
     private var logs: some View {
-        ConduitSettingsSection(title: AppLocalization.string("Recent gateway logs"), symbol: "text.alignleft", tint: .conduitAccent) {
+        ConduitSettingsSection(title: AppLocalization.string("Recent gateway logs", table: .chat), symbol: "text.alignleft", tint: .conduitAccent) {
             let lines = appState.gatewayDiagnostics?.logs ?? []
             if lines.isEmpty {
                 Text("No gateway log lines were returned.").scaledFont(.footnote).foregroundStyle(.secondary)
@@ -273,6 +273,9 @@ struct WorkspaceSheet: View {
 struct DelegateAgentsSheet: View {
     @ObservedObject var appLanguage = AppLanguageStore.shared
     @EnvironmentObject private var appState: AppState
+    /// The chat's background processes; nil until read, or when Hermes
+    /// can't say (then the section is left out).
+    @State private var processes: [BackgroundProcess]?
 
     var body: some View {
         NavigationStack {
@@ -291,8 +294,23 @@ struct DelegateAgentsSheet: View {
                                 DelegateAgentCard(agent: agent)
                             }
                         }
+                        // Hermes Desktop's /agents lists these beside the
+                        // agents: servers, watchers and builds left running.
+                        if let processes, !processes.isEmpty {
+                            ConduitSettingsSection(title: AppLocalization.string("Background processes", table: .chat), symbol: "gearshape.2", tint: .conduitAccent) {
+                                Text(AppLocalization.string("Started by Hermes for this chat. They keep running until they finish or you stop them.", table: .chat))
+                                    .scaledFont(.footnote).foregroundStyle(.secondary)
+                            }
+                            ForEach(processes) { process in
+                                BackgroundProcessCard(process: process) { await loadProcesses() }
+                            }
+                        }
                     }
                     .padding(16)
+                }
+                .refreshable {
+                    await appState.refreshDelegateAgents()
+                    await loadProcesses()
                 }
             }
             .navigationTitle("Delegate agents")
@@ -300,11 +318,22 @@ struct DelegateAgentsSheet: View {
             .toolbarBackground(.hidden, for: .navigationBar)
         }
         .task { await appState.refreshDelegateAgents() }
+        // Another chat's processes never stay on the list.
+        .task(id: appState.backgroundProcessSessionID) {
+            processes = []
+            await loadProcesses()
+        }
+    }
+
+    private func loadProcesses() async {
+        if let listed = await appState.loadBackgroundProcesses() {
+            processes = listed
+        }
     }
 
     private var activeSummary: String {
         let activeCount = appState.delegateAgents.filter(\.status.isActive).count
-        return activeCount == 0 ? AppLocalization.string("Latest delegation activity") : AppLocalization.string("\(activeCount) working now")
+        return activeCount == 0 ? AppLocalization.string("Latest delegation activity", table: .chat) : AppLocalization.string("\(activeCount) working now", table: .chat)
     }
 }
 
@@ -320,6 +349,13 @@ private struct DelegateAgentCard: View {
     @State private var working = false
     @State private var note: (text: String, isError: Bool)?
 
+    /// Model, tool, status and how long it has run or ran (issue 1553).
+    private func subtitle(at now: Date, spoken: Bool = false) -> String {
+        let seconds = agent.elapsed(at: now)
+        let time = spoken ? ChatStepTiming.spokenText(seconds) : ChatStepTiming.text(seconds)
+        return [agent.model, agent.currentTool, agent.status.label, time].compactMap { $0 }.joined(separator: " · ")
+    }
+
     /// Hermes takes Steer, Stop and live output only for an agent it named
     /// and still runs (#820).
     private var controllable: Bool { agent.status == .running && agent.hasGatewayID && !agent.sessionId.isEmpty }
@@ -331,9 +367,13 @@ private struct DelegateAgentCard: View {
                     HStack(spacing: 10) {
                         Circle().fill(statusColor).frame(width: 9, height: 9)
                         VStack(alignment: .leading, spacing: 2) {
-                            Text(agent.goal.isEmpty ? AppLocalization.string("Delegate agent") : agent.goal).scaledFont(.subheadline.weight(.semibold)).lineLimit(2)
-                            Text([agent.model, agent.currentTool, agent.status.label].compactMap { $0 }.joined(separator: " · "))
-                                .scaledFont(.caption).foregroundStyle(.secondary).lineLimit(1)
+                            Text(agent.goal.isEmpty ? AppLocalization.string("Delegate agent", table: .chat) : agent.goal).scaledFont(.subheadline.weight(.semibold)).lineLimit(2)
+                            // A running agent's time counts up each second.
+                            TimelineView(.periodic(from: .now, by: agent.status == .running ? 1 : 3600)) { context in
+                                Text(subtitle(at: context.date))
+                                    .scaledFont(.caption).foregroundStyle(.secondary).lineLimit(1)
+                                    .accessibilityLabel(subtitle(at: context.date, spoken: true))
+                            }
                         }
                         Spacer()
                         Image(systemName: expanded ? "chevron.up" : "chevron.down").scaledFont(.caption).foregroundStyle(.secondary)
@@ -350,7 +390,7 @@ private struct DelegateAgentCard: View {
             }
             if expanded {
                 if agent.stream.isEmpty {
-                    Text(agent.summary ?? (agent.status.isActive ? AppLocalization.string("Waiting for activity…") : AppLocalization.string("No stream output returned.")))
+                    Text(agent.summary ?? (agent.status.isActive ? AppLocalization.string("Waiting for activity…", table: .chat) : AppLocalization.string("No stream output returned.", table: .chat)))
                         .scaledFont(.footnote).foregroundStyle(.secondary)
                 } else {
                     ForEach(agent.stream.suffix(10)) { line in
@@ -379,7 +419,7 @@ private struct DelegateAgentCard: View {
         }
         .sheet(isPresented: $showingTail) {
             DelegateAgentTailSheet(
-                title: agent.goal.isEmpty ? AppLocalization.string("Delegate agent") : agent.goal,
+                title: agent.goal.isEmpty ? AppLocalization.string("Delegate agent", table: .chat) : agent.goal,
                 isRunning: { appState.delegateAgents.first(where: { $0.id == agent.id && $0.sessionId == agent.sessionId })?.status.isActive ?? false },
                 load: { await appState.tailDelegateAgent(agent) }
             )
@@ -403,7 +443,7 @@ private struct DelegateAgentCard: View {
             .contentShape(Rectangle())
         }
         .disabled(working)
-        .accessibilityLabel(AppLocalization.string("Agent actions"))
+        .accessibilityLabel(AppLocalization.string("Agent actions", table: .chat))
         .accessibilityIdentifier("delegateAgent.actions")
     }
 
@@ -416,12 +456,12 @@ private struct DelegateAgentCard: View {
             let result = await appState.steerDelegateAgent(agent, text: text)
             working = false
             switch result {
-            case .done: note = (AppLocalization.string("Sent. The agent reads it at its next step."), false)
-            case .notRunning: note = (AppLocalization.string("This agent has already finished."), true)
+            case .done: note = (AppLocalization.string("Sent. The agent reads it at its next step.", table: .chat), false)
+            case .notRunning: note = (AppLocalization.string("This agent has already finished.", table: .chat), true)
             case .failed:
                 // Kept for Steer… again, so a dropped send isn't retyped.
                 steerText = text
-                note = (AppLocalization.string("Couldn't reach this agent."), true)
+                note = (AppLocalization.string("Couldn't reach this agent.", table: .chat), true)
             }
         }
     }
@@ -434,8 +474,8 @@ private struct DelegateAgentCard: View {
             working = false
             switch result {
             case .done: note = nil
-            case .notRunning: note = (AppLocalization.string("This agent has already finished."), true)
-            case .failed: note = (AppLocalization.string("Couldn't reach this agent."), true)
+            case .notRunning: note = (AppLocalization.string("This agent has already finished.", table: .chat), true)
+            case .failed: note = (AppLocalization.string("Couldn't reach this agent.", table: .chat), true)
             }
         }
     }
@@ -447,6 +487,90 @@ private struct DelegateAgentCard: View {
         case .completed: return .green
         case .failed: return .red
         case .interrupted: return .secondary
+        }
+    }
+}
+
+/// One background process Hermes runs for the chat: its command, how long
+/// it has run, its newest output, and Stop.
+private struct BackgroundProcessCard: View {
+    @ObservedObject var appLanguage = AppLanguageStore.shared
+    @EnvironmentObject private var appState: AppState
+    let process: BackgroundProcess
+    /// Reads the list again once one stopped.
+    let reload: () async -> Void
+    @State private var confirmingStop = false
+    @State private var working = false
+    @State private var failure: String?
+
+    private var subtitle: String {
+        var parts: [String] = []
+        if let uptime = process.uptimeSeconds, let time = ChatStepTiming.text(TimeInterval(uptime)) { parts.append(time) }
+        if let pid = process.pid { parts.append("PID \(pid)") }
+        if !process.isRunning { parts.append(AppLocalization.string("Exited", table: .chat)) }
+        if let cwd = process.cwd, !cwd.isEmpty { parts.append(cwd) }
+        return parts.joined(separator: " · ")
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .top, spacing: 10) {
+                Circle().fill(process.isRunning ? Color.conduitAccent : Color.secondary).frame(width: 9, height: 9).padding(.top, 5)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(verbatim: process.command.isEmpty ? process.id : process.command)
+                        .scaledFont(.subheadline.monospaced().weight(.semibold))
+                        .lineLimit(3)
+                    if !subtitle.isEmpty {
+                        Text(verbatim: subtitle).scaledFont(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                    }
+                }
+                Spacer()
+                if process.isRunning {
+                    Button { confirmingStop = true } label: {
+                        Group {
+                            if working {
+                                ProgressView().controlSize(.small)
+                            } else {
+                                Image(systemName: "stop.circle").scaledFont(.body).foregroundStyle(.red)
+                            }
+                        }
+                        .frame(width: 32, height: 32)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(working)
+                    .accessibilityLabel(AppLocalization.string("Stop process", table: .chat))
+                }
+            }
+            if !process.output.isEmpty {
+                Text(verbatim: process.output)
+                    .scaledFont(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+                    .lineLimit(4)
+                    .textSelection(.enabled)
+            }
+            if let failure {
+                Text(verbatim: failure).scaledFont(.caption).foregroundStyle(.red)
+            }
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .conduitGlassSurface(cornerRadius: 20, tint: Color.conduitAccent.opacity(0.04))
+        .confirmationDialog(AppLocalization.string("Stop this process?", table: .chat), isPresented: $confirmingStop, titleVisibility: .visible) {
+            Button(AppLocalization.string("Stop process", table: .chat), role: .destructive) { stop() }
+        } message: {
+            Text(AppLocalization.string("Hermes ends it on your host. Anything it was serving or watching stops with it.", table: .chat))
+        }
+    }
+
+    private func stop() {
+        guard !working else { return }
+        working = true
+        failure = nil
+        Task {
+            failure = await appState.killBackgroundProcess(process)
+            working = false
+            await reload()
         }
     }
 }
@@ -485,9 +609,9 @@ private struct DelegateAgentTailSheet: View {
                                 ProgressView().frame(maxWidth: .infinity).padding(.top, 44)
                             } else {
                                 ContentUnavailableView(
-                                    failed ? AppLocalization.string("Couldn't load output") : AppLocalization.string("No output yet"),
+                                    failed ? AppLocalization.string("Couldn't load output", table: .chat) : AppLocalization.string("No output yet", table: .chat),
                                     systemImage: "text.alignleft",
-                                    description: Text(failed ? AppLocalization.string("Hermes didn't send this agent's output.") : AppLocalization.string("Output appears here once the agent writes some."))
+                                    description: Text(failed ? AppLocalization.string("Hermes didn't send this agent's output.", table: .chat) : AppLocalization.string("Output appears here once the agent writes some.", table: .chat))
                                 )
                                 .padding(.top, 44)
                             }
@@ -508,7 +632,7 @@ private struct DelegateAgentTailSheet: View {
                                 } label: {
                                     Label("Latest", systemImage: "arrow.down.to.line")
                                 }
-                                .accessibilityLabel(AppLocalization.string("Jump to latest activity"))
+                                .accessibilityLabel(AppLocalization.string("Jump to latest activity", table: .chat))
                             }
                         }
                     }
@@ -544,7 +668,7 @@ private struct DeviceReportsSection: View {
     @State private var loading = false
 
     var body: some View {
-        ConduitSettingsSection(title: AppLocalization.string("Device reports"), symbol: "chart.bar.doc.horizontal", tint: .conduitAccent) {
+        ConduitSettingsSection(title: AppLocalization.string("Device reports", table: .chat), symbol: "chart.bar.doc.horizontal", tint: .conduitAccent) {
             VStack(alignment: .leading, spacing: 10) {
                 Text("Usage, network and hang reports iOS makes about once a day. They stay on this device until you share them.")
                     .scaledFont(.footnote)
@@ -606,7 +730,7 @@ private struct ChatTracesSection: View {
     @State private var result: ChatTraceUpload.Result?
 
     var body: some View {
-        ConduitSettingsSection(title: AppLocalization.string("Chat traces"), symbol: "waveform.path.ecg", tint: .conduitAccent) {
+        ConduitSettingsSection(title: AppLocalization.string("Chat traces", table: .chat), symbol: "waveform.path.ecg", tint: .conduitAccent) {
             VStack(alignment: .leading, spacing: 10) {
                 Text("Conduit notes how the open chat scrolls and lays out: row counts, sizes and timings, never what the messages say. When a chat jumps, freezes, stops scrolling or shows none of its messages, it saves the last few minutes on this device.")
                     .scaledFont(.footnote)

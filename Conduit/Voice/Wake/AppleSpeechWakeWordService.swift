@@ -63,6 +63,9 @@ final class AppleSpeechWakeWordService: WakeWordService {
     /// This listener set the session's preferred input (CarPlay) and must
     /// clear it before handing the session back.
     private var prefersBuiltInMicrophone = false
+    /// The microphone preferred before wake moved to the iPhone's own (one
+    /// the user picked in iOS's input picker, issue 2389), put back after.
+    private var inputHold = VoicePreferredInputHold<AVAudioSessionPortDescription>()
     /// A system interruption (a call, Siri) is in progress.
     private var isInterrupted = false
     private var observers: [NSObjectProtocol] = []
@@ -110,7 +113,7 @@ final class AppleSpeechWakeWordService: WakeWordService {
         }
         guard Self.isSpeechAuthorized, Self.isMicrophoneAuthorized else {
             throw WakeWordServiceError.unavailable(
-                AppLocalization.string("Wake phrases need microphone and speech recognition access.")
+                AppLocalization.string("Wake phrases need microphone and speech recognition access.", table: .voice)
             )
         }
         makeRecognizers()
@@ -124,7 +127,7 @@ final class AppleSpeechWakeWordService: WakeWordService {
         } catch {
             stopEverything()
             wakeLogger.error("wake audio start failed: \(LogRedaction.message(error), privacy: .public)")
-            throw WakeWordServiceError.unavailable(AppLocalization.string("Wake listening couldn't use the microphone. Close other apps using it, then try again."))
+            throw WakeWordServiceError.unavailable(AppLocalization.string("Wake listening couldn't use the microphone. Close other apps using it, then try again.", table: .voice))
         }
         observeAudioDisruptions()
         startRecognitionCycle()
@@ -232,20 +235,24 @@ final class AppleSpeechWakeWordService: WakeWordService {
         let session = AVAudioSession.sharedInstance()
         guard let builtIn = session.availableInputs?.first(where: { $0.portType == .builtInMic }) else {
             throw WakeWordServiceError.unavailable(
-                AppLocalization.string("Wake listening on CarPlay needs the iPhone's microphone, which is not available right now.")
+                AppLocalization.string("Wake listening on CarPlay needs the iPhone's microphone, which is not available right now.", table: .voice)
             )
         }
+        let previous = session.preferredInput
         try session.setPreferredInput(builtIn)
+        inputHold.take(previous: previous, settingUID: builtIn.uid)
         prefersBuiltInMicrophone = true
     }
 
     /// A conversation that takes the session over uses the car's own
-    /// microphone again.
+    /// microphone again, or the one the user picked before.
     private func clearPreferredInput() {
         guard prefersBuiltInMicrophone else { return }
         prefersBuiltInMicrophone = false
+        // A microphone picked since wake moved to the built-in one stays.
+        guard case .restore(let previous) = inputHold.release(currentUID: AVAudioSession.sharedInstance().preferredInput?.uid) else { return }
         do {
-            try AVAudioSession.sharedInstance().setPreferredInput(nil)
+            try AVAudioSession.sharedInstance().setPreferredInput(previous)
         } catch {
             wakeLogger.error("wake listening could not clear its preferred input: \(LogRedaction.message(error), privacy: .public)")
         }
@@ -271,19 +278,18 @@ final class AppleSpeechWakeWordService: WakeWordService {
         // A phone call, Siri or an alarm is not a Conduit audio owner: stop
         // listening for its whole duration and only resume once it ends.
         observers.append(center.addObserver(
-            forName: AVAudioSession.interruptionNotification,
+            forName: .audioSessionInterruption,
             object: nil,
             queue: .main
         ) { [weak self] notification in
-            let rawType = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt
-            let type = rawType.flatMap(AVAudioSession.InterruptionType.init(rawValue:))
-            Task { @MainActor [weak self] in self?.handleInterruption(type) }
+            let interruption = AudioSessionInterruption(notification)
+            Task { @MainActor [weak self] in self?.handleInterruption(interruption) }
         })
     }
 
-    private func handleInterruption(_ type: AVAudioSession.InterruptionType?) {
+    private func handleInterruption(_ interruption: AudioSessionInterruption?) {
         guard isArmed else { return }
-        switch type {
+        switch interruption {
         case .began:
             isInterrupted = true
             watchInterruption()
@@ -300,7 +306,7 @@ final class AppleSpeechWakeWordService: WakeWordService {
             recoveryTask?.cancel()
             recoveryTask = nil
             scheduleAudioRecovery()
-        default:
+        case nil:
             break
         }
     }
@@ -367,7 +373,7 @@ final class AppleSpeechWakeWordService: WakeWordService {
                 self.startRecognitionCycle()
             } catch {
                 wakeLogger.error("wake audio restart failed: \(LogRedaction.message(error), privacy: .public)")
-                self.recordFailure(AppLocalization.string("Wake listening couldn't use the microphone. Close other apps using it, then try again."))
+                self.recordFailure(AppLocalization.string("Wake listening couldn't use the microphone. Close other apps using it, then try again.", table: .voice))
             }
         }
     }
@@ -400,7 +406,7 @@ final class AppleSpeechWakeWordService: WakeWordService {
             return note.text
         }
         let locale = Locale.current
-        return AppLocalization.string("On-device Apple speech recognition is unavailable for \(locale.identifier).")
+        return AppLocalization.string("On-device Apple speech recognition is unavailable for \(locale.identifier).", table: .voice)
     }
 
     private func cancelRecognition() {
@@ -453,7 +459,7 @@ final class AppleSpeechWakeWordService: WakeWordService {
         if failed {
             consecutiveFailures += 1
             guard consecutiveFailures < Self.maximumConsecutiveFailures else {
-                recordFailure(AppLocalization.string("Apple speech recognition is temporarily unavailable."))
+                recordFailure(AppLocalization.string("Apple speech recognition is temporarily unavailable.", table: .voice))
                 return
             }
             cycleTask?.cancel()

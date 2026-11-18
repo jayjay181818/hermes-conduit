@@ -46,10 +46,33 @@ struct ArtifactItem: Identifiable, Equatable, Hashable {
     /// From a bot's Bot Chat: it goes by the bot's name and opens the way
     /// Bots opens it, in its store's profile.
     var isBotChat = false
+    /// Saved (issue 2467): when, the user's note, and the copy the host
+    /// keeps of a file, which opens once the original is gone. Set only on
+    /// the rows of Saved (`ArtifactPinsClient`).
+    var savedAt: Date?
+    var note: String?
+    var keptPath: String?
+    /// Another combined dashboard's, listed in All through its kept
+    /// connection (Eric, 2026-11-16); nil for the dashboard on screen's.
+    /// Its files are read there, and it can't be saved or shown in a chat
+    /// here.
+    var dashboardID: UUID?
+
+    /// The file to open: the original while the host has it, else the
+    /// copy kept when it was saved.
+    var openPath: String? { exists ? path : keptPath }
+
+    /// Whether a tap can open it: a link, a file still on the host, or a
+    /// saved one's kept copy.
+    var canOpen: Bool { url != nil && path == nil || openPath != nil }
 
     /// One path or URL is one artifact, listed at its newest mention, even
     /// when several chats sent it (the host lists it the same way).
-    var id: String { path ?? url?.absoluteString ?? "\(messageID)|\(name)" }
+    /// Another dashboard's is apart from this one's of the same path.
+    var id: String {
+        let own = path ?? url?.absoluteString ?? "\(messageID)|\(name)"
+        return dashboardID.map { "\($0.uuidString)|\(own)" } ?? own
+    }
 
     var isVisual: Bool { kind == .image || kind == .video }
 
@@ -96,8 +119,8 @@ enum ArtifactFilter: String, CaseIterable, Identifiable {
     var title: String {
         switch self {
         case .all: return AppLocalization.string("All")
-        case .images: return AppLocalization.string("Images")
-        case .pages: return AppLocalization.string("Pages")
+        case .images: return AppLocalization.string("Images", table: .chat)
+        case .pages: return AppLocalization.string("Pages", table: .chat)
         case .files: return AppLocalization.string("Files")
         case .links: return AppLocalization.string("Links")
         }
@@ -146,6 +169,9 @@ struct ArtifactSource: Equatable {
     /// rows go by the bot's name.
     var botChatIDs: [String] = []
     var botLabel: String?
+    /// Another combined dashboard's store, read through its kept
+    /// connection; nil for the dashboard on screen's.
+    var dashboardID: UUID?
 }
 
 /// Several stores' pages as one list, newest first. Each store pages from
@@ -227,11 +253,12 @@ struct ArtifactFeed: Equatable {
         return horizon
     }
 
-    private static func tagged(_ items: [ArtifactItem], from source: ArtifactSource) -> [ArtifactItem] {
+    static func tagged(_ items: [ArtifactItem], from source: ArtifactSource) -> [ArtifactItem] {
         let botChat = Set(source.botChatIDs)
-        guard source.label != nil || !botChat.isEmpty else { return items }
+        guard source.label != nil || !botChat.isEmpty || source.dashboardID != nil else { return items }
         return items.map { item in
             var item = item
+            item.dashboardID = source.dashboardID
             if let label = source.label {
                 item.otherProfile = source.profile
                 item.otherProfileLabel = label
@@ -348,7 +375,7 @@ final class ArtifactsClient {
             throw Failure.malformed
         }
         // An older plugin lists missing files whatever it was asked.
-        let items = rows.compactMap(ArtifactItem.init).filter { showMissing || $0.exists }
+        let items = rows.compactMap { ArtifactItem($0) }.filter { showMissing || $0.exists }
         // Each artifact once, so list identity holds whatever the host sends.
         return ArtifactPage(items: merged([], with: items), nextBefore: response["next_before"] as? Int)
     }

@@ -21,6 +21,11 @@ struct ProfilePickerSheet: View {
     /// (Keychain reads stay off the render path).
     @State private var dashboardRows: [SavedDashboardRowModel] = []
     @State private var switchingToDashboard: UUID?
+    /// The sheet closed for a switch once its dashboard connected; the
+    /// switch's end doesn't close it again.
+    @State private var closedForConnectedSwitch = false
+    /// A pick made during a call, waiting on the user's answer (issue 2390).
+    @State private var pendingCallEndingSwitch: CallEndingSwitch?
     /// The bar's Profiles preference: Current only leaves one chip, so the All
     /// chip is out of the bar whenever All chats is off, and this sheet is
     /// where the bar sends a tap.
@@ -32,8 +37,8 @@ struct ProfilePickerSheet: View {
 
     private var photosFootnote: String {
         appState.profilePhotosLiveOnHermes
-            ? AppLocalization.string("Sessions and settings follow the active profile. Photos are saved to Hermes, so bots and Hermes Desktop show them too.")
-            : AppLocalization.string("Sessions and settings follow the active profile. Photos stay only on this device.")
+            ? AppLocalization.string("Sessions and settings follow the active profile. Photos are saved to Hermes, so bots and Hermes Desktop show them too.", table: .settings)
+            : AppLocalization.string("Sessions and settings follow the active profile. Photos stay only on this device.", table: .settings)
     }
 
     var body: some View {
@@ -53,12 +58,12 @@ struct ProfilePickerSheet: View {
                         }
                         HStack(alignment: .top, spacing: 12) {
                             Text(isReordering
-                                 ? AppLocalization.string("Use the arrows to choose the order profiles appear throughout Conduit.")
+                                 ? AppLocalization.string("Use the arrows to choose the order profiles appear throughout Conduit.", table: .settings)
                                  : photosFootnote)
                                 .scaledFont(.footnote)
                                 .foregroundStyle(.secondary)
                             Spacer(minLength: 0)
-                            Button(isReordering ? AppLocalization.string("Done") : AppLocalization.string("Reorder")) {
+                            Button(isReordering ? AppLocalization.string("Done") : AppLocalization.string("Reorder", table: .settings)) {
                                 Haptics.selection()
                                 withAnimation(ConduitMotion.response) { isReordering.toggle() }
                             }
@@ -91,7 +96,9 @@ struct ProfilePickerSheet: View {
                                 }
                             ) {
                                 Haptics.medium()
-                                Task { await appState.switchProfile(to: profile); dismiss() }
+                                appState.switchEndingCall(to: appState.profileDisplayName(profile), profileOnly: true, pending: &pendingCallEndingSwitch) {
+                                    Task { await appState.switchProfile(to: profile); dismiss() }
+                                }
                             }
                         }
                     }
@@ -103,10 +110,15 @@ struct ProfilePickerSheet: View {
             .task { await appState.refreshBotRosterAndStalePictures() }
             .task { dashboardRows = SavedDashboardRowModel.rows(appState) }
             .onChange(of: appState.savedDashboardRegistry) { _, _ in dashboardRows = SavedDashboardRowModel.rows(appState) }
+            // A switch closes the sheet once the dashboard is connected: its
+            // chat list, and the chat it was in, keep coming in behind it
+            // (a 600-chat list takes seconds), which the sheet held up.
+            .onChange(of: appState.isConnected) { _, connected in closeOnSwitchedDashboardConnected(connected) }
             .toolbar(.hidden, for: .navigationBar)
             .safeAreaInset(edge: .top, spacing: 0) {
                 ConduitSheetHeader(title: AppLocalization.string("Profiles"), close: { dismiss() })
             }
+            .callEndingSwitchConfirmation($pendingCallEndingSwitch)
         }
     }
 
@@ -118,7 +130,7 @@ struct ProfilePickerSheet: View {
         offersAllChatsRow && V2SessionsBarControls.showsAllChatsRow(
             profiles: profilesPreference,
             allProfilesChatsOn: appState.isAllProfilesChatsOn,
-            allProfilesAvailable: AllProfilesChats.isAvailable(profiles: appState.profiles)
+            allProfilesAvailable: appState.allProfilesChatsAvailable
         )
     }
 
@@ -189,14 +201,41 @@ extension ProfilePickerSheet {
     private func switchDashboard(to row: SavedDashboardRowModel) {
         guard !row.isActive, switchingToDashboard == nil else { return }
         Haptics.medium()
+        appState.switchEndingCall(to: row.dashboard.label, pending: &pendingCallEndingSwitch) {
+            startDashboardSwitch(to: row)
+        }
+    }
+
+    private func startDashboardSwitch(to row: SavedDashboardRowModel) {
+        guard !row.isActive, switchingToDashboard == nil else { return }
         switchingToDashboard = row.id
         Task {
             await appState.switchDashboard(to: row.id)
             switchingToDashboard = nil
             // The sheet belongs to the outgoing dashboard's bar; a switch
             // that ends at sign-in shows the login behind it.
-            dismiss()
+            if !closedForConnectedSwitch { dismiss() }
         }
+    }
+
+    private func closeOnSwitchedDashboardConnected(_ connected: Bool) {
+        guard Self.closesForConnectedSwitch(
+            connected: connected,
+            alreadyClosed: closedForConnectedSwitch,
+            switchingTo: switchingToDashboard,
+            active: appState.activeDashboardID
+        ) else { return }
+        closedForConnectedSwitch = true
+        dismiss()
+    }
+
+    /// Closes once, when the dashboard a switch from this sheet is going to
+    /// is the selected one and its socket is up; a switch that never
+    /// connects (it failed, or another took over) leaves it to the switch's
+    /// end.
+    static func closesForConnectedSwitch(connected: Bool, alreadyClosed: Bool, switchingTo target: UUID?, active: UUID?) -> Bool {
+        guard connected, !alreadyClosed, let target else { return false }
+        return active == target
     }
 }
 
@@ -309,15 +348,15 @@ private struct ProfilePickerRow: View {
                 UIAccessibility.post(notification: .announcement, argument: saveError)
             }
         )
-        .alert(AppLocalization.string("Rename profile"), isPresented: $isRenaming) {
+        .alert(AppLocalization.string("Rename profile", table: .settings), isPresented: $isRenaming) {
             TextField(AppLocalization.string("Name"), text: $draftName)
                 .textInputAutocapitalization(.words)
             Button(AppLocalization.string("Cancel"), role: .cancel) {}
             Button(AppLocalization.string("Save")) { saveName(draftName) }
         } message: {
             Text(BotManagement.isDefaultProfile(profile) || !appState.profilePhotosLiveOnHermes
-                 ? AppLocalization.string("This only changes how the profile is named in Conduit.")
-                 : AppLocalization.string("Chats and settings stay with the profile. Bots and Hermes Desktop show the new name too."))
+                 ? AppLocalization.string("This only changes how the profile is named in Conduit.", table: .settings)
+                 : AppLocalization.string("Chats and settings stay with the profile. Bots and Hermes Desktop show the new name too.", table: .settings))
         }
     }
 
@@ -353,7 +392,7 @@ private struct ProfilePickerRow: View {
             Button(action: select) {
                 VStack(alignment: .leading, spacing: 3) {
                     Text(appState.profileDisplayName(profile)).scaledFont(.headline).foregroundStyle(.primary)
-                    Text(BotManagement.isDefaultProfile(profile) ? AppLocalization.string("Primary Hermes profile") : AppLocalization.string("Hermes profile")).scaledFont(.caption).foregroundStyle(.secondary)
+                    Text(BotManagement.isDefaultProfile(profile) ? AppLocalization.string("Primary Hermes profile", table: .settings) : AppLocalization.string("Hermes profile", table: .settings)).scaledFont(.caption).foregroundStyle(.secondary)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
             }
@@ -456,7 +495,7 @@ private struct ProfilePickerRow: View {
                 .scaledFont(.caption)
                 .foregroundStyle(.secondary)
                 .accessibilityHidden(true)
-            Text(AppLocalization.string("Background glow"))
+            Text(AppLocalization.string("Background glow", table: .settings))
                 .scaledFont(.caption)
                 .foregroundStyle(.secondary)
                 .accessibilityHidden(true)
@@ -474,7 +513,7 @@ private struct ProfilePickerRow: View {
                 .accessibilityLabel("Automatic background glow for \(appState.profileDisplayName(profile))")
             }
             ColorPicker(selection: glowColor, supportsOpacity: false) {
-                Text(AppLocalization.string("Background glow"))
+                Text(AppLocalization.string("Background glow", table: .settings))
             }
             .labelsHidden()
             .frame(minWidth: 44, minHeight: 44)
@@ -592,6 +631,9 @@ struct ProfileAvatarView: View {
     /// Plays a moving picture (AnimatedAvatarFrames); only where the face is
     /// the focus, never in rows or the transcript.
     var animates = false
+    /// Another combined dashboard's profile: its starter face is that
+    /// dashboard's (BotFaceDirectory). Nil: the one on screen.
+    var dashboardID: UUID? = nil
     private var initials: String {
         let letters = displayName.split(separator: " ").prefix(2).compactMap(\.first)
         return letters.isEmpty ? "H" : String(letters).uppercased()
@@ -611,6 +653,11 @@ struct ProfileAvatarView: View {
                 .clipped()
                 // Always beside the profile's name, or inside a labelled button.
                 .accessibilityHidden(true)
+            } else if let look = BotFaceDirectory.shared.look(for: profile, on: dashboardID) {
+                // A bot's profile with no picture wears its starter face.
+                StarterFaceView(face: look.face, background: look.color.map { BotAvatarView.color(for: $0, name: profile) })
+                    .frame(width: size, height: size)
+                    .accessibilityHidden(true)
             } else {
                 Text(initials).font(.system(size: max(10, size * 0.36), weight: .bold, design: .rounded))
                     .foregroundStyle(Color.conduitAccent).frame(width: size, height: size)

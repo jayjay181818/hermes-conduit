@@ -98,6 +98,8 @@ final class LocalLiveJobNoticeTests: XCTestCase {
         let marker = try XCTUnwrap(content["text"] as? String)
         socket.deliver(["type": "conduit.turn", "turn_id": "ready", "text": marker])
         await settle(until: { session.state == .ready })
+        // The check's response ends, so the call's own turns can go (issue 2524).
+        socket.deliver(["type": "response.done"])
     }
 
     /// The call's own turns that carry `text`.
@@ -332,11 +334,7 @@ final class LocalLiveJobNoticeTests: XCTestCase {
         XCTAssertFalse(supervisor.jobs.first?.outcomeDelivered == true, "still pending, not spent")
 
         call.input.startError = nil
-        center.post(
-            name: AVAudioSession.interruptionNotification,
-            object: nil,
-            userInfo: [AVAudioSessionInterruptionTypeKey: AVAudioSession.InterruptionType.ended.rawValue]
-        )
+        AudioSessionInterruption.ended(shouldResume: true).post(on: center)
         await settle(until: { !call.controller.isAudioPausedForTesting })
         call.controller.deliverPendingJobUpdates()
         await settle(until: { turns(socket, containing: "3 unread.").count == 1 })

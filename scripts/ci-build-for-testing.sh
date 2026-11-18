@@ -38,7 +38,7 @@ if [ -n "${BUILD_DESTINATION:-}" ]; then
   DESTINATION="$BUILD_DESTINATION"
   echo "build-for-testing: destination $DESTINATION"
 else
-  SIMULATOR_NAME="${SIMULATOR_NAME:-iPhone 17 Pro}"
+  SIMULATOR_NAME="${SIMULATOR_NAME:-iPhone 18 Pro}"
   build_destination
 
   # Destination readiness gate: absorb the fresh-runner CoreSimulator
@@ -272,6 +272,10 @@ fi
 
 echo "build-for-testing ok in ${duration}s ($build_kind)"
 du -sh "$DERIVED_DATA_PATH"/* "$DERIVED_DATA_PATH"/Build/* 2>/dev/null || true
+# How many Swift files each target compiled, so a slow incremental build
+# shows what it rebuilt (ci-build-compiled-counts.py).
+compiled=$(python3 "$SCRIPT_DIR/ci-build-compiled-counts.py" "$LOG_DIR/build.log" 2>/dev/null || true)
+echo "build-for-testing: Swift files compiled: ${compiled:-none}"
 # The notice is readable from the job's annotations, where a long test log
 # would bury the build step's output.
 timing=$(sed -n '/Build Timing Summary/,$p' "$LOG_DIR/build.log" | grep -E '\| *[0-9.]+ seconds' \
@@ -284,7 +288,7 @@ if [ -n "$timing" ]; then
   prep_note="before the build: destination ${destination_s}s"
   if [ -n "$boot_wait_s" ]; then prep_note="$prep_note, ${boot_wait_s}s waiting for the simulator"; fi
   if [ -n "$resolve_s" ]; then prep_note="$prep_note, then packages ${resolve_s}s"; fi
-  echo "::notice title=Build ${duration}s ($build_kind build; DerivedData ${dd_size:-?}) - slowest phases::$(printf 'cache: %s\n%s\n%s\n' "${BUILD_CACHE:-not used}" "$prep_note" "$timing" | sed 's/%/%25/g' | awk '{printf "%s%s", (NR > 1 ? "%0A" : ""), $0}')"
+  echo "::notice title=Build ${duration}s ($build_kind build; DerivedData ${dd_size:-?}) - slowest phases::$(printf 'cache: %s\ncompiled: %s\n%s\n%s\n' "${BUILD_CACHE:-not used}" "${compiled:-none}" "$prep_note" "$timing" | sed 's/%/%25/g' | awk '{printf "%s%s", (NR > 1 ? "%0A" : ""), $0}')"
 else
   echo "::warning::no Build Timing Summary in $LOG_DIR/build.log"
 fi

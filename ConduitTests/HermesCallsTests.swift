@@ -224,6 +224,54 @@ extension VoiceConversationControllerTests {
         XCTAssertEqual(calls.holds.count, holdsAtHangUp, "Nothing renews after the call")
     }
 
+    /// A new call resets the supervisor while the hang-up's pass is still
+    /// on the wire (issue 2551): the ended jobs' watches are settled on
+    /// their own, a running job's is left to lapse on the host.
+    func testAResetDuringTheHangUpsPassStillSettlesTheEndedJobs() async {
+        let (supervisor, _, calls) = hermesCallSupervisor()
+        beginHermesCall(supervisor)
+        _ = await supervisor.performVoiceCommand(.start(instructions: "check the router"))
+        _ = await supervisor.performVoiceCommand(.start(instructions: "find a dinner recipe"))
+        _ = supervisor.requestCallback(.all)
+        await supervisor.callbackPassesSettled()
+        supervisor.observe(.messageComplete(sessionId: "rt-1", messageId: nil, content: "All good.", reasoning: nil))
+
+        supervisor.finishCallbacks()
+        let settles = supervisor.detachEndedCallbackSettles()
+        supervisor.reset()
+        await settles?.value
+
+        XCTAssertNotNil(settles)
+        let routerWatch = (calls.watches.firstIndex { $0.target.runtimeSessionID == "rt-1" }).map { "w\($0 + 1)" }
+        XCTAssertEqual(calls.watches.count, 2)
+        XCTAssertEqual(calls.cancels, routerWatch.map { [$0] } ?? [], "only the ended job's watch")
+        XCTAssertEqual(calls.notified.map(\.target.runtimeSessionID), ["rt-1"])
+        XCTAssertEqual(calls.notified.first?.kind, .done)
+        XCTAssertNil(supervisor.detachEndedCallbackSettles(), "nothing left once reset")
+    }
+
+    /// A running job the host already saw end is told at once when the
+    /// jobs are handed back mid-pass, not after its hold lapses (#2626's
+    /// review).
+    func testAResetDuringTheHangUpsPassTellsAJobTheHostSawEnd() async {
+        let (supervisor, _, calls) = hermesCallSupervisor()
+        calls.watchAnswers = [.ended(.failed)]
+        beginHermesCall(supervisor)
+        _ = await supervisor.performVoiceCommand(.start(instructions: "check the router"))
+        _ = supervisor.requestCallback()
+        await supervisor.callbackPassesSettled()
+
+        supervisor.finishCallbacks()
+        let settles = supervisor.detachEndedCallbackSettles()
+        supervisor.reset()
+        await settles?.value
+
+        XCTAssertNotNil(settles)
+        XCTAssertEqual(calls.cancels, [], "no watch was registered to let go of")
+        XCTAssertEqual(calls.notified.map(\.target.runtimeSessionID), ["rt-1"])
+        XCTAssertEqual(calls.notified.first?.kind, .failed)
+    }
+
     func testHangUpNotifiesForAJobThatEndedUntold() async {
         let (supervisor, _, calls) = hermesCallSupervisor()
         beginHermesCall(supervisor)
@@ -238,6 +286,55 @@ extension VoiceConversationControllerTests {
         XCTAssertEqual(calls.notified.map(\.target.runtimeSessionID), ["rt-1"])
         XCTAssertEqual(calls.notified.first?.kind, .done)
         XCTAssertNil(supervisor.takePendingNotice(), "No later conversation announces it again")
+    }
+
+    /// The pass's notice names the hanging-up call's profile for a job that
+    /// names none, so a hand-back while it waits can't move it (#2628's
+    /// review).
+    func testTheHangUpsNoticeNamesTheCallsProfile() async {
+        let (supervisor, _, calls) = hermesCallSupervisor()
+        beginHermesCall(supervisor)
+        _ = await supervisor.performVoiceCommand(.start(instructions: "check the router"))
+        _ = supervisor.requestCallback()
+        await supervisor.callbackPassesSettled()
+        supervisor.observe(.messageComplete(sessionId: "rt-1", messageId: nil, content: "All good.", reasoning: nil))
+
+        await supervisor.finishCallbacks(callProfile: "furina")?.value
+
+        XCTAssertEqual(calls.notified.map(\.target.runtimeSessionID), ["rt-1"])
+        XCTAssertEqual(calls.notified.first?.target.profile, "furina")
+        XCTAssertNil(supervisor.settlingCallProfile, "Cleared as its pass ends")
+
+        // A pass with no call to finish leaves a running pass's profile.
+        supervisor.settlingCallProfile = "nahida"
+        XCTAssertNil(supervisor.finishCallbacks(callProfile: "furina"))
+        XCTAssertEqual(supervisor.settlingCallProfile, "nahida")
+
+        // So does a call that hangs up with nothing to settle.
+        beginHermesCall(supervisor)
+        XCTAssertNil(supervisor.finishCallbacks(callProfile: "furina"))
+        XCTAssertEqual(supervisor.settlingCallProfile, "nahida")
+
+        // A pass held open on the wire keeps its own token through such a
+        // hang-up, so it still clears its profile as it ends (#2636's
+        // review, issue 2633).
+        supervisor.settlingCallProfile = nil
+        beginHermesCall(supervisor)
+        _ = await supervisor.performVoiceCommand(.start(instructions: "check the logs"))
+        _ = supervisor.requestCallback()
+        await supervisor.callbackPassesSettled()
+        let (stream, release) = AsyncStream<Void>.makeStream()
+        let held = Task { for await _ in stream { break } }
+        supervisor.holdCallbackSyncForTesting(held)
+        let first = supervisor.finishCallbacks(callProfile: "furina")
+        XCTAssertNotNil(first)
+        XCTAssertEqual(supervisor.settlingCallProfile, "furina")
+        beginHermesCall(supervisor)
+        XCTAssertNil(supervisor.finishCallbacks(callProfile: "nahida"))
+        XCTAssertEqual(supervisor.settlingCallProfile, "furina")
+        release.yield()
+        await first?.value
+        XCTAssertNil(supervisor.settlingCallProfile, "the held pass's own token stood: it clears as it ends")
     }
 
     func testReleaseAfterTheHostSawTheEndNotifiesOnce() async {
@@ -827,7 +924,8 @@ extension VoiceConversationControllerTests {
         XCTAssertEqual(plan(target), .ring)
         XCTAssertEqual(plan(target, sentAgo: nil), .ring, "An older relay doesn't say when it sent it")
         XCTAssertEqual(plan(target, sentAgo: 91), .endAtOnce(.missed), "The phone was offline: a missed call, never a late ring")
-        XCTAssertEqual(plan(target, busy: true), .endAtOnce(.talk))
+        XCTAssertEqual(plan(target, busy: true), .endAtOnce(.busy), "Already in a call: a missed call, never a ring over it")
+        XCTAssertTrue(plan(target, busy: true).startsTrace)
         XCTAssertEqual(plan(target, replayed: true), .endAtOnce(.none))
         XCTAssertEqual(plan(nil), .endAtOnce(.unreadable))
         XCTAssertTrue(plan(target, sentAgo: 91).startsTrace)
@@ -837,7 +935,7 @@ extension VoiceConversationControllerTests {
         // rings always shows, one that wouldn't only when iOS needs it.
         XCTAssertTrue(HermesNativeCalls.showsCall(.ring, mustReport: false))
         XCTAssertTrue(HermesNativeCalls.showsCall(.endAtOnce(.missed), mustReport: true))
-        XCTAssertFalse(HermesNativeCalls.showsCall(.endAtOnce(.talk), mustReport: false))
+        XCTAssertFalse(HermesNativeCalls.showsCall(.endAtOnce(.busy), mustReport: false))
         XCTAssertFalse(HermesNativeCalls.showsCall(.endAtOnce(.none), mustReport: false))
         if #available(iOS 26.4, *) {
             let selector = NSSelectorFromString("pushRegistry:didReceiveIncomingVoIPPushWithPayload:metadata:withCompletionHandler:")
@@ -853,7 +951,7 @@ extension VoiceConversationControllerTests {
     func testInTheCarOrSilencedTheWatchStopsRinging() {
         XCTAssertTrue(HermesNativeCalls.stopsWatchRing(plan: .ring, inCar: true), "Driving: the call rings on CarPlay, not the wrist")
         XCTAssertFalse(HermesNativeCalls.stopsWatchRing(plan: .ring, inCar: false))
-        XCTAssertTrue(HermesNativeCalls.stopsWatchRing(plan: .endAtOnce(.talk), inCar: false), "Busy in voice here")
+        XCTAssertTrue(HermesNativeCalls.stopsWatchRing(plan: .endAtOnce(.busy), inCar: false), "Busy in voice here")
         XCTAssertFalse(HermesNativeCalls.stopsWatchRing(plan: .endAtOnce(.missed), inCar: true), "A late push: the Watch judges its own")
         XCTAssertFalse(HermesNativeCalls.stopsWatchRing(plan: .endAtOnce(.none), inCar: true))
         XCTAssertTrue(HermesNativeCalls.stopsWatchRing(after: .filteredByDoNotDisturb), "A Focus silenced it here")
@@ -1005,8 +1103,29 @@ extension VoiceConversationControllerTests {
         XCTAssertEqual(routed.profile, "fam")
         XCTAssertEqual(routed.call?.kind, .question)
         XCTAssertEqual(routed.call?.reason, "Which branch?")
-        XCTAssertEqual(HermesCallNotifications.callRequest(for: target, missed: false)?.content.title, HermesCallCopy.notificationTitle)
+        XCTAssertEqual(HermesCallNotifications.callRequest(for: target, missed: false)?.content.title, HermesCallCopy.notificationTitle())
+        // The bot that calls is named, as its ring names it (issue 2540).
+        let talk = try XCTUnwrap(HermesCallNotifications.callRequest(for: target, missed: false, callerName: "Fam"))
+        XCTAssertEqual(talk.content.title, "Fam wants to talk")
+        XCTAssertEqual(talk.content.body, "Fam has a question for you. Which branch?")
         XCTAssertNil(HermesCallNotifications.callRequest(for: ConduitNotificationTarget(profile: nil, sessionId: "rt-1", type: nil), missed: true))
+
+        // A missed call offers both (Eric 2026-11-15): Call Back, the
+        // Talk button's action, and Open Chat, which opens its chat with
+        // no call. "Hermes wants to talk" keeps Talk alone.
+        XCTAssertEqual(missed.content.categoryIdentifier, HermesCallNotifications.missedCategoryIdentifier)
+        XCTAssertEqual(HermesCallNotifications.callRequest(for: target, missed: false)?.content.categoryIdentifier,
+                       HermesCallNotifications.categoryIdentifier)
+        XCTAssertTrue(HermesCallNotifications.isCallCategory(HermesCallNotifications.missedCategoryIdentifier))
+        XCTAssertTrue(HermesCallNotifications.isCallCategory(HermesCallNotifications.categoryIdentifier))
+        XCTAssertEqual(HermesCallNotifications.missedCategory().actions.map(\.identifier),
+                       [HermesCallNotifications.talkActionIdentifier, HermesCallNotifications.openChatActionIdentifier])
+        let chatOnly = try XCTUnwrap(HermesCallNotifications.localTarget(from: missed.content.userInfo, opensChatOnly: true))
+        XCTAssertEqual(chatOnly.sessionId, "rt-1")
+        XCTAssertEqual(chatOnly.durableSessionID, "st-1")
+        XCTAssertEqual(chatOnly.profile, "fam")
+        XCTAssertNil(chatOnly.call, "Open Chat starts no call")
+        XCTAssertNil(chatOnly.type)
     }
 
     func testTheLiveModelAnswersWhatTheCallWaitsOnOnlyWithTheUsersWords() async {
@@ -1173,7 +1292,7 @@ extension VoiceConversationControllerTests {
         let prompt = HermesCallSettingsFormat.watchPrompt("  Only if the homelab is down for over 10 minutes. \n\n Never before 9 am. ")
         XCTAssertEqual(
             prompt,
-            AppLocalization.string("Make my scheduled checks that call me match this note. Update the ones I already have instead of adding new ones:\n\("Only if the homelab is down for over 10 minutes.\nNever before 9 am.")"),
+            AppLocalization.string("Make my scheduled checks that call me match this note. Update the ones I already have instead of adding new ones:\n\("Only if the homelab is down for over 10 minutes.\nNever before 9 am.")", table: .voice),
             "The request, then the note trimmed line by line"
         )
     }

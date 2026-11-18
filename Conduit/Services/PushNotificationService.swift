@@ -186,6 +186,14 @@ enum PendingDecisionPayload: Equatable, Codable {
     /// batch model as native clarifies — no separate push card exists.
     case clarifyBatch(requestId: String, questions: [ClarifyQuestion])
 
+    /// A question's request id; nil for an approval.
+    var requestID: String? {
+        switch self {
+        case .approval: return nil
+        case .clarify(let requestId, _, _), .clarifyBatch(let requestId, _): return requestId
+        }
+    }
+
     /// Request ids minted by the notifier plugin's clarify loop; answers to
     /// these route through the relay instead of `clarify.respond`.
     static let relayRequestPrefix = "conduit-push-"
@@ -532,17 +540,17 @@ enum NotificationDetail: CaseIterable {
 
     var title: String {
         switch self {
-        case .generic: return AppLocalization.string("Generic")
-        case .chatNames: return AppLocalization.string("Chat names")
-        case .previews: return AppLocalization.string("Full previews")
+        case .generic: return AppLocalization.string("Generic", table: .notifications)
+        case .chatNames: return AppLocalization.string("Chat names", table: .notifications)
+        case .previews: return AppLocalization.string("Full previews", table: .notifications)
         }
     }
 
     var caption: String {
         switch self {
-        case .generic: return AppLocalization.string("Notifications say only what happened, like “Response ready”.")
-        case .chatNames: return AppLocalization.string("Notifications name the chat and profile, without what Hermes said.")
-        case .previews: return AppLocalization.string("Notifications name the chat and profile and show what Hermes said.")
+        case .generic: return AppLocalization.string("Notifications say only what happened, like “Response ready”.", table: .notifications)
+        case .chatNames: return AppLocalization.string("Notifications name the chat and profile, without what Hermes said.", table: .notifications)
+        case .previews: return AppLocalization.string("Notifications name the chat and profile and show what Hermes said.", table: .notifications)
         }
     }
 }
@@ -666,8 +674,10 @@ final class PushNotificationService: ObservableObject {
     }
 
     /// Encrypted decisions keep their gateway across relaunches: the answer
-    /// has to be sealed for that pairing, and plaintext is rejected. Only
-    /// verified pushes are kept, newest last, capped.
+    /// has to be sealed for that pairing, and plaintext is rejected. Kept
+    /// from verified pushes, and from question cards drawn from a Needs you
+    /// row whose gateway this iPhone holds a current key for (issue 2683);
+    /// newest last, capped.
     static let encryptedDecisionGatewaysKey = "conduit.e2e.decisionGateways"
     private static let encryptedDecisionGatewaysLimit = 64
 
@@ -686,10 +696,35 @@ final class PushNotificationService: ObservableObject {
         case .clarifyBatch(let id, _): requestID = id
         default: return
         }
-        var pairs = (UserDefaults.standard.array(forKey: Self.encryptedDecisionGatewaysKey) as? [[String]] ?? [])
+        Self.persistEncryptedGatewayID(gatewayID, requestID: requestID)
+    }
+
+    /// A question's card drawn in the chat from its Needs you row (issue
+    /// 2556) came from no push, so nothing retained its gateway, and its
+    /// answer went out unsealed, which an encrypted pairing refuses (issue
+    /// 2683). The chat hands over the gateway its host names for the
+    /// profile; a push's own, when one arrived, stays. Kept across
+    /// relaunches when the pairing is encrypted, as a push's is.
+    func retainRelayGatewayID(_ gatewayID: String, forRequestID requestID: String) {
+        guard relayGatewayID(forRequestID: requestID) == nil else { return }
+        relayGatewayIDsByRequestID[requestID] = gatewayID
+        if Self.keepsGatewayAcrossRelaunch(gatewayID, installationID: installationID, records: Self.e2eKeyStore.records()) {
+            Self.persistEncryptedGatewayID(gatewayID, requestID: requestID)
+        }
+    }
+
+    /// Whether a row-drawn card's gateway is kept across relaunches: only
+    /// for a pairing this iPhone holds a current key for, whose answers
+    /// must be sealed; a plaintext pairing's stays for the session.
+    nonisolated static func keepsGatewayAcrossRelaunch(_ gatewayID: String, installationID: String?, records: [E2EKeyRecord]) -> Bool {
+        NotificationE2E.currentRecord(gatewayID: gatewayID, installationID: installationID, records: records) != nil
+    }
+
+    static func persistEncryptedGatewayID(_ gatewayID: String, requestID: String) {
+        var pairs = (UserDefaults.standard.array(forKey: encryptedDecisionGatewaysKey) as? [[String]] ?? [])
             .filter { $0.count == 2 && $0[0] != requestID }
         pairs.append([requestID, gatewayID])
-        UserDefaults.standard.set(Array(pairs.suffix(Self.encryptedDecisionGatewaysLimit)), forKey: Self.encryptedDecisionGatewaysKey)
+        UserDefaults.standard.set(Array(pairs.suffix(encryptedDecisionGatewaysLimit)), forKey: encryptedDecisionGatewaysKey)
     }
 
     /// The respond body for a relay decision answer: answer, optional batch
@@ -882,9 +917,9 @@ final class PushNotificationService: ObservableObject {
 
     var isEnabled: Bool { registration != nil && preferences.enabled }
     var statusText: String {
-        if isWorking { return AppLocalization.string("Updating") }
-        if isEnabled { return AppLocalization.string("Enabled") }
-        if authorizationStatus == .denied { return AppLocalization.string("Notifications denied") }
+        if isWorking { return AppLocalization.string("Updating", table: .notifications) }
+        if isEnabled { return AppLocalization.string("Enabled", table: .notifications) }
+        if authorizationStatus == .denied { return AppLocalization.string("Notifications denied", table: .notifications) }
         return AppLocalization.string("Off")
     }
 
@@ -1603,15 +1638,15 @@ final class PushNotificationService: ObservableObject {
         var errorDescription: String? {
             switch self {
             case .unregistered:
-                return AppLocalization.string("This iPhone isn't set up to answer from notifications. Set it up again in Settings > Notifications.")
+                return AppLocalization.string("This iPhone isn't set up to answer from notifications. Set it up again in Settings > Notifications.", table: .notifications)
             case .transport(let message):
-                return AppLocalization.string("Couldn't send your answer: \(message)")
+                return AppLocalization.string("Couldn't send your answer: \(message)", table: .notifications)
             case .server:
-                return AppLocalization.string("Your answer wasn't accepted. Open the chat in Conduit and answer there.")
+                return AppLocalization.string("Your answer wasn't accepted. Open the chat in Conduit and answer there.", table: .notifications)
             case .insecureTransport:
-                return AppLocalization.string("The notification relay address must start with https://. Fix it in Settings > Notifications.")
+                return AppLocalization.string("The notification relay address must start with https://. Fix it in Settings > Notifications.", table: .notifications)
             case .answerTooLarge:
-                return AppLocalization.string("That answer is too long to send from a notification card. Open the chat in Conduit and answer there.")
+                return AppLocalization.string("That answer is too long to send from a notification card. Open the chat in Conduit and answer there.", table: .notifications)
             }
         }
     }
@@ -1835,7 +1870,7 @@ final class PushNotificationService: ObservableObject {
         do {
             let (data, response) = try await URLSession.shared.data(for: request)
             guard let http = response as? HTTPURLResponse else {
-                throw RelayDecisionError.transport(AppLocalization.string("invalid response"))
+                throw RelayDecisionError.transport(AppLocalization.string("invalid response", table: .notifications))
             }
             let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
             let remaining = json?["remaining"] as? [String]
@@ -1957,7 +1992,7 @@ final class PushNotificationService: ObservableObject {
         // Gateway discriminators belong to the old relay; echoing one to
         // the new relay could only fail or mis-route.
         relayGatewayIDsByRequestID.removeAll()
-        relayNotice = AppLocalization.string("Moved to the new relay. Pair each Hermes profile again to keep receiving notifications.")
+        relayNotice = AppLocalization.string("Moved to the new relay. Pair each Hermes profile again to keep receiving notifications.", table: .notifications)
         await refreshMeta()
     }
 
@@ -2019,7 +2054,7 @@ final class PushNotificationService: ObservableObject {
         pairingExpiry = nil
         lastError = nil
         guard let registration else {
-            lastError = AppLocalization.string("Turn on notifications on this device before creating a pairing code.")
+            lastError = AppLocalization.string("Turn on notifications on this device before creating a pairing code.", table: .notifications)
             return
         }
         isWorking = true
@@ -2108,7 +2143,7 @@ final class PushNotificationService: ObservableObject {
             throw DashboardTicketBridgeError.notReady
         }
         guard response["ok"] as? Bool == true, response["installation_id"] as? String == registration.installationID else {
-            throw DashboardTicketBridgeError.requestFailed(AppLocalization.string("The plugin didn't confirm the pairing."))
+            throw DashboardTicketBridgeError.requestFailed(AppLocalization.string("The plugin didn't confirm the pairing.", table: .notifications))
         }
         await refreshMeta()
         return response["gateway_id"] as? String
@@ -2597,8 +2632,10 @@ final class PushNotificationService: ObservableObject {
     }
 
     /// A "Hermes wants to talk" notification Conduit posted itself (#449).
-    func receiveLocalCallNotification(_ userInfo: [AnyHashable: Any]) {
-        guard let target = HermesCallNotifications.localTarget(from: userInfo) else { return }
+    /// `opensChatOnly`: a missed call's Open Chat, which opens its chat
+    /// without calling back.
+    func receiveLocalCallNotification(_ userInfo: [AnyHashable: Any], opensChatOnly: Bool = false) {
+        guard let target = HermesCallNotifications.localTarget(from: userInfo, opensChatOnly: opensChatOnly) else { return }
         route(target)
     }
 
@@ -2673,6 +2710,10 @@ final class PushNotificationService: ObservableObject {
         pendingRouteAwaitsCall = false
         forgetWaitingTap()
     }
+
+    /// No attempt of the pending tap's route has started yet, or it opens
+    /// after a call as if just made: its window, and its failures, are its own.
+    var pendingRouteIsFresh: Bool { !pendingRouteOpenStarted || pendingRouteAwaitsCall }
 
     /// An open of `target` is starting: a retry still waiting would only
     /// cancel it when it fires, so it stands down. Returns false, clearing
@@ -2999,6 +3040,19 @@ final class PushNotificationService: ObservableObject {
         return nil
     }
 
+    /// A question's card from a row of the plugin's waiting list, which
+    /// carries it as the push did (`decision`, notifier 0.177.17; issue
+    /// 2556). Nil for an approval, which its chat's own card answers.
+    nonisolated static func waitingQuestionCard(from row: [String: Any]) -> PendingDecisionPayload? {
+        switch pendingDecision(from: row) {
+        case let card?:
+            if case .approval = card { return nil }
+            return card
+        case nil:
+            return nil
+        }
+    }
+
     /// Parses the structured decision content the relay forwards alongside a
     /// decision notification (see the background-arrival design doc). Returns
     /// nil for non-decision notifications or malformed/unknown payloads so the
@@ -3006,7 +3060,7 @@ final class PushNotificationService: ObservableObject {
     /// requires a session key to answer, a description to display, and at
     /// least one usable choice — otherwise a cached card could render the
     /// approval view's default action set, which the payload never promised.
-    private static func pendingDecision(from payload: [String: Any]) -> PendingDecisionPayload? {
+    nonisolated private static func pendingDecision(from payload: [String: Any]) -> PendingDecisionPayload? {
         guard let decision = payload["decision"] as? [String: Any],
               let kind = (decision["kind"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
               !kind.isEmpty else {
@@ -3075,7 +3129,7 @@ final class PushNotificationService: ObservableObject {
     /// (qid/question/choices/multi_select); qids are preserved as identity —
     /// they are NOT synthetic, so per-question relay answers can address
     /// them.
-    private static func pushClarifyQuestion(from entry: [String: Any]) -> ClarifyQuestion? {
+    nonisolated private static func pushClarifyQuestion(from entry: [String: Any]) -> ClarifyQuestion? {
         guard let question = (entry["question"] as? String)?
             .trimmingCharacters(in: .whitespacesAndNewlines),
             !question.isEmpty else {
@@ -3267,22 +3321,22 @@ final class PushNotificationService: ObservableObject {
         let body = try? JSONDecoder().decode(RelayErrorBody.self, from: data)
         switch body?.error {
         case "unauthorized":
-            return AppLocalization.string("The push relay no longer knows this iPhone. Turn notifications off and on again in Settings > Notifications.")
+            return AppLocalization.string("The push relay no longer knows this iPhone. Turn notifications off and on again in Settings > Notifications.", table: .notifications)
         case "invalid_topic", "production_only":
-            return AppLocalization.string("The push relay can't send to this build of Conduit. Check the relay's APNs settings.")
+            return AppLocalization.string("The push relay can't send to this build of Conduit. Check the relay's APNs settings.", table: .notifications)
         case "invalid_device_token", "token_proof_required", "token_proof_invalid":
-            return AppLocalization.string("The push relay couldn't confirm this iPhone's push token. Try again.")
+            return AppLocalization.string("The push relay couldn't confirm this iPhone's push token. Try again.", table: .notifications)
         case "installation_limit_reached", "gateway_limit_reached":
-            return AppLocalization.string("The push relay has no room for this iPhone. Ask whoever runs it to make room.")
+            return AppLocalization.string("The push relay has no room for this iPhone. Ask whoever runs it to make room.", table: .notifications)
         case "rate_limited":
-            return AppLocalization.string("The push relay is busy. Try again in a minute.")
+            return AppLocalization.string("The push relay is busy. Try again in a minute.", table: .notifications)
         case "answer_too_large":
             return RelayDecisionError.answerTooLarge.errorDescription ?? ""
         case let code? where !code.isEmpty:
-            return AppLocalization.string("Push relay request failed (\(code)).")
+            return AppLocalization.string("Push relay request failed (\(code)).", table: .notifications)
         default:
             if let message = body?.message, !message.isEmpty { return message }
-            return AppLocalization.string("Push relay request failed.")
+            return AppLocalization.string("Push relay request failed.", table: .notifications)
         }
     }
 
@@ -3445,10 +3499,10 @@ private enum PushNotificationError: LocalizedError {
     case relay(String)
     var errorDescription: String? {
         switch self {
-        case .permissionDenied: return AppLocalization.string("Allow notifications in Settings to continue.")
-        case .tokenTimeout: return AppLocalization.string("Apple didn't return a push token in time. Check your connection and try again.")
-        case .tokenRequestPending: return AppLocalization.string("Still waiting for a push token from Apple. Try again in a moment.")
-        case .tokenProofTimeout: return AppLocalization.string("The push relay's check didn't reach this iPhone in time. Check your connection and try again.")
+        case .permissionDenied: return AppLocalization.string("Allow notifications in Settings to continue.", table: .notifications)
+        case .tokenTimeout: return AppLocalization.string("Apple didn't return a push token in time. Check your connection and try again.", table: .notifications)
+        case .tokenRequestPending: return AppLocalization.string("Still waiting for a push token from Apple. Try again in a moment.", table: .notifications)
+        case .tokenProofTimeout: return AppLocalization.string("The push relay's check didn't reach this iPhone in time. Check your connection and try again.", table: .notifications)
         case .relay(let message): return message
         }
     }

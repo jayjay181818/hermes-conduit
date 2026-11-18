@@ -7,6 +7,7 @@
 //
 
 import Combine
+import SwiftUI
 import XCTest
 @testable import Conduit
 
@@ -159,6 +160,7 @@ final class SidebarLayoutTests: XCTestCase {
     func testCoveredChatsListWaitsUntilItShowsAgain() {
         let state = makeAppState()
         let updates = V2ShownUpdates(state)
+        updates.revealDelay = 0.05
         var sent = 0
         let watch = updates.objectWillChange.sink { sent += 1 }
         defer { watch.cancel() }
@@ -171,14 +173,191 @@ final class SidebarLayoutTests: XCTestCase {
         state.sessions = [pinnedTestSession("covered")]
         state.cronSessions = [pinnedTestSession("run", source: .cron)]
         XCTAssertEqual(sent, 0)
+        // Shown again by the pop, it draws once the pop has slid, with a
+        // publish during the slide.
         updates.isShown = true
+        XCTAssertEqual(sent, 0, "the list drew as the pop started")
+        state.sessions = [pinnedTestSession("during the pop")]
+        XCTAssertEqual(sent, 0)
+        waitUntil { sent > 0 }
+        settle()
+        XCTAssertEqual(sent, 1)
+
+        // Covered again before it drew: the next showing draws.
+        sent = 0
+        updates.isShown = false
+        state.sessions = [pinnedTestSession("covered again")]
+        updates.isShown = true
+        updates.isShown = false
+        settle()
+        XCTAssertEqual(sent, 0)
+        updates.isShown = true
+        waitUntil { sent > 0 }
         XCTAssertEqual(sent, 1)
 
         // Nothing missed, nothing to draw.
         sent = 0
         updates.isShown = false
         updates.isShown = true
+        settle()
         XCTAssertEqual(sent, 0)
+
+        // Shown by a pop with nothing missed, a publish during the slide
+        // still waits it out.
+        updates.isShown = false
+        updates.isShown = true
+        state.sessions = [pinnedTestSession("during a pop with nothing missed")]
+        XCTAssertEqual(sent, 0, "a publish during the slide drew at once")
+        waitUntil { sent > 0 }
+        settle()
+        XCTAssertEqual(sent, 1)
+
+        // Shown by a tab switch, nothing slides: what it missed draws at
+        // once, and so does a publish after.
+        sent = 0
+        updates.revealDelay = 0
+        updates.isShown = false
+        state.sessions = [pinnedTestSession("behind another tab")]
+        updates.isShown = true
+        XCTAssertEqual(sent, 1)
+        state.sessions = [pinnedTestSession("after the switch")]
+        XCTAssertEqual(sent, 2)
+
+        // The window crosses the split threshold during a pop's wait:
+        // nothing slides any more, so what it missed draws then.
+        sent = 0
+        let covered = V2ListVisibility(tabActive: true, covered: true, split: false)
+        let popped = V2ListVisibility(tabActive: true, covered: false, split: false)
+        updates.follow(covered, from: popped)
+        state.sessions = [pinnedTestSession("under the chat")]
+        updates.follow(popped, from: covered)
+        XCTAssertEqual(updates.revealDelay, V2ShownUpdates.popSlide)
+        XCTAssertEqual(sent, 0)
+        updates.follow(V2ListVisibility(tabActive: true, covered: false, split: true), from: popped)
+        XCTAssertEqual(sent, 1, "a split change during the wait kept waiting")
+        settle()
+        XCTAssertEqual(sent, 1)
+    }
+
+    /// A row's content compares on what it shows: the list's re-run with
+    /// new closures leaves it be; its item or project title changing
+    /// redraws it.
+    @MainActor
+    func testChatsRowComparesOnWhatItShows() {
+        func row(_ item: V2ChatsListItem, project: String? = nil, expand: @escaping (String, Bool) -> Void = { _, _ in }) -> V2ChatsRowContent {
+            V2ChatsRowContent(item: item, projectTitle: project, profileBadge: { _ in nil }, setExpanded: expand)
+        }
+        let parent = pinnedTestSession("parent")
+        let child = pinnedTestSession("child")
+        let nest = V2ChatsListItem(id: "parent", kind: .session(SessionNesting.Node(
+            session: parent, children: [SessionNesting.Node(session: child, children: [])])))
+        var expansions = 0
+        XCTAssertEqual(row(nest), row(nest, expand: { _, _ in expansions += 1 }), "new closures redrew the row")
+        XCTAssertNotEqual(row(nest), row(nest, project: "Conduit"))
+        let retitledChild = V2ChatsListItem(id: "parent", kind: .session(SessionNesting.Node(
+            session: parent, children: [SessionNesting.Node(session: pinnedTestSession("child", title: "Renamed"), children: [])])))
+        XCTAssertNotEqual(row(nest), row(retitledChild), "a child's change left the row as it was")
+        XCTAssertNotEqual(row(.leaf(parent)), row(.leaf(pinnedTestSession("parent", title: "Renamed"))))
+    }
+
+    /// Mounted in a List: the list re-running with the same rows (as it does
+    /// when a chat is pushed or popped) leaves their content alone (behind
+    /// `.equatable()`, the traits outside it); a changed item redraws its
+    /// row.
+    @MainActor
+    func testChatsListReRunLeavesUnchangedRowsAlone() throws {
+        let state = makeAppState()
+        let updates = V2ShownUpdates(state)
+        let parent = ChatsRowsParentModel(items: [.leaf(pinnedTestSession("a")), .leaf(pinnedTestSession("b"))])
+        let host = UIHostingController(rootView: ChatsRowsParent(model: parent).environmentObject(updates))
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let window = UIWindow(windowScene: scene)
+        window.frame = CGRect(x: 0, y: 0, width: 390, height: 844)
+        window.rootViewController = host
+        window.isHidden = false
+        defer { window.isHidden = true }
+        TranscriptPerf.reset()
+        waitUntil { TranscriptPerf.chatsListRowBodyEvaluations >= 2 }
+        XCTAssertGreaterThanOrEqual(TranscriptPerf.chatsListRowBodyEvaluations, 2, "the rows never drew")
+        settle()
+
+        TranscriptPerf.reset()
+        parent.covered.toggle()
+        waitUntil { parent.parentBodies >= 2 }
+        settle()
+        XCTAssertGreaterThanOrEqual(parent.parentBodies, 2, "the list never re-ran")
+        XCTAssertEqual(TranscriptPerf.chatsListRowBodyEvaluations, 0, "the list's re-run redrew unchanged rows")
+
+        parent.items[1] = .leaf(pinnedTestSession("b", title: "Renamed"))
+        waitUntil { TranscriptPerf.chatsListRowBodyEvaluations > 0 }
+        XCTAssertGreaterThan(TranscriptPerf.chatsListRowBodyEvaluations, 0, "a changed item left its row as it was")
+    }
+
+    @MainActor
+    private final class ChatsRowsParentModel: ObservableObject {
+        @Published var covered = false
+        @Published var items: [V2ChatsListItem]
+        var parentBodies = 0
+        init(items: [V2ChatsListItem]) { self.items = items }
+    }
+
+    /// Re-runs on its model's every change with new closures for each row,
+    /// as V2ChatsView does when the shell's covered flag flips.
+    private struct ChatsRowsParent: View {
+        @ObservedObject var model: ChatsRowsParentModel
+        var body: some View {
+            let _ = model.parentBodies += 1
+            List {
+                Text(model.covered ? "covered" : "shown")
+                ForEach(model.items) { item in
+                    V2ChatsRow(item: item, projectTitle: nil, profileBadge: { _ in nil }, onRename: { _ in },
+                               onDelete: { _ in }, onReorderPinned: { _ in }, setExpanded: { _, _ in })
+                }
+            }
+        }
+    }
+
+    /// A project page is covered by a chat pushed over it, not by one
+    /// beside it; its rows compare on what they show.
+    @MainActor
+    func testProjectPageFollowsTheChatsListsGate() {
+        var shell = V2ShellContext()
+        shell.values.showsChatRows = false
+        let covered = V2ProjectPage.visibility(in: shell)
+        XCTAssertFalse(covered.isShown)
+        shell.values.showsChatRows = true
+        XCTAssertTrue(V2ProjectPage.visibility(in: shell).isPop(from: covered))
+        shell.values.isSplit = true
+        shell.values.hasChatBeside = true
+        XCTAssertTrue(V2ProjectPage.visibility(in: shell).isShown, "a chat beside the page covered it")
+        XCTAssertFalse(V2ProjectPage.visibility(in: shell).isPop(from: covered))
+
+        func row(_ session: SessionSummary, badge: V2ProfileBadge? = nil) -> V2ProjectSessionRowContent {
+            V2ProjectSessionRowContent(session: session, profileBadge: badge)
+        }
+        let session = pinnedTestSession("chat")
+        XCTAssertEqual(row(session), row(session))
+        XCTAssertNotEqual(row(session), row(session, badge: V2ProfileBadge(profile: "work", name: "Work", url: nil)))
+        XCTAssertNotEqual(row(session), row(pinnedTestSession("chat", title: "Renamed")))
+    }
+
+    /// Only a pop on the shown tab waits out a slide: a tab switch, or the
+    /// window or the list's toggle putting the list beside the chat,
+    /// slides nothing.
+    @MainActor
+    func testOnlyAPopUncoveringTheChatsListCountsAsAPop() {
+        typealias Visibility = V2ListVisibility
+        let covered = Visibility(tabActive: true, covered: true, split: false)
+        XCTAssertTrue(Visibility(tabActive: true, covered: false, split: false).isPop(from: covered))
+        XCTAssertFalse(Visibility(tabActive: true, covered: false, split: true).isPop(from: covered),
+                       "the list put beside the chat waited for a slide")
+        XCTAssertFalse(Visibility(tabActive: false, covered: false, split: false).isPop(from: covered))
+        XCTAssertFalse(Visibility(tabActive: true, covered: false, split: false)
+            .isPop(from: Visibility(tabActive: false, covered: false, split: false)),
+                       "a tab switch waited for a slide")
+        XCTAssertFalse(Visibility(tabActive: true, covered: false, split: false)
+            .isPop(from: Visibility(tabActive: false, covered: true, split: false)),
+                       "a pop landing from another tab waited for a slide")
     }
 
     /// Beside a chat on a wide iPad the list shows, but a burst of publishes
@@ -212,6 +391,20 @@ final class SidebarLayoutTests: XCTestCase {
         settle()
         XCTAssertEqual(sent, 0)
         updates.isShown = true
+        XCTAssertEqual(sent, 1)
+
+        // Shown again while a burst's draw waits, that draw waits for the
+        // slide in too, then the two draw once.
+        sent = 0
+        updates.revealDelay = 0.3
+        state.sessions = [pinnedTestSession("burst")]
+        updates.isShown = false
+        state.sessions = [pinnedTestSession("covered")]
+        updates.isShown = true
+        settle()
+        XCTAssertEqual(sent, 0, "the burst's draw came during the slide in")
+        waitUntil { sent > 0 }
+        settle()
         XCTAssertEqual(sent, 1)
     }
 
@@ -458,6 +651,56 @@ final class SidebarLayoutTests: XCTestCase {
         XCTAssertEqual(sent, 3)
     }
 
+    /// The Chats and drawer menus' Needs you entry watches the store: on a
+    /// dashboard whose plugin keeps no list, another combined dashboard's
+    /// first wait brings it with nothing else redrawing, and its last one
+    /// takes it away (all-live stage 4a).
+    @MainActor
+    func testTheNeedsYouMenuEntryComesWithAnotherDashboardsFirstWait() throws {
+        let state = makeAppState()
+        XCTAssertFalse(state.servesNeedsYou)
+        let host = UIHostingController(rootView: VStack { NeedsYouMenuEntry(store: state.needsYou) {} }.environmentObject(state))
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let window = UIWindow(windowScene: scene)
+        window.frame = CGRect(x: 0, y: 0, width: 390, height: 844)
+        window.rootViewController = host
+        window.isHidden = false
+        defer { window.isHidden = true }
+        NeedsYouMenuEntry.lastShown = nil
+        waitUntil { NeedsYouMenuEntry.lastShown != nil }
+        XCTAssertEqual(NeedsYouMenuEntry.lastShown, false)
+
+        let there = UUID()
+        state.needsYou.applyOther([NeedsYouItem(waitID: "w", profile: "default", kind: .approval, sessionIDs: ["s"])],
+                                  profile: "default", dashboardID: there)
+        waitUntil { NeedsYouMenuEntry.lastShown == true }
+        XCTAssertEqual(NeedsYouMenuEntry.lastShown, true, "another dashboard's wait brings the entry")
+
+        state.needsYou.forgetOtherDashboards(otherThan: [])
+        waitUntil { NeedsYouMenuEntry.lastShown == false }
+        XCTAssertEqual(NeedsYouMenuEntry.lastShown, false, "and its going takes it away")
+    }
+
+    /// A combined dashboard's badge past the palette: each place's hue
+    /// keeps clear of the palette's and of the ones before it.
+    @MainActor
+    func testBadgeHuesPastThePaletteKeepClearOfEachOther() {
+        // The hues the generated ones keep clear of are the palette's own.
+        XCTAssertEqual(CombinedDashboardBadge.paletteHues.count, CombinedDashboardBadge.palette.count)
+        for (color, listed) in zip(CombinedDashboardBadge.palette, CombinedDashboardBadge.paletteHues) {
+            var hue: CGFloat = 0
+            XCTAssertTrue(UIColor(color).getHue(&hue, saturation: nil, brightness: nil, alpha: nil))
+            XCTAssertEqual(Double(hue), listed, accuracy: 0.002, "paletteHues drifted from the palette")
+        }
+        let hues = (6..<12).map(CombinedDashboardBadge.generatedHue)
+        for (at, hue) in hues.enumerated() {
+            for other in CombinedDashboardBadge.paletteHues + hues[..<at] {
+                let apart = min(abs(hue - other), 1 - abs(hue - other))
+                XCTAssertGreaterThan(apart, 0.03, "hue \(hue) sits on \(other)")
+            }
+        }
+    }
+
     private func settle() {
         RunLoop.current.run(until: Date().addingTimeInterval(0.1))
     }
@@ -535,5 +778,136 @@ final class SidebarLayoutTests: XCTestCase {
             [pinnedTestSession("a")], query: "", isPinned: { _ in false }, matches: titleMatches
         )
         XCTAssertTrue(result.isEmpty)
+    }
+
+    /// Issue 2671: a Mac keeps the Sessions list's bar hidden, as before
+    /// #2580; an iPhone and an iPad keep it shown for the pushed header.
+    func testListKeepsItsBarShownExceptOnAMac() {
+        XCTAssertTrue(V2ListNavigationBarPolicy.keepsBarShown(onMac: false))
+        XCTAssertFalse(V2ListNavigationBarPolicy.keepsBarShown(onMac: true))
+    }
+
+    /// The Sessions list keeps its navigation bar shown (#2580): while the
+    /// list is on top its keeper takes the bar's height out of the list's
+    /// safe area and keeps the bar's touches and VoiceOver off; a page pushed
+    /// over it gets the bar back as any screen has it, and the list takes it
+    /// again once it's on top. Dismantled, the list's inset goes back to 0.
+    @MainActor
+    func testListKeepsItsShownBarOutOfTheWayOnlyWhileItsOnTop() {
+        let list = UIViewController()
+        let navigation = UINavigationController(navigationBarClass: SizableNavigationBar.self, toolbarClass: nil)
+        navigation.setViewControllers([list], animated: false)
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
+        window.rootViewController = navigation
+        window.isHidden = false
+        defer { window.isHidden = true }
+        window.layoutIfNeeded()
+        let bar = navigation.navigationBar
+        XCTAssertFalse(navigation.isNavigationBarHidden)
+
+        func waitUntil(_ what: String, _ condition: @escaping () -> Bool) {
+            let met = expectation(description: what)
+            func poll(_ triesLeft: Int) {
+                if condition() { return met.fulfill() }
+                guard triesLeft > 0 else { return }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.02) { poll(triesLeft - 1) }
+            }
+            poll(100)
+            wait(for: [met], timeout: 3)
+        }
+
+        let keeper = V2ListNavigationBar.KeeperView()
+        list.view.addSubview(keeper)
+        waitUntil("the list takes the bar out of the way") {
+            !bar.isUserInteractionEnabled && bar.accessibilityElementsHidden
+        }
+        XCTAssertGreaterThan(bar.bounds.height, 0)
+        XCTAssertEqual(list.additionalSafeAreaInsets.top, -bar.bounds.height, "the list lies where it did under a hidden bar")
+
+        // A chat pushed over the list: the bar is the chat's.
+        navigation.pushViewController(UIViewController(), animated: false)
+        window.layoutIfNeeded()
+        waitUntil("the pushed page gets the bar back") {
+            bar.isUserInteractionEnabled && !bar.accessibilityElementsHidden
+        }
+
+        // Back on the list: it takes the bar again.
+        navigation.popViewController(animated: false)
+        window.layoutIfNeeded()
+        waitUntil("the list takes the bar again after the pop") {
+            !bar.isUserInteractionEnabled && bar.accessibilityElementsHidden
+        }
+        XCTAssertEqual(list.additionalSafeAreaInsets.top, -bar.bounds.height)
+
+        // The bar's height changes with the window (a turned phone, a
+        // resized iPad window): the list's inset follows it, each time.
+        for height in [CGFloat(70), 32] {
+            // UIKit lays the bar out by its own height and lays it out
+            // again whenever the list's safe area changes, so the test bar
+            // reports the height it's given and announces it as a resize.
+            (bar as? SizableNavigationBar)?.height = height
+            navigation.view.setNeedsLayout()
+            navigation.view.layoutIfNeeded()
+            waitUntil("the list's inset follows a \(height) pt bar") {
+                bar.bounds.height == height && list.additionalSafeAreaInsets.top == -height
+            }
+        }
+
+        V2ListNavigationBar.dismantleUIView(keeper, coordinator: ())
+        XCTAssertEqual(list.additionalSafeAreaInsets.top, 0)
+        XCTAssertTrue(bar.isUserInteractionEnabled)
+        XCTAssertFalse(bar.accessibilityElementsHidden)
+        keeper.removeFromSuperview()
+    }
+
+    /// A keeper whose lookups ran out before its stack held the list
+    /// (issue 2592) looks again on a later update of the list, and manages
+    /// the bar once it finds the stack.
+    @MainActor
+    func testTheListBarKeeperFindsItsStackOnALaterUpdate() {
+        let list = UIViewController()
+        let navigation = UINavigationController(rootViewController: list)
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
+        window.rootViewController = navigation
+        window.isHidden = false
+        defer { window.isHidden = true }
+        window.layoutIfNeeded()
+        let bar = navigation.navigationBar
+
+        let keeper = V2ListNavigationBar.KeeperView()
+        keeper.retries = 0
+        var stackWired = false
+        keeper.findPage = { view in stackWired ? SystemBackSwipeGate.pushedPage(of: view) : nil }
+        list.view.addSubview(keeper)
+        XCTAssertTrue(bar.isUserInteractionEnabled, "no stack found: the bar isn't managed yet")
+        XCTAssertEqual(list.additionalSafeAreaInsets.top, 0)
+
+        stackWired = true
+        keeper.sync()
+        XCTAssertFalse(bar.isUserInteractionEnabled, "a later update finds the stack")
+        XCTAssertTrue(bar.accessibilityElementsHidden)
+        XCTAssertEqual(list.additionalSafeAreaInsets.top, -bar.bounds.height)
+
+        V2ListNavigationBar.dismantleUIView(keeper, coordinator: ())
+        keeper.removeFromSuperview()
+    }
+}
+
+/// A navigation bar whose height a test sets, standing in for the bar's
+/// height changing with the window.
+private final class SizableNavigationBar: UINavigationBar {
+    /// The height the bar reports, whatever UIKit lays it out at. Setting it
+    /// sets the bounds, so whoever observes them hears of the change.
+    var height: CGFloat? {
+        didSet { bounds = super.bounds }
+    }
+
+    override var bounds: CGRect {
+        get {
+            var reported = super.bounds
+            if let height { reported.size.height = height }
+            return reported
+        }
+        set { super.bounds = newValue }
     }
 }

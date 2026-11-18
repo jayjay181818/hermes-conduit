@@ -44,6 +44,9 @@ struct RoomCopy: Identifiable, Equatable {
     let members: [Member]
     /// Your agents in it, while they are; empty once they're out.
     let yours: [Agent]
+    /// You're in it with none of your agents ("Just me"): you read it and
+    /// post in it yourself.
+    var justMe = false
     /// `started`, `left` (your agents left) or `ended`. A status a newer
     /// plugin adds is kept as it is.
     let status: String
@@ -56,6 +59,10 @@ struct RoomCopy: Identifiable, Equatable {
     /// The last event the copy holds.
     let lastSeq: Int
     let updatedAt: Double
+    /// Who left or was taken out, by member id: yours from their invite,
+    /// everyone else's as the home last said (plugin 0.166+ on both
+    /// sides; empty from an older one, which shows everyone as in).
+    var out: [String: RoomMemberOut] = [:]
 
     /// It ended, or your agents left: nothing more comes, and it can be
     /// deleted.
@@ -79,6 +86,7 @@ struct RoomCopy: Identifiable, Equatable {
             if agent == nil {
                 shown.owner = member.owner ?? (host.isEmpty ? nil : host)
             }
+            shown.out = out[member.memberID]
             return shown
         }
         return GroupRoom(
@@ -109,18 +117,26 @@ enum RoomCopyText {
     /// The row's line: who hosts it and how it stands.
     static func line(for copy: RoomCopy) -> String {
         switch copy.status {
+        case "ended" where copy.reason == "removed":
+            // The room goes on without your agents: it didn't end.
+            let host = copy.from.trimmingCharacters(in: .whitespacesAndNewlines)
+            return host.isEmpty
+                ? AppLocalization.string("Your agents were taken out", table: .rooms)
+                : AppLocalization.string("\(host) took your agents out", table: .rooms)
         case "ended":
             return AppLocalization.string("Ended")
         case "left":
-            return AppLocalization.string("Your agents left")
+            return copy.justMe
+                ? AppLocalization.string("You left", table: .rooms)
+                : AppLocalization.string("Your agents left", table: .rooms)
         default:
             break
         }
         let host = copy.from.trimmingCharacters(in: .whitespacesAndNewlines)
         if copy.state.working {
             return host.isEmpty
-                ? AppLocalization.string("Hosted elsewhere · working…")
-                : AppLocalization.string("Hosted by \(host) · working…")
+                ? AppLocalization.string("Hosted elsewhere · working…", table: .rooms)
+                : AppLocalization.string("Hosted by \(host) · working…", table: .rooms)
         }
         // The count in a string of its own, for its plural.
         let hostLine = self.host(for: copy)
@@ -131,13 +147,13 @@ enum RoomCopyText {
     /// Group Info's first line.
     static func host(for copy: RoomCopy) -> String {
         let host = copy.from.trimmingCharacters(in: .whitespacesAndNewlines)
-        return host.isEmpty ? AppLocalization.string("Hosted elsewhere") : AppLocalization.string("Hosted by \(host)")
+        return host.isEmpty ? AppLocalization.string("Hosted elsewhere", table: .rooms) : AppLocalization.string("Hosted by \(host)", table: .rooms)
     }
 
     /// Who posts the room's people's messages, by the host's name.
     static func hostName(for copy: RoomCopy) -> String {
         let host = copy.from.trimmingCharacters(in: .whitespacesAndNewlines)
-        return host.isEmpty ? AppLocalization.string("The host") : host
+        return host.isEmpty ? AppLocalization.string("The host", table: .rooms) : host
     }
 
     /// In the composer's place, when it can't be posted in: it's over, or
@@ -147,23 +163,23 @@ enum RoomCopyText {
         let host = copy.from.trimmingCharacters(in: .whitespacesAndNewlines)
         if canPost || copy.isOver {
             return host.isEmpty
-                ? AppLocalization.string("Hosted elsewhere. You can read it here.")
-                : AppLocalization.string("Hosted by \(host). You can read it here.")
+                ? AppLocalization.string("Hosted elsewhere. You can read it here.", table: .rooms)
+                : AppLocalization.string("Hosted by \(host). You can read it here.", table: .rooms)
         }
         return host.isEmpty
-            ? PluginUpdateAsk.text(AppLocalization.string("Hosted elsewhere. Update the Conduit plugin on your Hermes to post in it."),
-                                   lead: AppLocalization.string("Hosted elsewhere."))
-            : PluginUpdateAsk.text(AppLocalization.string("Hosted by \(host). Update the Conduit plugin on your Hermes to post in it."),
-                                   lead: AppLocalization.string("Hosted by \(host)."))
+            ? PluginUpdateAsk.text(AppLocalization.string("Hosted elsewhere. Update the Conduit plugin on your Hermes to post in it.", table: .rooms),
+                                   lead: AppLocalization.string("Hosted elsewhere.", table: .rooms))
+            : PluginUpdateAsk.text(AppLocalization.string("Hosted by \(host). Update the Conduit plugin on your Hermes to post in it.", table: .rooms),
+                                   lead: AppLocalization.string("Hosted by \(host).", table: .rooms))
     }
 
-    static var deleteTitle: String { AppLocalization.string("Delete this room?") }
+    static var deleteTitle: String { AppLocalization.string("Delete this room?", table: .rooms) }
     static var deleteMessage: String {
-        AppLocalization.string("Your copy of it and your agents' chats for it are deleted from your Hermes. The others keep theirs.")
+        AppLocalization.string("Your copy of it and your agents' chats for it are deleted from your Hermes. The others keep theirs.", table: .rooms)
     }
 
     static func deleteRefusal(for error: Error) -> String {
-        AppLocalization.string("Could not delete this room: \(RoomLinksClient.message(for: error))")
+        AppLocalization.string("Could not delete this room: \(RoomLinksClient.message(for: error))", table: .rooms)
     }
 }
 
@@ -252,7 +268,7 @@ struct RoomCopiesClient {
             guard let memberID = text(agent["member_id"]), let profile = text(agent["profile"]) else { return nil }
             return RoomCopy.Agent(memberID: memberID, profile: profile, handle: text(agent["handle"]))
         }
-        return RoomCopy(
+        var copy = RoomCopy(
             roomID: roomID,
             name: name,
             link: link,
@@ -263,8 +279,13 @@ struct RoomCopiesClient {
             reason: text(object["reason"]),
             state: state(object["state"] as? [String: Any] ?? [:]),
             lastSeq: object["last_seq"] as? Int ?? 0,
-            updatedAt: (object["updated_at"] as? NSNumber)?.doubleValue ?? 0
+            updatedAt: (object["updated_at"] as? NSNumber)?.doubleValue ?? 0,
+            out: (object["out"] as? [String: Any] ?? [:]).reduce(into: [:]) { kept, pair in
+                if let how = (pair.value as? String).flatMap(RoomMemberOut.init(rawValue:)) { kept[pair.key] = how }
+            }
         )
+        copy.justMe = object["just_me"] as? Bool ?? false
+        return copy
     }
 
     /// The copy's state as the room screen reads a driver's: working, each
@@ -378,11 +399,11 @@ extension AppState {
     func readLinkedRoomCopies() async -> [RoomCopy]? {
         guard canReadRoomCopies, isConnected else { return nil }
         let epoch = groupRoomEpoch
-        let generation = linkedRoomCopiesGeneration
+        let generation = linkedRosterGeneration
         let client = roomCopiesClient
-        // A read a delete overtook could still list the deleted copy.
+        // A read a delete, Block or leave overtook could still list what went.
         guard let copies = try? await client.copies(), groupRoomEpoch == epoch,
-              linkedRoomCopiesGeneration == generation, activeDashboardID == client.dashboardID else { return nil }
+              linkedRosterGeneration == generation, activeDashboardID == client.dashboardID else { return nil }
         let read = LinkedRoomCopies(dashboardID: client.dashboardID, copies: copies)
         // The room screen reads them each quiet tick: unchanged, nothing is published.
         if read != linkedRoomCopies { linkedRoomCopies = read }
@@ -427,7 +448,7 @@ extension AppState {
         } catch {
             return .refused(RoomCopyText.deleteRefusal(for: error))
         }
-        linkedRoomCopiesGeneration &+= 1
+        linkedRosterGeneration &+= 1
         if var copies = linkedRoomCopies, copies.dashboardID == client.dashboardID {
             copies.copies.removeAll { $0.id == copy.id }
             linkedRoomCopies = copies

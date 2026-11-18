@@ -129,6 +129,18 @@ struct ChatStepLabel: Equatable {
     var action: String?
     /// The catalog's line about the toolset, for the opened row.
     var detail: String?
+    /// What an MCP or connector call was about, from its own arguments
+    /// (the prompt, query or page it was given).
+    var about: String?
+
+    /// The line under the row's words: an MCP or connector call's action and
+    /// what it was about ("generate image · a fox in the snow"), so the row
+    /// says more than the tool's name.
+    var subjectLine: String? {
+        guard let action else { return about }
+        guard let about, about.caseInsensitiveCompare(action) != .orderedSame else { return action }
+        return "\(action) · \(about)"
+    }
 
     init(toolName: String, input: String? = nil, catalog: ToolCatalog = ToolCatalog()) {
         let name = toolName.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -172,6 +184,7 @@ struct ChatStepLabel: Equatable {
         if let call = Self.appCall(name) {
             kind = .named(call.app)
             action = call.action.isEmpty ? nil : call.action
+            about = ChatStepSubject.argument(from: input)
             return
         }
         let category = HermesToolCategory(toolName: name)
@@ -192,9 +205,9 @@ struct ChatStepLabel: Equatable {
     var runningTitle: String {
         switch kind {
         case .category(let category): AppLocalization.string(String.LocalizationValue(HermesTurnCopy.toolKey(category)))
-        case .named(let name): AppLocalization.string("Using \(name)")
-        case .toolSearch: AppLocalization.string("Looking for tools")
-        case .toolDescribe: AppLocalization.string("Reading tool details")
+        case .named(let name): AppLocalization.string("Using \(name)", table: .chat)
+        case .toolSearch: AppLocalization.string("Looking for tools", table: .chat)
+        case .toolDescribe: AppLocalization.string("Reading tool details", table: .chat)
         }
     }
 
@@ -202,9 +215,9 @@ struct ChatStepLabel: Equatable {
     var doneTitle: String {
         switch kind {
         case .category(let category): AppLocalization.string(ChatStepStyle.doneKey(category))
-        case .named(let name): AppLocalization.string("Used \(name)")
-        case .toolSearch: AppLocalization.string("Looked for tools")
-        case .toolDescribe: AppLocalization.string("Read tool details")
+        case .named(let name): AppLocalization.string("Used \(name)", table: .chat)
+        case .toolSearch: AppLocalization.string("Looked for tools", table: .chat)
+        case .toolDescribe: AppLocalization.string("Read tool details", table: .chat)
         }
     }
 
@@ -297,6 +310,16 @@ enum ChatStepSubject {
         return oneLine(trimmed)
     }
 
+    /// What a call was about, from its own arguments only: nil for a JSON
+    /// object too large to parse, so a row never shows a raw fragment
+    /// (an image call's inline base64) after its action.
+    static func argument(from input: String?) -> String? {
+        guard let input else { return nil }
+        let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.hasPrefix("{"), trimmed.utf8.count > parseLimit { return nil }
+        return line(from: trimmed)
+    }
+
     private static func oneLine(_ text: String) -> String? {
         let line = String(text.prefix(400))
             .replacingOccurrences(of: "\n", with: " ")
@@ -330,7 +353,9 @@ extension View {
     @ViewBuilder
     func chatStepCard(_ isOn: Bool = true) -> some View {
         if isOn {
-            settingsCard(cornerRadius: ChatStepStyle.cardCornerRadius)
+            // As it grows open, what it opens shows only inside the card.
+            clipShape(RoundedRectangle(cornerRadius: ChatStepStyle.cardCornerRadius, style: .continuous))
+                .settingsCard(cornerRadius: ChatStepStyle.cardCornerRadius)
         } else {
             self
         }
@@ -358,7 +383,7 @@ struct ChatWorkingLine: View {
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
     private var phrase: String {
-        if repliesElsewhere { return AppLocalization.string("Replying on another device") }
+        if repliesElsewhere { return AppLocalization.string("Replying on another device", table: .chat) }
         if let currentToolTitle { return currentToolTitle }
         if let currentToolName {
             return ChatStepLabel(toolName: currentToolName, input: currentToolInput, catalog: rowState.toolCatalog).runningTitle
@@ -406,7 +431,7 @@ struct ChatWorkingLine: View {
             }
         }
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel(AppLocalization.string("\(identity.name) is working"))
+        .accessibilityLabel(AppLocalization.string("\(identity.name) is working", table: .chat))
         .accessibilityValue(phrase)
 
         // The timer stays its own element, so VoiceOver reads it current.
@@ -803,6 +828,8 @@ private struct ChatStepRowBody: View {
                     }
                     // Close the transcript's gap to the row above: one card.
                     .padding(.top, isFirst ? 0 : -ChatStepStyle.transcriptRowSpacing)
+                    // The run's open line doesn't fade over its folded one.
+                    .transition(.rowFoldSwap)
                 } else if isFirst {
                     ChatStepGroupHeader(
                         members: visible,
@@ -816,6 +843,7 @@ private struct ChatStepRowBody: View {
                         toggle: { toggle(group, to: true) }
                     )
                     .chatStepCard()
+                    .transition(.rowFoldSwap)
                 }
             }
         }
@@ -843,7 +871,7 @@ private struct ChatStepRowBody: View {
         .chatStepMenu(
             // Like the run's line: only once the turn is done with it.
             explain: (lookingBack || placement.group.members.contains(where: \.running) || (placement.group.isTrailing && isBusy)) ? nil : explain,
-            title: summary == nil ? AppLocalization.string("Explain this step") : AppLocalization.string("Explain again"),
+            title: summary == nil ? AppLocalization.string("Explain this step", table: .chat) : AppLocalization.string("Explain again", table: .chat),
             thinking: thinkingReveal
         )
     }
@@ -939,7 +967,7 @@ private struct ChatStepGroupHeader: View {
     /// time is on the working line): shown, then spoken.
     private var title: (shown: String, spoken: String) {
         let counted = self.counted ?? members
-        let count = AppLocalization.string("\(counted.count) steps")
+        let count = AppLocalization.string("\(counted.count) steps", table: .chat)
         let span = isLive ? nil : ChatStepTiming.span(of: counted)
         guard let time = ChatStepTiming.text(span),
               let spoken = ChatStepTiming.spokenText(span) else { return (count, count) }
@@ -980,7 +1008,7 @@ private struct ChatStepGroupHeader: View {
             // The caller leaves explain out over a step still marked running,
             // hidden ones included: Hermes isn't done with them.
             explain: lookingBack ? nil : explain,
-            title: summary == nil ? AppLocalization.string("Explain these steps") : AppLocalization.string("Explain again"),
+            title: summary == nil ? AppLocalization.string("Explain these steps", table: .chat) : AppLocalization.string("Explain again", table: .chat),
             thinking: thinking
         )
     }
@@ -1059,7 +1087,7 @@ struct ChatStepLookingBack: View {
         HStack(spacing: 6) {
             ProgressView()
                 .controlSize(.mini)
-            Text(AppLocalization.string("Hermes is looking back…"))
+            Text(AppLocalization.string("Hermes is looking back…", table: .chat))
                 .scaledFont(.caption)
                 .foregroundStyle(.secondary)
         }
@@ -1088,7 +1116,7 @@ struct ChatThinkingReveal {
     }
 
     var title: String {
-        shown ? AppLocalization.string("Hide thinking") : AppLocalization.string("Show thinking")
+        shown ? AppLocalization.string("Hide thinking", table: .chat) : AppLocalization.string("Show thinking", table: .chat)
     }
 }
 

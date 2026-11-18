@@ -450,6 +450,155 @@ final class AppStateDecisionFenceTests: XCTestCase {
         XCTAssertNil(appState.errorMessage, "A stale failure must not surface a user-facing banner on B")
     }
 
+    func testStaleSubmissionRearmsACardTheReplacementClientReplayed() async throws {
+        let appState = makeAppState()
+        appState.messages = [approvalFixture(requestId: "request-a")]
+        let transport = ClarifyFakeTransport()
+        let socket = ClarifyFakeSocket()
+        _ = try await installConnectedClient(appState, socket: socket, transport: transport)
+
+        let parked = try await parkApprovalRespond(appState: appState, socket: socket)
+
+        // The replacement client replays the same request while the old
+        // submission is still out: the card keeps reading Sending.
+        appState.client = makeReplacementClient(baseURL: "https://two.example")
+        var replay = try XCTUnwrap(approvalFixture(requestId: "request-a").approval)
+        replay.status = .pending
+        appState.applyApprovalActivity(replay, authoritative: true)
+        XCTAssertEqual(appState.messages.first?.approval?.status, .submitting)
+
+        deliverResult(socket, rpcID: parked.rpcID, result: ["resolved": 1])
+        await parked.task.value
+
+        let card = try XCTUnwrap(appState.messages.first?.approval)
+        XCTAssertEqual(card.requestId, "request-a")
+        XCTAssertEqual(card.status, .pending, "nothing else would settle a card left on Sending")
+        XCTAssertNil(card.choice)
+        XCTAssertNil(card.error)
+    }
+
+    // A session-wide answer that may have reached Hermes can't be offered
+    // again after its connection was replaced: a second tap would settle
+    // whatever request is oldest now (issue 2333).
+    func testStaleSessionWideAnswerIsNotOfferedAgain() async throws {
+        let appState = makeAppState()
+        appState.messages = [approvalFixture()]
+        let transport = ClarifyFakeTransport()
+        let socket = ClarifyFakeSocket()
+        _ = try await installConnectedClient(appState, socket: socket, transport: transport)
+
+        let parked = try await parkApprovalRespond(appState: appState, socket: socket)
+        XCTAssertEqual(appState.messages.first?.approval?.status, .submitting)
+
+        appState.client = makeReplacementClient(baseURL: "https://two.example")
+        deliverResult(socket, rpcID: parked.rpcID, result: ["resolved": 1])
+        await parked.task.value
+
+        let card = try XCTUnwrap(appState.messages.first?.approval)
+        XCTAssertEqual(card.status, .expired, "a re-tap would answer the session's next request")
+        XCTAssertNil(card.choice)
+        XCTAssertEqual(
+            card.error,
+            AppLocalization.string("The connection changed before Hermes confirmed this answer. It isn't sent again, since it could answer a different request.")
+        )
+    }
+
+    func testStaleSessionWideAnswerFailureIsNotOfferedAgain() async throws {
+        let appState = makeAppState()
+        appState.messages = [approvalFixture()]
+        let transport = ClarifyFakeTransport()
+        let socket = ClarifyFakeSocket()
+        _ = try await installConnectedClient(appState, socket: socket, transport: transport)
+
+        let parked = try await parkApprovalRespond(appState: appState, socket: socket)
+        appState.client = makeReplacementClient(baseURL: "https://two.example")
+        // Failed after it was sent: Hermes may have taken it first.
+        deliverError(socket, rpcID: parked.rpcID, code: 5000, message: "socket closed")
+        await parked.task.value
+
+        let card = try XCTUnwrap(appState.messages.first?.approval)
+        XCTAssertEqual(card.status, .expired)
+        XCTAssertNil(card.choice)
+        XCTAssertNil(appState.errorMessage)
+    }
+
+    // The socket refused the frame: the answer never left, so the card can
+    // be answered again on the new connection.
+    func testStaleSessionWideAnswerThatNeverLeftIsOfferedAgain() async throws {
+        let appState = makeAppState()
+        appState.messages = [approvalFixture()]
+        let transport = ClarifyFakeTransport()
+        let socket = ClarifyFakeSocket()
+        _ = try await installConnectedClient(appState, socket: socket, transport: transport)
+
+        socket.holdSendCompletion = true
+        let parked = try await parkApprovalRespond(appState: appState, socket: socket)
+        appState.client = makeReplacementClient(baseURL: "https://two.example")
+        socket.releaseSends(error: URLError(.networkConnectionLost))
+        await parked.task.value
+
+        let card = try XCTUnwrap(appState.messages.first?.approval)
+        XCTAssertEqual(card.status, .pending, "nothing reached Hermes")
+        XCTAssertNil(card.choice)
+        XCTAssertNil(card.error)
+    }
+
+    // Hermes said it waits no longer: the card ends saying that, not that the
+    // connection changed.
+    func testStaleSessionWideAnswerHermesNoLongerWaitedOnSaysSo() async throws {
+        let appState = makeAppState()
+        appState.messages = [approvalFixture()]
+        let transport = ClarifyFakeTransport()
+        let socket = ClarifyFakeSocket()
+        _ = try await installConnectedClient(appState, socket: socket, transport: transport)
+
+        let parked = try await parkApprovalRespond(appState: appState, socket: socket)
+        appState.client = makeReplacementClient(baseURL: "https://two.example")
+        deliverError(socket, rpcID: parked.rpcID, code: 4009, message: "no pending approval")
+        await parked.task.value
+
+        let card = try XCTUnwrap(appState.messages.first?.approval)
+        XCTAssertEqual(card.status, .expired)
+        XCTAssertEqual(
+            card.error,
+            AppLocalization.string("This approval is no longer active — Hermes timed it out and continued.")
+        )
+    }
+
+    func testStaleSessionWideAnswerWhoseSessionWentSaysNoLongerActive() async throws {
+        let appState = makeAppState()
+        appState.messages = [approvalFixture()]
+        let transport = ClarifyFakeTransport()
+        let socket = ClarifyFakeSocket()
+        _ = try await installConnectedClient(appState, socket: socket, transport: transport)
+
+        let parked = try await parkApprovalRespond(appState: appState, socket: socket)
+        appState.client = makeReplacementClient(baseURL: "https://two.example")
+        deliverError(socket, rpcID: parked.rpcID, code: 4001, message: "session not found")
+        await parked.task.value
+
+        let card = try XCTUnwrap(appState.messages.first?.approval)
+        XCTAssertEqual(card.status, .expired)
+        XCTAssertEqual(card.error, AppLocalization.string("This approval is no longer active."))
+    }
+
+    // No socket: the session-wide answer never left, which the card path
+    // reads as one it can offer again.
+    func testASessionWideAnswerWithNoSocketIsNotSent() async throws {
+        let client = HermesClient(
+            connection: HermesConnection(baseUrl: "https://one.example", ticket: "t"),
+            profile: "default"
+        )
+        do {
+            _ = try await client.respondToApprovalOutcome(sessionId: "s1", choice: "once")
+            XCTFail("an unconnected client sends nothing")
+        } catch let unsent as HermesClient.AnswerNotSent {
+            guard case HermesError.notConnected = unsent.underlying else {
+                return XCTFail("expected notConnected underneath, got \(unsent.underlying)")
+            }
+        }
+    }
+
     // MARK: - Stale native clarify completions
 
     func testStaleClarifySuccessCannotMutateReplacedClientState() async throws {
@@ -526,6 +675,70 @@ final class AppStateDecisionFenceTests: XCTestCase {
         let card = try XCTUnwrap(appState.messages.first?.approval)
         XCTAssertEqual(card.status, .rejected)
         XCTAssertEqual(card.choice, "deny")
+    }
+
+    /// "Tell Hermes what to do instead": the words steer the waiting turn
+    /// before the command is rejected, so they ride on its result.
+    func testTellHermesInsteadSteersThenRejects() async throws {
+        var steered: [String] = []
+        var operations = ChatResumeLifecycleOperations()
+        operations.steer = { _, session, text in steered.append("\(session): \(text)") }
+        let appState = makeAppState(chatResumeLifecycleOperations: operations)
+        appState.activeSessionId = "default"
+        appState.messages = [approvalFixture()]
+        let transport = ClarifyFakeTransport()
+        let socket = ClarifyFakeSocket()
+        _ = try await installConnectedClient(appState, socket: socket, transport: transport)
+        let sent = ClarifyGate()
+        socket.onSend = { sent.signal() }
+        socket.refusesApprovalPendingBeforeRespond = true
+        let shown = try XCTUnwrap(appState.messages.first?.approval)
+
+        let task = Task {
+            await appState.rejectApprovalAndSteer(messageId: "approval-msg", instruction: "  Use the staging box  ", shown: shown)
+        }
+        try await sent.wait("the approval.respond request to be sent")
+        XCTAssertEqual(steered, ["default: Use the staging box"], "The steer goes first")
+        let request = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(try XCTUnwrap(socket.sentTexts.last).utf8)) as? [String: Any]
+        )
+        XCTAssertEqual((request["params"] as? [String: Any])?["choice"] as? String, "deny")
+        deliverResult(socket, rpcID: try XCTUnwrap(request["id"] as? Int), result: [:])
+        await task.value
+
+        XCTAssertEqual(appState.messages.first?.approval?.status, .rejected)
+        XCTAssertTrue(appState.messages.contains { $0.isSteer && $0.content == "Use the staging box" }, "The steer shows in the chat")
+        XCTAssertNil(appState.composerPrefillDraftKey, "A steer Hermes took leaves the composer alone")
+    }
+
+    /// A legacy card the next command updates in place while Tell Hermes
+    /// instead's steer goes isn't answered, and goes back to waiting rather
+    /// than staying taken.
+    func testTellHermesInsteadLeavesALegacyCardTheNextCommandReplacedWaiting() async throws {
+        var duringSteer: (() -> Void)?
+        var operations = ChatResumeLifecycleOperations()
+        operations.steer = { _, _, _ in duringSteer?() }
+        let appState = makeAppState(chatResumeLifecycleOperations: operations)
+        appState.activeSessionId = "default"
+        appState.messages = [approvalFixture()]
+        let socket = ClarifyFakeSocket()
+        _ = try await installConnectedClient(appState, socket: socket, transport: ClarifyFakeTransport())
+        let shown = try XCTUnwrap(appState.messages.first?.approval)
+        defer { duringSteer = nil }
+        duringSteer = {
+            XCTAssertEqual(appState.messages.first?.approval?.status, .submitting, "taken while the steer goes")
+            appState.messages[0].approval?.command = "migrate"
+            appState.messages[0].approval?.description = "Run the migration?"
+        }
+        let sentBefore = socket.sentTexts.count
+
+        await appState.rejectApprovalAndSteer(messageId: "approval-msg", instruction: "Use staging", shown: shown)
+
+        let card = try XCTUnwrap(appState.messages.first?.approval)
+        XCTAssertEqual(card.command, "migrate")
+        XCTAssertEqual(card.status, .pending, "the new question waits for its own answer")
+        XCTAssertNil(card.choice)
+        XCTAssertFalse(socket.sentTexts.dropFirst(sentBefore).contains { $0.contains("approval.respond") }, "nothing answers the new question")
     }
 
     func testRequestIdentifiedApprovalWithZeroResolvedExpires() async throws {
@@ -724,6 +937,39 @@ final class AppStateDecisionFenceTests: XCTestCase {
         XCTAssertEqual(appState.messages.count, 1)
         XCTAssertEqual(appState.messages[0].approval?.status, .error)
         XCTAssertNil(appState.messages[0].approval?.requestId)
+    }
+
+    func testLegacyErrorRefreshLeavesARetriedCardToItsRetry() async throws {
+        let appState = makeAppState()
+        prepareActiveSession(appState)
+        appState.messages = [approvalFixture()]
+        appState.messages[0].approval?.sessionId = "runtime-queue"
+        let transport = ClarifyFakeTransport()
+        let socket = ClarifyFakeSocket()
+        let client = try await installConnectedClient(appState, socket: socket, transport: transport)
+
+        let parked = try await parkApprovalRespond(appState: appState, socket: socket)
+        deliverError(socket, rpcID: parked.rpcID, code: 4002, message: "temporary failure")
+        await parked.task.value
+        for _ in 0..<1_000 where socket.sentTexts.count < 2 { await Task.yield() }
+        let refresh = appState.schedulePendingApprovalsRefresh(
+            sessionId: "runtime-queue",
+            using: client,
+            replacingLegacyErrorMessageID: "approval-msg"
+        )
+        for _ in 0..<1_000 where socket.sentTexts.count < 3 { await Task.yield() }
+        // The person retries while the queue read is out.
+        appState.messages[0].approval?.status = .submitting
+        appState.messages[0].approval?.choice = "approve"
+        appState.messages[0].approval?.error = nil
+        deliverResult(socket, rpcID: try rpcID(socket.sentTexts[2]), result: ["approvals": [
+            ["request_id": "approval-a", "description": "Run A?"]
+        ]])
+        await refresh.value
+
+        let card = try XCTUnwrap(appState.messages.first { $0.id == "approval-msg" }?.approval)
+        XCTAssertEqual(card.status, .submitting, "the retry still owns its card")
+        XCTAssertEqual(card.choice, "approve")
     }
 
     func testLegacyFailureReplacementRefreshCannotPopulateReplacementClient() async throws {
@@ -2306,20 +2552,26 @@ final class AppStateDecisionFenceTests: XCTestCase {
         XCTAssertEqual(answers.requestIds, [], "a card without its command cannot tell these apart")
     }
 
-    func testRedactedPushApprovalAnswersTheOnlyQueuedRequest() async {
+    func testRedactedPushApprovalShowsEvenTheOnlyQueuedRequestBeforeAnswering() async {
         let answers = RecordedApprovalAnswers()
+        var queueReads = 0
         let appState = makePushRestoredApprovalAppState(
             description: "Hermes needs your approval. Open Conduit for details.",
-            queue: { [
-                self.queuedApproval("req-only", command: "rm -rf build", description: "Delete the build folder?")
-            ] },
+            queue: {
+                queueReads += 1
+                // The push's own request may have gone; this one asks
+                // something the person never saw.
+                return [self.queuedApproval("req-only", command: "rm -rf build", description: "Delete the build folder?")]
+            },
             recording: answers
         )
 
         await appState.respondToApproval(messageId: "approval-runtime-1", choice: "once")
+        for _ in 0..<1_000 where queueReads < 2 { await Task.yield() }
 
-        XCTAssertEqual(answers.requestIds, ["req-only"])
-        XCTAssertEqual(appState.messages.first { $0.id == "approval-runtime-1" }?.approval?.status, .approved)
+        XCTAssertEqual(answers.requestIds, [], "a redacted card cannot say which request it was")
+        XCTAssertGreaterThanOrEqual(queueReads, 2, "the queue's own card is fetched to replace it")
+        XCTAssertNotEqual(appState.messages.first { $0.id == "approval-runtime-1" }?.approval?.status, .approved)
     }
 
     func testRedactedPushApprovalWithTwoQueuedSendsNothingAndRefreshes() async {

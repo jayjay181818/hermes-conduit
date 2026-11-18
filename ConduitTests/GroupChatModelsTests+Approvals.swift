@@ -101,18 +101,18 @@ extension GroupChatModelsTests {
         let agent = "Research Buddy"
         let room = "Zoo trip"
         let host = "Furina"
-        XCTAssertEqual(try line(), AppLocalization.string("\(agent) in \(room), hosted by \(host)"))
-        XCTAssertEqual(try line(from: nil), AppLocalization.string("\(agent) in \(room)"))
-        XCTAssertEqual(try line(from: ""), AppLocalization.string("\(agent) in \(room)"))
-        XCTAssertEqual(try line(room: nil), AppLocalization.string("\(agent) in a room hosted by \(host)"))
-        XCTAssertEqual(try line(room: nil, from: nil), AppLocalization.string("\(agent) in a room hosted elsewhere"))
+        XCTAssertEqual(try line(), AppLocalization.string("\(agent) in \(room), hosted by \(host)", table: .rooms))
+        XCTAssertEqual(try line(from: nil), AppLocalization.string("\(agent) in \(room)", table: .rooms))
+        XCTAssertEqual(try line(from: ""), AppLocalization.string("\(agent) in \(room)", table: .rooms))
+        XCTAssertEqual(try line(room: nil), AppLocalization.string("\(agent) in a room hosted by \(host)", table: .rooms))
+        XCTAssertEqual(try line(room: nil, from: nil), AppLocalization.string("\(agent) in a room hosted elsewhere", table: .rooms))
         // The agent by its name there, else its handle, else its profile.
         let handle = "research-buddy"
         XCTAssertEqual(try line(agent: ["profile": "research", "handle": handle]),
-                       AppLocalization.string("\(handle) in \(room), hosted by \(host)"))
+                       AppLocalization.string("\(handle) in \(room), hosted by \(host)", table: .rooms))
         let profile = "research"
         XCTAssertEqual(try line(agent: ["profile": profile, "display_name": ""]),
-                       AppLocalization.string("\(profile) in \(room), hosted by \(host)"))
+                       AppLocalization.string("\(profile) in \(room), hosted by \(host)", table: .rooms))
     }
 
     @MainActor
@@ -160,6 +160,9 @@ extension GroupChatModelsTests {
         XCTAssertTrue(AppState.roomCopyReadsApprovals(
             roomMoved: false, working: false, listed: false,
             lastRead: now.addingTimeInterval(-AppState.roomCopyQuietApprovalsInterval), now: now))
+        // Group Chats on screen reads them again too: sooner while one is listed.
+        XCTAssertEqual(AppState.rosterApprovalsInterval(listed: true), .seconds(15))
+        XCTAssertEqual(AppState.rosterApprovalsInterval(listed: false), .seconds(45))
     }
 
     /// A copy tick's approvals read that fails doesn't start the quiet
@@ -197,10 +200,10 @@ extension GroupChatModelsTests {
     func testApprovalRefusalsShowThePluginsWords() {
         let answered = "That approval was answered already, or its turn moved on"
         XCTAssertEqual(RoomApprovalsClient.refusal(for: DashboardTicketBridgeError.http(status: 409, detail: answered)),
-                       AppLocalization.string("Could not answer: \(answered)"))
+                       AppLocalization.string("Could not answer: \(answered)", table: .rooms))
         let down = "This Hermes' API server didn't answer; check that its gateway runs"
         XCTAssertEqual(RoomApprovalsClient.refusal(for: DashboardTicketBridgeError.http(status: 503, detail: down)),
-                       AppLocalization.string("Could not answer: \(down)"))
+                       AppLocalization.string("Could not answer: \(down)", table: .rooms))
     }
 
     // MARK: - When they're read
@@ -293,7 +296,7 @@ extension GroupChatModelsTests {
         routes.refusesAnswers = true
         routes.approvals = []
         let refused = await appState.answerLinkedRoomApproval(appState.linkedRoomApprovalRows[0], choice: "deny")
-        XCTAssertEqual(refused, .failed(AppLocalization.string("Could not answer: \(ApprovalsRoutes.notPending)")))
+        XCTAssertEqual(refused, .failed(AppLocalization.string("Could not answer: \(ApprovalsRoutes.notPending)", table: .rooms)))
         XCTAssertEqual(appState.linkedRoomApprovalRows, [])
 
         // A new one (the one answered here stays gone).
@@ -313,6 +316,149 @@ extension GroupChatModelsTests {
         await before.value
         XCTAssertEqual(appState.groupChatPhase, .available)
         XCTAssertEqual(appState.linkedRoomApprovalRows, [], "the read from before the sign-out is dropped")
+    }
+
+    /// Coming back to the foreground reads the approvals with the drafts and
+    /// invites, so one that came up while away shows at once; a plugin that
+    /// doesn't list them isn't asked (#2340, issue 2343).
+    @MainActor
+    func testTheForegroundReadsTheApprovalsOnlyWhereThePluginListsThem() async {
+        let backend = InMemoryKeychainBackend()
+        KeychainHelper.useBackendForTesting(backend)
+        defer { KeychainHelper.useBackendForTesting(KeychainHelper.SystemKeychainBackend()) }
+        let routes = ApprovalsRoutes(approvals: [])
+        let appState = approvalsAppState(routes)
+        approvalsConnect(appState)
+        await appState.refreshGroupChatSupport()
+        appState.applyNotifierPluginReport(approvalsPluginReport)
+        await approvalsWait("the first read", until: { routes.approvalsReads == 1 })
+        routes.approvals = [approvalsApproval()]
+        await appState.refreshLinkedRoomsOnForeground()
+        XCTAssertEqual(routes.approvalsReads, 2)
+        XCTAssertEqual(appState.linkedRoomApprovalRows.map(\.id), ["run_a1/req-1"])
+
+        let older = ApprovalsRoutes(approvals: [approvalsApproval()])
+        let without = approvalsAppState(older)
+        approvalsConnect(without)
+        await without.refreshGroupChatSupport()
+        without.applyNotifierPluginReport(["ok": true, "version": "0.105.0", "capabilities": [RoomInvitesClient.capability]])
+        await without.refreshLinkedRoomsOnForeground()
+        XCTAssertEqual(older.approvalsReads, 0, "not where the plugin doesn't list them")
+    }
+
+    /// A roster read made before a Block that answers after it is dropped:
+    /// it would bring back the blocked host's grants. The Block reads the
+    /// approvals again itself, so they go at once (issue 2347).
+    @MainActor
+    func testARosterReadABlockOvertookIsDropped() async throws {
+        let backend = InMemoryKeychainBackend()
+        KeychainHelper.useBackendForTesting(backend)
+        defer { KeychainHelper.useBackendForTesting(KeychainHelper.SystemKeychainBackend()) }
+        let routes = ApprovalsRoutes(approvals: [approvalsApproval()])
+        let appState = approvalsAppState(routes)
+        approvalsConnect(appState)
+        await appState.refreshGroupChatSupport()
+        appState.applyNotifierPluginReport(approvalsPluginReport)
+        await approvalsWait("the first read", until: { appState.linkedRoomApprovalRows.count == 1 })
+
+        routes.holdsNextRead = true
+        let before = Task { @MainActor in await appState.refreshLinkedRoomApprovals() }
+        await approvalsWait("the held read", until: { routes.holding })
+        // The Block ends the grant: the plugin lists it no more.
+        routes.approvals = []
+        let reads = routes.approvalsReads
+        let removed = try await appState.block(RoomBlockTarget(id: "lk-mona", name: "Mona"))
+        XCTAssertTrue(removed)
+        XCTAssertEqual(routes.unlinks, 1)
+        XCTAssertEqual(routes.approvalsReads, reads + 1, "Block reads the approvals again itself")
+        XCTAssertEqual(appState.linkedRoomApprovalRows, [])
+
+        routes.answerHeldRead()
+        let committed = await before.value
+        XCTAssertFalse(committed, "the read from before the Block is dropped")
+        XCTAssertEqual(appState.linkedRoomApprovalRows, [], "the blocked host's grant stays gone")
+    }
+
+    /// One read of a Linked Rooms list at a time (issue 2359): a caller
+    /// shares a running read that started after the time it names (the
+    /// return to the app's departure), callers that need a read from after
+    /// their call share one queued behind it, and another key's read starts
+    /// at once.
+    @MainActor
+    func testALinkedRoomsListReadIsSharedOnlyWhenItStartedLateEnough() async throws {
+        let read = LinkedRoomListRead()
+        var calls = 0
+        var held: [CheckedContinuation<Void, Never>] = []
+        let body: @MainActor () async -> Bool = {
+            calls += 1
+            await withCheckedContinuation { held.append($0) }
+            return true
+        }
+        func settle(until count: Int) async {
+            for _ in 0..<1000 where held.count < count { await Task.yield() }
+            for _ in 0..<50 { await Task.yield() }
+        }
+        func release() {
+            held.forEach { $0.resume() }
+            held.removeAll()
+        }
+        let left = Date().addingTimeInterval(-60)
+        let first = Task { @MainActor in await read.read(key: 1, body) }
+        await settle(until: 1)
+        let afterLeaving = Task { @MainActor in await read.read(key: 1, since: left, body) }
+        let push = Task { @MainActor in await read.read(key: 1, body) }
+        let secondPush = Task { @MainActor in await read.read(key: 1, body) }
+        await settle(until: 1)
+        XCTAssertEqual(calls, 1, "the return joins the first read; the pushes wait for one after it")
+
+        release()
+        await settle(until: 1)
+        XCTAssertEqual(calls, 2, "the two pushes share one read, after the first")
+        release()
+        for task in [first, afterLeaving, push, secondPush] {
+            let answered = await task.value
+            XCTAssertTrue(answered)
+        }
+
+        // Another key (a Block, a sign-in) doesn't wait on the read before it.
+        let before = Task { @MainActor in await read.read(key: 1, body) }
+        await settle(until: 1)
+        let otherKey = Task { @MainActor in await read.read(key: 2, body) }
+        await settle(until: 2)
+        XCTAssertEqual(calls, 4)
+        release()
+        _ = await before.value
+        _ = await otherKey.value
+    }
+
+    /// Settings > Multiplayer's Unlink fences the roster reads the way
+    /// Block does: a read from before it is dropped (issue 2374).
+    @MainActor
+    func testARosterReadASettingsUnlinkOvertookIsDropped() async throws {
+        let backend = InMemoryKeychainBackend()
+        KeychainHelper.useBackendForTesting(backend)
+        defer { KeychainHelper.useBackendForTesting(KeychainHelper.SystemKeychainBackend()) }
+        let routes = ApprovalsRoutes(approvals: [approvalsApproval()])
+        let appState = approvalsAppState(routes)
+        approvalsConnect(appState)
+        await appState.refreshGroupChatSupport()
+        appState.applyNotifierPluginReport(approvalsPluginReport)
+        await approvalsWait("the first read", until: { appState.linkedRoomApprovalRows.count == 1 })
+
+        routes.holdsNextRead = true
+        let before = Task { @MainActor in await appState.refreshLinkedRoomApprovals() }
+        await approvalsWait("the held read", until: { routes.holding })
+        routes.approvals = []
+        let reads = routes.approvalsReads
+        let removed = try await appState.unlinkLinkedPerson("lk-mona")
+        XCTAssertTrue(removed)
+        XCTAssertEqual(routes.unlinks, 1)
+        XCTAssertEqual(routes.approvalsReads, reads + 1, "Unlink reads the approvals again itself")
+
+        routes.answerHeldRead()
+        let committed = await before.value
+        XCTAssertFalse(committed, "the read from before the Unlink is dropped")
+        XCTAssertEqual(appState.linkedRoomApprovalRows, [], "the unlinked host's grant stays gone")
     }
 
     /// An "Approval needed" notification opens a listed approval's card
@@ -453,6 +599,7 @@ private final class ApprovalsRoutes {
     /// Answers are refused as answered already.
     var refusesAnswers = false
     private(set) var approvalsReads = 0
+    private(set) var unlinks = 0
     private(set) var answers: [[String: Any]] = []
     private(set) var holding = false
     private var released = false
@@ -474,13 +621,15 @@ private final class ApprovalsRoutes {
             return ["ok": true, "invites": invites]
         case (RoomApprovalsClient.path, "GET"):
             approvalsReads += 1
+            // What was listed when the read was made, however long it waits.
+            let listed = approvals
             if holdsNextRead {
                 holdsNextRead = false
                 await hold()
             } else if readsFail {
                 throw URLError(.timedOut)
             }
-            return ["ok": true, "approvals": approvals]
+            return ["ok": true, "approvals": listed]
         case ("\(RoomApprovalsClient.path)/answer", "POST"):
             if refusesAnswers { throw DashboardTicketBridgeError.http(status: 409, detail: Self.notPending) }
             answers.append(body ?? [:])
@@ -488,6 +637,9 @@ private final class ApprovalsRoutes {
             let request = body?["request_id"] as? String
             approvals.removeAll { $0["run_id"] as? String == run && $0["request_id"] as? String == request }
             return ["ok": true, "approval": body ?? [:]]
+        case ("\(RoomLinksClient.path)/links?link_id=lk-mona", "DELETE"):
+            unlinks += 1
+            return ["ok": true, "removed": true]
         default:
             throw URLError(.fileDoesNotExist)
         }

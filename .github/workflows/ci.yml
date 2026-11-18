@@ -5,7 +5,7 @@ name: CI
 #
 #   PR / push (this file)   the cheap Linux validation beside ONE macOS job that
 #                           compiles the full app and all test targets once,
-#                           incrementally from main's latest build, and runs
+#                           incrementally from the PR's own last build or main's, and runs
 #                           the pinned unit smoke tests (scripts/smoke-suite.json)
 #                           on that build and simulator; a push to main also
 #                           runs the pinned UI smoke tests there.
@@ -25,7 +25,7 @@ name: CI
 #                        and the CI-tooling suites, bash wrapper tests included.
 #   smoke      (macos)   builds its test products while its simulator boots in
 #                        the background, then runs the unit smoke tests (one
-#                        invocation, no retry) and, on a push to main, the UI
+#                        invocation, no test retried) and, on a push to main, the UI
 #                        smoke tests (one invocation, one targeted retry). A
 #                        unit failure does not skip the UI step; the job fails
 #                        if either did.
@@ -35,20 +35,27 @@ name: CI
 # and runner queueing, not test time, was what made the three-job CI v4 shape
 # slow. A PR's superseded runs are cancelled: a same-repository PR's by the
 # newer run's plan job, so it doesn't wait for them to wind down, a fork PR's
-# by its concurrency group. A newer push never cancels an
-# older one's run, so back-to-back merges overlap and each adds one macOS job.
+# by its concurrency group. A branch's pushes share one group without
+# cancelling: one run goes on, the newest push waits, and a push between them
+# gets no run of its own (Eric, 2026-11-15).
 
 on:
   push:
-    branches: [main, linked-rooms]
+    branches: [main, linked-rooms, all-live]
   pull_request:
     # linked-rooms: the Linked Rooms app side, kept off main until it all works.
-    branches: [main, linked-rooms]
+    # all-live: the all-live rework (several chats and Hermes instances live
+    # at once), on its own TestFlight builds until Eric has tested each stage.
+    branches: [main, linked-rooms, all-live]
 
-# A PR's newer push supersedes its older run. A push is grouped by its own
-# commit instead, so every merge gets a full run: branch protection does not
-# require PRs to be up to date with main, so this run is what catches two PRs
-# that pass alone but break together.
+# A PR's newer push supersedes its older run. A branch's pushes share a group
+# by its ref, without cancel-in-progress: the run under way finishes, the
+# newest push waits, and GitHub cancels a waiting push's run when a newer one
+# arrives. Branch protection does not require PRs to be up to date with main,
+# so the waiting run, which holds every merge since the last one, is what
+# catches two PRs that pass alone but break together. A run per merge held
+# up to 6 of the 5 macOS runners on a busy evening, queueing 85 minutes, and
+# the build cache PRs restore fell 14 merges behind (Eric, 2026-11-15).
 #
 # A PR from this repository gets a group of its own run, and its plan job
 # cancels the older runs (Cancel this PR's older runs): in a shared group the
@@ -56,17 +63,18 @@ on:
 # (Eric, 2026-11-02). A fork's token can't cancel runs, so a fork PR keeps the
 # shared group and cancel-in-progress.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) && format('run-{0}', github.run_id) || github.event.pull_request.number || github.sha }}
-  cancel-in-progress: true
+  group: ci-${{ github.workflow }}-${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) && format('run-{0}', github.run_id) || github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
 
 env:
   # Known simulator, used directly as the xcodebuild destination - no
-  # 'simctl list' enumeration on the happy path. macos-26 images ship the
-  # iPhone 17 family; override here if an image refresh renames devices.
-  SIMULATOR_NAME: "iPhone 17 Pro"
+  # 'simctl list' enumeration on the happy path. The xcode-27 image ships the
+  # iPhone 18 family (iPhone 17 Pro is gone); override here if an image
+  # refresh renames devices.
+  SIMULATOR_NAME: "iPhone 18 Pro"
   # Workspace-anchored DerivedData: GITHUB_WORKSPACE is byte-identical across
   # GitHub-hosted runners for this repo (/Users/runner/work/<repo>/<repo>),
   # so absolute paths inside the .xctestrun are stable from run to run - no
@@ -100,7 +108,7 @@ jobs:
         # run number) and from this repository's branch, never a fork's of the
         # same name, so two runs never cancel each other. Only a run whose one
         # PR is this one (number and base): a branch with PRs into both main
-        # and linked-rooms (whose copy of this workflow shares its path) runs
+        # and linked-rooms or all-live (whose copies share its path) runs
         # for each, and a run that lists both PRs is left alone. Best effort:
         # a failed lookup leaves the older run going, which costs runner
         # time, not correctness.
@@ -125,6 +133,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           # A pull_request checkout is the merge commit: HEAD^1 is the base.
+          # A push's HEAD^1 is the branch's tip before it, for a one-commit push.
           fetch-depth: 2
 
       - name: Select the hosted smoke suite
@@ -144,23 +153,31 @@ jobs:
           echo "ui-csv=$(jq -r '.ui_csv' ci-artifacts/smoke.json)" >> "$GITHUB_OUTPUT"
 
       - name: Does the change need the macOS build
-        # A PR skips the smoke job, and CI Gate passes it on this step's word,
-        # when it changes only what the app build and the smoke tests never
-        # read (Markdown, docs/, LICENSE, review config, .github/ other than
-        # this workflow), or when its change (scripts/pr-change-id.py) is the
-        # same as at an earlier commit of it whose smoke job passed: merging
+        # A PR or a push skips the smoke job, and CI Gate passes it on this
+        # step's word, when it changes only what the app build and the smoke
+        # tests never read (Markdown, docs/, LICENSE, review config, .github/
+        # other than this workflow): a push only when it is one commit (main's
+        # squash merges, or a merge commit into linked-rooms or all-live), read
+        # against the branch's tip before it, and only when that tip's own
+        # push run passed (a run GitHub cancelled while it waited was never
+        # built), since a docs merge to main held a macOS runner for half an
+        # hour while PRs queued (2026-11-15). A PR also skips when its change
+        # (scripts/pr-change-id.py) is the same as at an earlier commit of it
+        # whose smoke job passed: merging
         # main, or resolving a feature map conflict, doesn't rebuild (Eric,
         # 2026-10-29, #1467). So a merge commit can pass without being built,
         # as a PR that isn't up to date with main always could; main's own run
         # after the merge still builds and catches two PRs that break
         # together. A file under an app or test folder (Markdown included)
-        # always builds, and a rename counts by both names. Fails closed:
-        # any push, anything but this PR's merge commit, an unreadable or
-        # empty diff, or a lookup that fails builds.
+        # always builds, and a rename counts by both names. Fails closed: a
+        # push of several commits or a new branch, anything but this PR's
+        # merge commit, an unreadable or empty diff, or a lookup that fails
+        # builds.
         id: needs-build
         env:
           EVENT: ${{ github.event_name }}
           PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           BASE_REF: ${{ github.base_ref }}
           GH_TOKEN: ${{ github.token }}
@@ -168,8 +185,12 @@ jobs:
           set -euo pipefail
           smoke=true
           why=''
-          if [ "$EVENT" = "pull_request" ] && [ -n "$PR_HEAD" ] \
-            && [ "$(git rev-parse -q --verify 'HEAD^2' || true)" = "$PR_HEAD" ] \
+          # HEAD^1 is the base: a PR's merge commit's first parent, or the
+          # branch's tip before a one-commit push.
+          if { { [ "$EVENT" = "pull_request" ] && [ -n "$PR_HEAD" ] \
+                && [ "$(git rev-parse -q --verify 'HEAD^2' || true)" = "$PR_HEAD" ]; } \
+              || { [ "$EVENT" = "push" ] && [ -n "$PUSH_BEFORE" ] \
+                && [ "$(git rev-parse -q --verify 'HEAD^1' || true)" = "$PUSH_BEFORE" ]; }; } \
             && changed=$(git -c core.quotePath=false diff --no-renames --name-only HEAD^1 HEAD) && [ -n "$changed" ]; then
             # grep reads all its input (no -q), so printf never meets a closed pipe.
             if ! printf '%s\n' "$changed" \
@@ -177,6 +198,21 @@ jobs:
               && ! printf '%s\n' "$changed" | grep -E '^\.github/workflows/ci\.yml$|^(Conduit[^/]*|Shared)/' >/dev/null; then
               smoke=false
               why="the change is only docs and config"
+              # A push's run answers for every push since the last run that
+              # finished: a pushed run GitHub cancelled while it waited (see
+              # concurrency) was never built, so this run builds unless the
+              # previous commit's own push run passed.
+              if [ "$EVENT" = "push" ]; then
+                passed_before=$(gh api -X GET "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs" \
+                  -f event=push -f head_sha="$PUSH_BEFORE" \
+                  --jq '[.workflow_runs[] | select(.conclusion == "success")] | length') || passed_before=0
+                case "$passed_before" in ''|*[!0-9]*) passed_before=0 ;; esac
+                if [ "$passed_before" -lt 1 ]; then
+                  smoke=true
+                  why=''
+                  echo "- docs-only push, but $PUSH_BEFORE has no passing push run (cancelled while it waited, failed, or unknown): building" >> "$GITHUB_STEP_SUMMARY"
+                fi
+              fi
             fi
           fi
           # The change id counts Markdown by its words, so Markdown under an
@@ -248,8 +284,9 @@ jobs:
 
       - name: Localization catalog coverage
         # Cheap Linux guard: every String(localized:) / SwiftUI literal call
-        # site must resolve to a key in Conduit/Localizable.xcstrings, so a
-        # translated string can never silently render English again.
+        # site must resolve to a key in Conduit/Localizable.xcstrings (or the
+        # feature table in Conduit/Strings/ it names), so a translated string
+        # can never silently render English again.
         run: python3 scripts/check-l10n-coverage.py --repo-root .
 
       - name: Text follows Text Size
@@ -269,6 +306,12 @@ jobs:
         # (#1533).
         run: python3 scripts/check-transcript-environment.py --repo-root .
 
+      - name: No hand-written Equatable
+        # A type with a hand-written `==` makes any new member of it
+        # recompile nearly the whole app (718 of 766 files, 2026-11-17):
+        # synthesize it, wrapping fields in Conduit/Services/EquatableWrappers.swift.
+        run: python3 scripts/check-hand-written-equality.py --repo-root .
+
       - name: Recommended plugin version matches the plugin
         # Conduit only offers the plugin update to hosts below
         # NotifierPluginStatus.recommendedVersion, so it must follow every
@@ -286,7 +329,7 @@ jobs:
         # where their code lives; a path that moved would send it to the
         # wrong file. notifier/ paths are checked on the plugin's main. On a
         # PR, an entry it adds or edits names it on its Checked line. A PR
-        # into pulse or linked-rooms (that branch's copy of this workflow
+        # into pulse, linked-rooms or all-live (that branch's copy of this workflow
         # runs on those) that merges main, so it leaves fewer of main's
         # commits to take than its base does, also passes main's maps where
         # the PR and its base meet main (their merge bases): an entry main
@@ -361,7 +404,7 @@ jobs:
     name: Smoke
     needs: plan
     if: needs.plan.outputs.smoke != 'false'
-    runs-on: macos-26
+    runs-on: xcode-27
     # 75: the UI smoke job alone needed 45 (a stalled first attempt plus the
     # one targeted retry ran past 30 minutes, which GitHub reports as
     # "cancelled" instead of a failure), and the unit smoke invocation now
@@ -371,7 +414,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Select Xcode
-        run: sudo xcode-select -s /Applications/Xcode.app
+        run: sudo --preserve-env=GITHUB_ENV bash scripts/ci-select-xcode.sh
 
       - name: Pick the build cache
         # DerivedData from the newest build of the same project and Xcode
@@ -420,7 +463,9 @@ jobs:
         # SIMULATOR_UDID for the steps below.
         env:
           # 1200 like the nightly: 800-900 s builds were common (2026-10-13).
-          BUILD_TIMEOUT_SECS: 1200
+          # A clean build (no cache from this Xcode yet, as after an Xcode
+          # move) gets 1800: the first Xcode 27 build outran 1200 s (#2319).
+          BUILD_TIMEOUT_SECS: ${{ steps.cache.outputs.cache-matched-key && '1200' || '1800' }}
           # Named in the build's timing notice, to explain a clean build.
           BUILD_CACHE: ${{ steps.cache.outputs.cache-matched-key || format('none saved under {0}', steps.cache-key.outputs.prefix) }}
         run: bash scripts/ci-hosted-build.sh
@@ -433,6 +478,31 @@ jobs:
         # iOS 17 lack (issue 1877).
         run: python3 scripts/check-weak-imports.py binaries --products "${DERIVED_DATA_PATH:-$PWD/ci-derived-data}/Build/Products/Debug-iphonesimulator"
 
+      - name: Save the build cache
+        # Every build that passed the weak-imports check (a build that fails
+        # it is never saved for another run to restore), right after it and
+        # before the tests, so a test failure still saves a good build.
+        # A push saves for the PRs opened after it: its UI smoke runs another
+        # 3-5 minutes, and a PR opened meanwhile would restore an older build
+        # and recompile main's latest merge. A PR saves for its own next
+        # push: GitHub gives a run its own ref's entries first, then its base
+        # branch's (and main's), never another PR's, so a review-fix push
+        # recompiles only what changed since the PR's last run instead of
+        # the PR again on top of its base branch. Smoke always builds the full app
+        # (project.yml); the app-only (slim) build the nightly unit shards
+        # restore is saved by nightly unit shard 1. A cache outage only
+        # warns: it never skips the tests.
+        if: >-
+          steps.build.outcome == 'success'
+          && steps.cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            ci-derived-data
+            !ci-derived-data/Logs
+          key: ${{ steps.cache-key.outputs.prefix }}-${{ github.sha }}
+
       - name: Run the curated unit smoke classes
         # A few pinned tests per risk area (scripts/smoke-suite.json, capped),
         # plus the static source contracts and the change's own unit classes
@@ -442,8 +512,9 @@ jobs:
         # (2026-10-15). Every other unit class runs in the nightly unit shards
         # (nightly.yml).
         #
-        # No retry of any kind: a unit failure is a test bug to fix, not
-        # runner noise. -test-timeouts-enabled bounds a hung test; and
+        # No retry of a test: a unit failure is a test bug to fix, not
+        # runner noise (the one exception, a runtime lost before any test
+        # ran, is below). -test-timeouts-enabled bounds a hung test; and
         # -collect-test-diagnostics never, because Xcode's on-failure default
         # gathers a simulator payload under its own 600s timeout (docs/CI.md).
         id: unit
@@ -474,15 +545,26 @@ jobs:
 
           echo "unit smoke: ${#CLASSES[@]} tests and classes in one invocation"
           started=$(date +%s)
+          run_unit_smoke_once() {
+            xcodebuild test-without-building \
+              -xctestrun "$XCRUN_FILE" \
+              -destination "$DESTINATION" \
+              -parallel-testing-enabled NO \
+              -collect-test-diagnostics never \
+              -test-timeouts-enabled YES \
+              -default-test-execution-time-allowance "${UNIT_TEST_ALLOWANCE_S:-180}" \
+              "${args[@]}" 2>&1 | tee ${1:+-a} "$UNIT_SMOKE_LOG"
+          }
           rc=0
-          xcodebuild test-without-building \
-            -xctestrun "$XCRUN_FILE" \
-            -destination "$DESTINATION" \
-            -parallel-testing-enabled NO \
-            -collect-test-diagnostics never \
-            -test-timeouts-enabled YES \
-            -default-test-execution-time-allowance "${UNIT_TEST_ALLOWANCE_S:-180}" \
-            "${args[@]}" 2>&1 | tee "$UNIT_SMOKE_LOG" || rc=$?
+          run_unit_smoke_once || rc=$?
+          # A simulator runtime lost before any test ran (the 2026-11-17
+          # Nightly) gets one more attempt after a reboot; any other failure
+          # stands.
+          if [ "$rc" -ne 0 ] && bash scripts/ci-recover-lost-runtime.sh "$UNIT_SMOKE_LOG"; then
+            echo "::warning title=unit smoke::its simulator runtime was lost before any test ran; running it once more"
+            rc=0
+            run_unit_smoke_once append || rc=$?
+          fi
           # How long the invocation took and how much of that ran tests.
           total=$(( $(date +%s) - started ))
           executed=$(grep -E '^[[:space:]]*Executed [0-9]+ tests?, with' "$UNIT_SMOKE_LOG" | tail -n 1 || true)
@@ -620,24 +702,6 @@ jobs:
             }
             echo "::warning::runner-level flake absorbed: $retry_csv failed, then the targeted retry passed"
           fi
-
-      - name: Save the build cache
-        # Pushes' builds only. A PR restores the newest it can reach: main's,
-        # and on a PR into pulse or linked-rooms (each runs its own copy of
-        # this workflow) that branch's too, never another branch's. Smoke
-        # always builds the full app (project.yml); the app-only (slim) build
-        # the nightly unit shards restore is saved by nightly unit shard 1.
-        # After the tests, so a test failure still saves a good build.
-        if: >-
-          always() && steps.build.outcome == 'success'
-          && steps.cache.outputs.cache-hit != 'true'
-          && github.event_name == 'push'
-        uses: actions/cache/save@v5
-        with:
-          path: |
-            ci-derived-data
-            !ci-derived-data/Logs
-          key: ${{ steps.cache-key.outputs.prefix }}-${{ github.sha }}
 
       - name: Dump simulator state (failure diagnostics)
         if: failure()

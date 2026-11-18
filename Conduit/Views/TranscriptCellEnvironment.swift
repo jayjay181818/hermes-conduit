@@ -35,13 +35,16 @@ struct TranscriptCellEnvironment: Equatable {
         // The shell sets it for the main button in a Duo's status strip;
         // no transcript row reads it.
         "v2MainButtonDiameter",
+        // The shell sets it on the list column, for a chat row's Open
+        // Beside; no transcript row reads it.
+        "v2BesideChatFits",
     ]
 
     // Conduit's
     var chatRowState: ChatRowState
     var chatRowActions: ChatRowActions?
-    var chatRowDisclosure: ChatRowDisclosure?
-    var imageGallery: ImageGallerySource?
+    @OptionalIdentityEquatable var chatRowDisclosure: ChatRowDisclosure?
+    @OptionalIdentityEquatable var imageGallery: ImageGallerySource?
     var selectableTextDrawsUntilTouched: Bool
     var composerStaysExpanded: Bool
     var chatWidthTextSteps: Int
@@ -51,9 +54,9 @@ struct TranscriptCellEnvironment: Equatable {
     var quotedReplyJump: QuotedReplyJumpAction?
     var chatQuoteAction: ChatQuoteAction?
     var markdownJoinsProseRuns: Bool
-    var gatewayMediaFiles: GatewayMediaDataURLResolver?
-    var roomFilePictures: GatewayMediaDataURLResolver?
-    var roomFileReads: GatewayMediaDataURLResolver?
+    @OptionalIdentityEquatable var gatewayMediaFiles: GatewayMediaDataURLResolver?
+    @OptionalIdentityEquatable var roomFilePictures: GatewayMediaDataURLResolver?
+    @OptionalIdentityEquatable var roomFileReads: GatewayMediaDataURLResolver?
     var v2Shell: V2ShellContext
     var v2OpenBeside: V2OpenBeside?
     var botZoomNamespace: Namespace.ID?
@@ -78,7 +81,7 @@ struct TranscriptCellEnvironment: Equatable {
     var scenePhase: ScenePhase
     var isEnabled: Bool
     /// Not compared: an action has no equality, and the app's is set once.
-    var openURL: OpenURLAction
+    @EqualityIgnored var openURL: OpenURLAction
 
     /// The values at the transcript, the chat's disclosure in place of any
     /// other (the stack set it on the rows).
@@ -129,44 +132,69 @@ struct TranscriptCellEnvironment: Equatable {
         "\(chatTextSize)|\(dynamicTypeSize)|\(chatWidthTextSteps)|\(String(describing: columnText))|\(String(describing: font))"
     }
 
-    static func == (lhs: Self, rhs: Self) -> Bool {
-        lhs.chatRowState == rhs.chatRowState
-            && lhs.chatRowActions == rhs.chatRowActions
-            && lhs.chatRowDisclosure === rhs.chatRowDisclosure
-            && lhs.imageGallery === rhs.imageGallery
-            && lhs.selectableTextDrawsUntilTouched == rhs.selectableTextDrawsUntilTouched
-            && lhs.composerStaysExpanded == rhs.composerStaysExpanded
-            && lhs.chatWidthTextSteps == rhs.chatWidthTextSteps
-            && lhs.columnText == rhs.columnText
-            && lhs.chatTextSize == rhs.chatTextSize
-            && lhs.markdownTablePlainCells == rhs.markdownTablePlainCells
-            && lhs.quotedReplyJump == rhs.quotedReplyJump
-            && lhs.chatQuoteAction == rhs.chatQuoteAction
-            && lhs.markdownJoinsProseRuns == rhs.markdownJoinsProseRuns
-            && lhs.gatewayMediaFiles === rhs.gatewayMediaFiles
-            && lhs.roomFilePictures === rhs.roomFilePictures
-            && lhs.roomFileReads === rhs.roomFileReads
-            && lhs.v2Shell == rhs.v2Shell
-            && lhs.v2OpenBeside == rhs.v2OpenBeside
-            && lhs.botZoomNamespace == rhs.botZoomNamespace
-            && lhs.botsHomeCovered == rhs.botsHomeCovered
-            && lhs.botChatZoomed == rhs.botChatZoomed
-            && lhs.rosterRowsInScroll == rhs.rosterRowsInScroll
-            && lhs.v2TabBarClearance == rhs.v2TabBarClearance
-            && lhs.windowSideInsets == rhs.windowSideInsets
-            && lhs.v2ComposerRests == rhs.v2ComposerRests
-            && lhs.groupMemberTints == rhs.groupMemberTints
-            && lhs.groupRoomLooks == rhs.groupRoomLooks
-            && lhs.conduitAccent == rhs.conduitAccent
-            && lhs.settingsGlowTint == rhs.settingsGlowTint
-            && lhs.locale == rhs.locale
-            && lhs.dynamicTypeSize == rhs.dynamicTypeSize
-            && lhs.font == rhs.font
-            && lhs.colorScheme == rhs.colorScheme
-            && lhs.layoutDirection == rhs.layoutDirection
-            && lhs.horizontalSizeClass == rhs.horizontalSizeClass
-            && lhs.scenePhase == rhs.scenePhase
-            && lhs.isEnabled == rhs.isEnabled
+    /// Whether a row could measure differently under `other` (issue 1763,
+    /// #2341 review): equal apart from what only colors or pauses a row, or
+    /// what no row reads (the app's phase, enabled state and color scheme,
+    /// Bots Home's cover, the roster's scroll, the tab bar's clearance, the
+    /// side insets, the tints). Those leave every row's measured height
+    /// current (TranscriptLayout.forgetCurrentMeasurements).
+    func measuresLike(_ other: Self) -> Bool {
+        var same = other
+        same.scenePhase = scenePhase
+        same.isEnabled = isEnabled
+        same.colorScheme = colorScheme
+        same.botsHomeCovered = botsHomeCovered
+        same.rosterRowsInScroll = rosterRowsInScroll
+        same.v2TabBarClearance = v2TabBarClearance
+        same.windowSideInsets = windowSideInsets
+        same.conduitAccent = conduitAccent
+        same.settingsGlowTint = settingsGlowTint
+        same.groupMemberTints = groupMemberTints
+        return self == same
+    }
+
+    /// Which rows could measure differently under this environment than
+    /// under `other` (issue 2358). A turn starting or ending, or a reply
+    /// landing, moves only the rows' state that names its rows (the
+    /// running turn's, the newest reply, the follow-ups' board, a run's
+    /// summary, a teammate's reply), so only those rows forget their
+    /// heights; anything else changing still forgets every row's.
+    func measurementChange(from other: Self) -> TranscriptMeasurementChange {
+        if measuresLike(other) { return .none }
+        let new = chatRowState
+        let old = other.chatRowState
+        var rest = other
+        rest.chatRowState.isBusy = new.isBusy
+        rest.chatRowState.cardsCanSend = new.cardsCanSend
+        rest.chatRowState.latestAssistantMessageID = new.latestAssistantMessageID
+        rest.chatRowState.retryableReplyID = new.retryableReplyID
+        rest.chatRowState.followUpBoardRowID = new.followUpBoardRowID
+        rest.chatRowState.teammateReplies = new.teammateReplies
+        rest.chatRowState.stepSummaries = new.stepSummaries
+        rest.chatRowState.stepSummariesAsked = new.stepSummariesAsked
+        guard measuresLike(rest) else { return .all }
+        // `cardsCanSend` only enables a card's buttons; the follow-ups it
+        // shows or hides go with `followUpBoardRowID`.
+        var messages: Set<String> = []
+        for (before, after) in [
+            (old.latestAssistantMessageID, new.latestAssistantMessageID),
+            (old.retryableReplyID, new.retryableReplyID),
+            (old.followUpBoardRowID, new.followUpBoardRowID),
+        ] where before != after {
+            if let before { messages.insert(before) }
+            if let after { messages.insert(after) }
+        }
+        for id in Set(old.teammateReplies.keys).union(new.teammateReplies.keys)
+        where old.teammateReplies[id] != new.teammateReplies[id] {
+            messages.insert(id)
+        }
+        var runs: Set<String> = []
+        for key in Set(old.stepSummaries.keys).union(new.stepSummaries.keys)
+        where old.stepSummaries[key] != new.stepSummaries[key] {
+            runs.insert(key)
+        }
+        runs.formUnion(old.stepSummariesAsked.symmetricDifference(new.stepSummariesAsked))
+        return .rows(messages: messages, runs: runs, turn: old.isBusy != new.isBusy)
     }
 }
 
@@ -239,5 +267,46 @@ private struct TranscriptCellSystemEnvironment: ViewModifier {
             .environment(\.isEnabled, values.isEnabled)
             .environment(\.openURL, values.openURL)
             .tint(Color.conduitAccent)
+    }
+}
+
+/// Which of the transcript's rows forget their measured heights when its
+/// environment changes (TranscriptCellEnvironment.measurementChange).
+enum TranscriptMeasurementChange: Equatable {
+    /// None: nothing a row's height reads changed.
+    case none
+    /// Every row, on screen or not.
+    case all
+    /// The rows of `messages`, the rows of the step runs whose summary key
+    /// is in `runs`, and with `turn` every row after the last message sent
+    /// (the running turn's: its run draws live while Hermes works).
+    case rows(messages: Set<String>, runs: Set<String>, turn: Bool)
+
+    /// The ids of `rows` this change reaches; nil for every row.
+    func rowIDs(in rows: [TranscriptRow]) -> Set<String>? {
+        switch self {
+        case .none: return []
+        case .all: return nil
+        case let .rows(messages, runs, turn):
+            var ids: Set<String> = []
+            if turn {
+                let lastSent = rows.lastIndex { row in
+                    if case .message(let target) = row.kind { return target.message.role == .user }
+                    return false
+                }
+                for row in rows[(lastSent.map { $0 + 1 } ?? 0)...] { ids.insert(row.id) }
+            }
+            guard !messages.isEmpty || !runs.isEmpty else { return ids }
+            var runKeys: [String: String?] = [:]
+            for row in rows {
+                guard case .message(let target) = row.kind else { continue }
+                if messages.contains(target.message.id) { ids.insert(row.id) }
+                guard !runs.isEmpty, let group = target.step?.group else { continue }
+                let key = runKeys[group.id] ?? group.summaryKey
+                runKeys[group.id] = key
+                if let key, runs.contains(key) { ids.insert(row.id) }
+            }
+            return ids
+        }
     }
 }

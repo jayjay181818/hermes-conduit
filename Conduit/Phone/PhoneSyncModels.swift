@@ -31,9 +31,9 @@ enum PhoneCalendarAccess: String, CaseIterable, Identifiable, Codable {
 
     var title: String {
         switch self {
-        case .full: return AppLocalization.string("Read and add")
+        case .full: return AppLocalization.string("Read and add", table: .phone)
         case .readOnly: return AppLocalization.string("Read only")
-        case .writeOnly: return AppLocalization.string("Add only")
+        case .writeOnly: return AppLocalization.string("Add only", table: .phone)
         case .off: return AppLocalization.string("Off")
         }
     }
@@ -57,9 +57,9 @@ enum PhoneCalendarWindow: Int, CaseIterable, Identifiable, Codable {
 
     var title: String {
         switch self {
-        case .days30: return AppLocalization.string("Next 30 days")
-        case .days60: return AppLocalization.string("Next 60 days")
-        case .days180: return AppLocalization.string("Next 6 months")
+        case .days30: return AppLocalization.string("Next 30 days", table: .phone)
+        case .days60: return AppLocalization.string("Next 60 days", table: .phone)
+        case .days180: return AppLocalization.string("Next 6 months", table: .phone)
         }
     }
 }
@@ -107,6 +107,9 @@ struct PhoneSyncPreferences: Codable, Equatable {
     /// Hermes may search what the phone says about each photo (made on
     /// the phone) and ask for one, always on a card. Read `photos`.
     var photosChoice: Bool?
+    /// Battery, Low Power Mode, CarPlay and Focus go with each message sent
+    /// from Conduit (issue 888). Read `turnStatus`.
+    var turnStatusChoice: Bool?
 
     /// Hermes may set alarms and timers on this phone (iOS 26's AlarmKit).
     /// They ring through Silent and Focus, so it's its own choice.
@@ -138,6 +141,13 @@ struct PhoneSyncPreferences: Codable, Equatable {
     var photos: Bool {
         get { photosChoice ?? false }
         set { photosChoice = newValue ? true : nil }
+    }
+
+    /// Part of sharing the status or Focus: only what they share goes, and
+    /// it's off with both.
+    var turnStatus: Bool {
+        get { (status || focus) && (turnStatusChoice ?? false) }
+        set { turnStatusChoice = newValue ? true : nil }
     }
 
     /// Hermes may ask to run the Shortcuts in `shortcutList`.
@@ -232,6 +242,7 @@ struct PhoneSyncPreferences: Codable, Equatable {
             "shortcuts_auto": shortcutsRunWithoutAsking,
             "contacts_edit": contactsEdit,
             "photos": photos,
+            "turn_status": turnStatus,
             "past_days": PhoneCalendarWindow.pastDays,
             "future_days": window.rawValue,
         ]
@@ -324,16 +335,16 @@ enum PhoneSyncPause: Codable, Equatable {
     func message(managedBy: String?) -> String {
         switch self {
         case .signInRequired:
-            return AppLocalization.string("Paused: sign in to this dashboard again. Sharing catches up when you open Conduit.")
+            return AppLocalization.string("Paused: sign in to this dashboard again. Sharing catches up when you open Conduit.", table: .phone)
         case .pluginMissing:
-            return PluginUpdateAsk.text(AppLocalization.string("Paused: update the Conduit plugin on this host to share your calendar and phone status."),
-                                        lead: AppLocalization.string("Sharing is paused."), managedBy: managedBy)
+            return PluginUpdateAsk.text(AppLocalization.string("Paused: update the Conduit plugin on this host to share your calendar and phone status.", table: .phone),
+                                        lead: AppLocalization.string("Sharing is paused.", table: .phone), managedBy: managedBy)
         case .otherDashboard:
-            return AppLocalization.string("Waiting: this goes only to the dashboard it was turned on for. Switch back to it to sync.")
+            return AppLocalization.string("Waiting: this goes only to the dashboard it was turned on for. Switch back to it to sync.", table: .phone)
         case .pluginOff(let remedy):
-            return AppLocalization.string("Paused: \(remedy)")
+            return AppLocalization.string("Paused: \(remedy)", table: .phone)
         case .refused(let detail):
-            return AppLocalization.string("Paused: the host refused the upload (\(detail)).")
+            return AppLocalization.string("Paused: the host refused the upload (\(detail)).", table: .phone)
         }
     }
 }

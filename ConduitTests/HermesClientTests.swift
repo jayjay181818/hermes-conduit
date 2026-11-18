@@ -556,6 +556,145 @@ final class HermesClientTests: XCTestCase {
         client.disconnect()
     }
 
+    /// A gateway serving several profiles on one socket finds a Bot Chat
+    /// only under the profile a request names, so the requests after the
+    /// resume (the reasoning switch, the send) name the bot's profile too;
+    /// unnamed, Hermes answered `config.set` with `not_found`. A resume
+    /// that names no profile keeps it; one under the client's own forgets it.
+    func testRequestsAfterABotChatResumeNameTheBotsProfile() async throws {
+        let transport = FakeTransport()
+        let socket = FakeSocket()
+        transport.nextSocket = { socket }
+        let client = makeClient(transport: transport, profile: "analyst")
+        let connectTask = Task { try? await client.connect() }
+        transport.open(socket)
+        try await awaitCompletion(of: connectTask, "connect() to complete after the handshake")
+
+        func lastRequest() throws -> [String: Any] {
+            try XCTUnwrap(
+                JSONSerialization.jsonObject(with: Data(try XCTUnwrap(socket.sentTexts.last).utf8)) as? [String: Any]
+            )
+        }
+        func answer(_ request: [String: Any], _ result: [String: Any]) throws {
+            let id = try XCTUnwrap(request["id"] as? Int)
+            let response: [String: Any] = ["jsonrpc": "2.0", "id": id, "result": result]
+            socket.deliver(try XCTUnwrap(String(data: try JSONSerialization.data(withJSONObject: response), encoding: .utf8)))
+        }
+
+        func expectSend() -> Gate {
+            let gate = Gate()
+            socket.onSend = { gate.signal() }
+            return gate
+        }
+
+        var sent = expectSend()
+        let openTask = Task<SessionResumeResult, Error> {
+            try await client.openSession("runtime-1", profile: "atlas")
+        }
+        try await sent.wait("the bot chat's session.resume to be sent")
+        try answer(try lastRequest(), [
+            "session_id": "runtime-1", "stored_session_id": "stored-1", "session_key": "key-1", "messages": [Any]()
+        ])
+        _ = try await awaitResult(of: openTask, "the bot chat's resume response")
+        XCTAssertEqual(client.sessionProfile(for: "runtime-1"), "atlas")
+        XCTAssertEqual(client.sessionProfile(for: "stored-1"), "atlas")
+        XCTAssertEqual(client.sessionProfile(for: "key-1"), "atlas", "every stored-id spelling is noted")
+
+        // A fresh client on the same dashboard (a reconnect, or a profile switch) keeps it.
+        let successor = makeClient(transport: FakeTransport(), profile: "analyst")
+        successor.inheritSessionProfiles(from: client)
+        XCTAssertEqual(successor.sessionProfile(for: "runtime-1"), "atlas")
+
+        sent = expectSend()
+        let reasoningTask = Task { try await client.setReasoning("runtime-1", effort: "high") }
+        try await sent.wait("the reasoning config.set to be sent")
+        let reasoning = try lastRequest()
+        XCTAssertEqual(reasoning["method"] as? String, "config.set")
+        let reasoningParams = try XCTUnwrap(reasoning["params"] as? [String: Any])
+        XCTAssertEqual(
+            reasoningParams["profile"] as? String, "atlas",
+            "the bot chat's reasoning switch names the bot's profile, not the client's"
+        )
+        try answer(reasoning, ["key": "reasoning", "value": "high"])
+        try await reasoningTask.value
+
+        // Another chat keeps the client's own scope.
+        sent = expectSend()
+        let otherTask = Task { try await client.setReasoning("runtime-2", effort: "low") }
+        try await sent.wait("another chat's config.set to be sent")
+        let other = try lastRequest()
+        XCTAssertEqual((other["params"] as? [String: Any])?["profile"] as? String, "analyst")
+        try answer(other, ["key": "reasoning", "value": "low"])
+        try await otherTask.value
+
+        // Opened again naming no profile (a branch's reconcile), the resume
+        // goes to the bot's profile and keeps it.
+        sent = expectSend()
+        let reopenTask = Task<SessionResumeResult, Error> {
+            try await client.openSession("runtime-1", profile: nil)
+        }
+        try await sent.wait("the unnamed session.resume to be sent")
+        let reopen = try lastRequest()
+        XCTAssertEqual((reopen["params"] as? [String: Any])?["profile"] as? String, "atlas")
+        try answer(reopen, ["session_id": "runtime-1", "messages": [Any]()])
+        _ = try await awaitResult(of: reopenTask, "the unnamed resume response")
+        XCTAssertEqual(client.sessionProfile(for: "runtime-1"), "atlas")
+
+        sent = expectSend()
+        let afterTask = Task { try await client.setReasoning("runtime-1", effort: "low") }
+        try await sent.wait("the config.set after the unnamed resume to be sent")
+        let after = try lastRequest()
+        XCTAssertEqual((after["params"] as? [String: Any])?["profile"] as? String, "atlas")
+        try answer(after, ["key": "reasoning", "value": "low"])
+        try await afterTask.value
+
+        // A blank profile is no profile: the resume still goes to the bot's.
+        sent = expectSend()
+        let blankTask = Task<SessionResumeResult, Error> {
+            try await client.openSession("runtime-1", profile: "  ")
+        }
+        try await sent.wait("the blank-profile session.resume to be sent")
+        let blank = try lastRequest()
+        XCTAssertEqual((blank["params"] as? [String: Any])?["profile"] as? String, "atlas")
+        try answer(blank, ["session_id": "runtime-1", "messages": [Any]()])
+        _ = try await awaitResult(of: blankTask, "the blank-profile resume response")
+        XCTAssertEqual(client.sessionProfile(for: "runtime-1"), "atlas")
+
+        // A branch of it is made in the bot's profile and keeps it, on a
+        // socket without the session authority too (issue 2281).
+        sent = expectSend()
+        let branchTask = Task {
+            try await client.branchSession(
+                parentSessionId: "runtime-1",
+                messages: [SessionBranchMessage(role: .user, content: "Hi"), SessionBranchMessage(role: .assistant, content: "Hello")],
+                title: "Branch of Bot Chat",
+                cwd: nil
+            )
+        }
+        try await sent.wait("the branch's session.create to be sent")
+        let branch = try lastRequest()
+        XCTAssertEqual(branch["method"] as? String, "session.create")
+        XCTAssertEqual(
+            (branch["params"] as? [String: Any])?["profile"] as? String, "atlas",
+            "the branch names its parent's profile, not the client's"
+        )
+        try answer(branch, ["session_id": "runtime-branch", "stored_session_id": "stored-branch"])
+        _ = try await awaitResult(of: branchTask, "the branch's create response")
+        XCTAssertEqual(client.sessionProfile(for: "runtime-branch"), "atlas")
+        XCTAssertEqual(client.sessionProfile(for: "stored-branch"), "atlas")
+
+        // Opened again under the client's own profile, it takes that scope.
+        sent = expectSend()
+        let ownTask = Task<SessionResumeResult, Error> {
+            try await client.openSession("runtime-1", profile: "analyst")
+        }
+        try await sent.wait("the client-profile session.resume to be sent")
+        try answer(try lastRequest(), ["session_id": "runtime-1", "messages": [Any]()])
+        _ = try await awaitResult(of: ownTask, "the client-profile resume response")
+        XCTAssertNil(client.sessionProfile(for: "runtime-1"))
+        client.disconnect()
+    }
+
     func testExplicitProfileInParamsWinsOverClientScope() async throws {
         let transport = FakeTransport()
         let socket = FakeSocket()
@@ -675,6 +814,57 @@ final class HermesClientTests: XCTestCase {
         let title = try await awaitResult(of: titleTask, "the session.title response")
         XCTAssertEqual(title, "Bot Chat")
         client.disconnect()
+    }
+
+    func testAJobLivenessProbeOnTheDashboardReadsOnlyItsTitle() async throws {
+        let (client, socket) = try await connectedClientForServerRequests()
+        defer { client.disconnect() }
+        let count = socket.sentTexts.count
+        let probe = Task<Bool?, Error> { try await client.sessionRunning("rt-job", profile: "fam") }
+        let params = try await answerRequest(on: socket, after: count, method: "session.title", result: ["title": "Router"])
+        let running = try await awaitResult(of: probe, "the read-only job probe")
+
+        XCTAssertNil(running, "a title proves existence, not whether its turn runs")
+        XCTAssertEqual(params["session_id"] as? String, "rt-job")
+        XCTAssertEqual(params["profile"] as? String, "fam")
+        XCTAssertEqual(Set(params.keys), ["session_id", "profile"], "never resume or rebind the chat")
+    }
+
+    func testAJobLivenessProbeOnTheAuthorityRequiresAnExplicitRunningFlag() async throws {
+        let cases: [([String: Any], Bool?)] = [
+            (["running": true], true), (["running": false], false),
+            (["info": ["running": false]], false), (["status": "idle", "title": "Router"], nil),
+        ]
+        for (answer, expected) in cases {
+            let (client, socket) = try await authorityClient()
+            defer { client.disconnect() }
+            let count = socket.sentTexts.count
+            let probe = Task<Bool?, Error> { try await client.sessionRunning("rt-job", profile: "fam") }
+            let params = try await answerRequest(on: socket, after: count, method: "session.info", result: answer)
+            let running = try await awaitResult(of: probe, "the authority job probe")
+
+            XCTAssertEqual(running, expected)
+            XCTAssertEqual(params["session_id"] as? String, "rt-job")
+            XCTAssertEqual(params["profile"] as? String, "fam")
+            XCTAssertEqual(Set(params.keys), ["session_id", "profile"])
+        }
+    }
+
+    func testAJobLivenessProbePreservesSessionNotFoundOnBothGateways() async throws {
+        for authority in [false, true] {
+            let (client, socket) = try await (authority ? authorityClient() : connectedClientForServerRequests())
+            defer { client.disconnect() }
+            let count = socket.sentTexts.count
+            let probe = Task<Bool?, Error> { try await client.sessionRunning("rt-gone", profile: "fam") }
+            try await answerRequest(on: socket, after: count, method: authority ? "session.info" : "session.title",
+                                    error: ["code": 4001, "message": "session not found"])
+            do {
+                _ = try await awaitResult(of: probe, "the missing-session refusal")
+                XCTFail("a missing session must remain distinguishable from an unknown running state")
+            } catch {
+                XCTAssertTrue(HermesClient.isSessionNotFoundError(error))
+            }
+        }
     }
 
     func testSessionTitleReadOmitsProfileForOrdinarySessions() async throws {
@@ -3183,8 +3373,10 @@ final class HermesClientTests: XCTestCase {
             profile: nil,
             transportFactory: { FakeTransport() }
         )
+        outgoing.sendsChangeEvents = true
         XCTAssertTrue(outgoing.handOffSocket(to: incoming))
         XCTAssertTrue(incoming.speaksSessionAuthority)
+        XCTAssertTrue(incoming.sendsChangeEvents, "The same socket's gateway still pushes sessions.changed")
         count = socket.sentTexts.count
         let confirm = Task<ModelSwitchOutcome, Error> {
             try await incoming.setModel("sess-1", model: "big", provider: "custom", confirmed: true)
@@ -3289,6 +3481,7 @@ final class HermesClientTests: XCTestCase {
             "params": ["type": "gateway.ready", "payload": ["change_events": true]]
         ], to: socket)
         try await sent.wait("client.capabilities to be sent after gateway.ready")
+        XCTAssertTrue(client.sendsChangeEvents, "change_events: the Chats list follows sessions.changed (issue 851)")
 
         let request = try sentFrame(socket)
         XCTAssertEqual(request["method"] as? String, "client.capabilities")
@@ -3302,6 +3495,7 @@ final class HermesClientTests: XCTestCase {
             "params": ["type": "gateway.ready", "payload": [String: Any]()]
         ], to: socket)
         XCTAssertEqual(socket.sentTexts.count, 1, "client.capabilities is sent once per connection")
+        XCTAssertFalse(client.sendsChangeEvents, "A ready without change_events goes back to the timed reads")
         client.disconnect()
     }
 
@@ -4731,6 +4925,51 @@ final class HermesClientTests: XCTestCase {
     /// Bounded wait for a spawned throwing task, returning its result. The
     /// Task-side counterpart of `Gate.wait`: a wedged phase fails the
     /// test naming `phase` instead of suspending forever.
+    /// `hermes dashboard` has no `session.mutate`: a rewind there is
+    /// Hermes' own `/undo N`, N the target turn and every turn after it in
+    /// the snapshot, sent to the runtime the snapshot's resume answered
+    /// with. Its `prefill` answer puts the target's words back.
+    func testRewindOnTheDashboardIsHermesUndoOnTheResumesRuntime() async throws {
+        let transport = FakeTransport()
+        let socket = FakeSocket()
+        transport.nextSocket = { socket }
+        let client = makeClient(transport: transport)
+        let connectTask = Task { try? await client.connect() }
+        transport.open(socket)
+        try await awaitCompletion(of: connectTask, "connect() to complete after the handshake")
+        XCTAssertFalse(client.speaksSessionAuthority)
+
+        let sent = Gate()
+        socket.onSend = { sent.signal() }
+        let snapshot = SessionRewindSnapshot(
+            turns: [.init(rowID: 1, text: "one"), .init(rowID: 5, text: "two"), .init(rowID: 7, text: "three")],
+            revision: nil,
+            generation: nil,
+            runtimeSessionID: "runtime-2"
+        )
+        let rewindTask = Task<SessionRewindReceipt, Error> {
+            try await client.rewindSession(sessionId: "runtime-1", targetMessageID: 5, snapshot: snapshot)
+        }
+        try await sent.wait("the dashboard's /undo to be sent")
+        let request = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(try XCTUnwrap(socket.sentTexts.last).utf8)) as? [String: Any]
+        )
+        XCTAssertEqual(request["method"] as? String, "slash.exec", "the dashboard answers session.mutate with unknown method")
+        let params = try XCTUnwrap(request["params"] as? [String: Any])
+        XCTAssertEqual(params["command"] as? String, "undo 2", "the target turn and the one after it")
+        XCTAssertEqual(params["session_id"] as? String, "runtime-2", "the runtime the snapshot's resume answered with")
+        let id = try XCTUnwrap(request["id"] as? Int)
+        let response: [String: Any] = ["jsonrpc": "2.0", "id": id, "result": [
+            "type": "prefill",
+            "message": "two",
+            "notice": "↶ Undid 2 turns (4 message(s)). Edit and resubmit, or send a new message.\nChanged files: notes.md"
+        ]]
+        socket.deliver(try XCTUnwrap(String(data: try JSONSerialization.data(withJSONObject: response), encoding: .utf8)))
+        let receipt = try await awaitResult(of: rewindTask, "the /undo's answer")
+        XCTAssertEqual(receipt, SessionRewindReceipt(rewoundCount: 4, text: "two", filesLine: "Changed files: notes.md"))
+        client.disconnect()
+    }
+
     private func awaitResult<T>(
         of task: Task<T, Error>,
         _ phase: String,
@@ -5387,6 +5626,210 @@ extension HermesClientTests {
         XCTAssertEqual(incomingEvents.count, 2)
         incoming.disconnect()
         XCTAssertTrue(socket.cancelled)
+    }
+
+    /// A live call on the phone goes on across a switch to another profile
+    /// (all-live stage 2, issue 2390) only through a socket the switch can
+    /// keep, and the next client names the call's profile for its chat, so
+    /// the call's next turn still reaches it.
+    func testALiveCallGoesOnAcrossAProfileSwitchThroughTheKeptSocket() async throws {
+        let (outgoing, socket, transport) = try await connectedForHandOff()
+        let appState = AppState(defaults: makeScratchDefaults("LiveCallAcrossSwitch"), loadSavedConnection: false)
+        appState.connection = HermesConnection(baseUrl: "https://test.example", ticket: "ticket")
+        appState.client = outgoing
+        appState.isConnected = true
+        // A GPT-Live call on "default", minimised, attached to a chat.
+        appState.liveCallProfile = "default"
+        appState.minimisedLiveVoice = .gptLive
+        appState.voiceBackgroundJobSupervisor.attachLiveThread(
+            VoiceThreadTarget(runtimeSessionID: "chat-1", storedSessionID: "stored-1", title: "Trip")
+        )
+        XCTAssertTrue(appState.isVoiceCallInProgress)
+        XCTAssertTrue(appState.callSurvivesProfileSwitch, "The socket can be kept, so the call goes on")
+        XCTAssertFalse(appState.isCallEndingProfileSwitch, "A profile pick doesn't ask")
+        // A call from Hermes answered in a live mode goes on too; one whose
+        // voice is still opening ends with the switch.
+        appState.isNativeHermesCallActive = true
+        appState.liveHermesCall = HermesCallOpening(kind: .done, title: "Build", result: "Green")
+        XCTAssertTrue(appState.callSurvivesProfileSwitch)
+        appState.pendingHermesCall = appState.liveHermesCall
+        XCTAssertFalse(appState.callSurvivesProfileSwitch)
+        XCTAssertTrue(appState.isCallEndingProfileSwitch)
+        appState.pendingHermesCall = nil
+        // Its voice still opening after the call took its opening.
+        let opening = Task<Void, Never> {}
+        appState.hermesCallOpenTask = opening
+        XCTAssertFalse(appState.callSurvivesProfileSwitch)
+        appState.hermesCallOpenTask = nil
+        XCTAssertTrue(appState.callSurvivesProfileSwitch)
+        appState.liveHermesCall = nil
+        appState.isNativeHermesCallActive = false
+        var asked: CallEndingSwitch?
+        var switched = false
+        appState.switchEndingCall(to: "Work", profileOnly: true, pending: &asked) { switched = true }
+        XCTAssertTrue(switched)
+        XCTAssertNil(asked)
+        appState.switchEndingCall(to: "Other dashboard", pending: &asked) { XCTFail("A dashboard switch still ends the call") }
+        XCTAssertNotNil(asked, "A dashboard pick still asks first")
+
+        // A client made by a reconnect (a failed switch dropped the one
+        // that knew) names the call's profile for its chat again.
+        let reconnected = makeClient(transport: transport, profile: "work")
+        appState.keepCallSessionsOnTheirProfile(afterReconnect: reconnected)
+        XCTAssertEqual(reconnected.sessionProfile(for: "chat-1"), "default")
+        XCTAssertEqual(reconnected.sessionProfile(for: "stored-1"), "default")
+        // A live start for the call's own profile keeps the call.
+        appState.endLiveCallOnAnotherProfile(than: "Default")
+        XCTAssertTrue(appState.isLiveCallUp)
+
+        // Classic voice can't go on: the pick asks first, as before.
+        appState.showVoiceSheet = true
+        XCTAssertFalse(appState.callSurvivesProfileSwitch)
+        XCTAssertTrue(appState.isCallEndingProfileSwitch)
+        appState.showVoiceSheet = false
+
+        // The switch hands the socket on; the next client names the call's
+        // profile for the call's chat.
+        let incoming = makeClient(transport: transport, profile: "work")
+        appState.keepCallSessionsOnTheirProfile(appState.voiceCallProfile, for: incoming)
+        // A Bot Chat thread naming its bot's profile keeps that profile on
+        // the next client too, not only on a reconnect's.
+        let botThreadSupervisor = appState.voiceBackgroundJobSupervisor
+        botThreadSupervisor.attachLiveThread(
+            VoiceThreadTarget(runtimeSessionID: "bot-1", storedSessionID: "bot-stored-1", title: "Furina", profile: "furina")
+        )
+        let afterSwitch = makeClient(transport: transport, profile: "work")
+        appState.keepCallSessionsOnTheirProfile(appState.voiceCallProfile, for: afterSwitch)
+        XCTAssertEqual(afterSwitch.sessionProfile(for: "bot-1"), "furina")
+        XCTAssertEqual(afterSwitch.sessionProfile(for: "bot-stored-1"), "furina")
+        // A reconnect's client, with no predecessor to inherit from, names
+        // it too, and Local Live's own chat on a bot's profile (issue 2551).
+        appState.localLiveOwnChat = VoiceThreadTarget(
+            runtimeSessionID: "own-1", storedSessionID: "own-stored-1", title: "Own", profile: "atlas"
+        )
+        let reconnectedAgain = makeClient(transport: transport, profile: "work")
+        appState.keepCallSessionsOnTheirProfile(afterReconnect: reconnectedAgain)
+        XCTAssertEqual(reconnectedAgain.sessionProfile(for: "bot-1"), "furina")
+        XCTAssertEqual(reconnectedAgain.sessionProfile(for: "bot-stored-1"), "furina")
+        XCTAssertEqual(reconnectedAgain.sessionProfile(for: "own-1"), "atlas")
+        XCTAssertEqual(reconnectedAgain.sessionProfile(for: "own-stored-1"), "atlas")
+        appState.localLiveOwnChat = nil
+        botThreadSupervisor.attachLiveThread(
+            VoiceThreadTarget(runtimeSessionID: "chat-1", storedSessionID: "stored-1", title: "Trip")
+        )
+        XCTAssertTrue(outgoing.handOffSocket(to: incoming))
+        outgoing.disconnect()
+        appState.client = incoming
+        appState.setActiveProfileForTesting("work")
+        XCTAssertEqual(incoming.sessionProfile(for: "chat-1"), "default")
+        XCTAssertEqual(incoming.sessionProfile(for: "stored-1"), "default")
+        XCTAssertEqual(appState.voiceCallProfile, "default", "The call keeps its profile")
+        XCTAssertEqual(appState.callProfileOffScreen, "default")
+
+        let sent = Gate()
+        socket.onSend = { sent.signal() }
+        let turn = Task { try await incoming.sendPrompt("chat-1", text: "And the hotel?") }
+        try await sent.wait("the call's turn to be sent")
+        let request = try lastRequest(on: socket)
+        XCTAssertEqual((request["params"] as? [String: Any])?["profile"] as? String, "default",
+                       "The call's turn goes to its own profile, not the one on screen")
+        incoming.disconnect()
+        _ = try? await turn.value
+
+        // Switching back to the call's profile makes them the client's own again.
+        let back = makeClient(transport: transport, profile: "default")
+        back.inheritSessionProfiles(from: incoming)
+        appState.keepCallSessionsOnTheirProfile(appState.voiceCallProfile, for: back)
+        XCTAssertNil(back.sessionProfile(for: "chat-1"))
+
+        // A live call asked for on the profile on screen (Siri, a Shortcut)
+        // isn't the one running on "default": that one ends and hands its
+        // jobs back, so the new call starts as its own.
+        appState.endLiveCallOnAnotherProfile(than: "work")
+        XCTAssertFalse(appState.isLiveCallUp)
+        XCTAssertNil(appState.liveCallProfile)
+        XCTAssertEqual(appState.voiceCallProfile, "work")
+    }
+
+    func testASwitchTheCallGoesOnAcrossKeepsTheCallsRequestsInFlight() async throws {
+        let (outgoing, socket, transport) = try await connectedForHandOff()
+        let sent = Gate()
+        socket.onSend = { sent.signal() }
+        // A spoken job's submit in flight, and the screen's list read.
+        let submit = Task { try await outgoing.sendPrompt("job-1", text: "Book it") }
+        try await sent.wait("the job's submit to be sent")
+        let submitID = try XCTUnwrap(try lastRequest(on: socket)["id"] as? Int)
+        let sentList = Gate()
+        socket.onSend = { sentList.signal() }
+        let list = Task { try await outgoing.sessions() }
+        try await sentList.wait("the screen's list read to be sent")
+
+        // Another job's chat still being made: it names no session yet.
+        let sentCreate = Gate()
+        socket.onSend = { sentCreate.signal() }
+        let create = Task {
+            try await CallRequestScope.$isCallRequest.withValue(true) { try await outgoing.createSession() }
+        }
+        try await sentCreate.wait("the job's chat create to be sent")
+        let createID = try XCTUnwrap(try lastRequest(on: socket)["id"] as? Int)
+
+        // Two switches: the requests follow the socket to whoever holds it.
+        let between = makeClient(transport: transport, profile: "work")
+        XCTAssertTrue(outgoing.handOffSocket(to: between, carryingSessions: ["job-1"], carryingCallRequests: true))
+        outgoing.disconnect()
+        do {
+            _ = try await awaitResult(of: list, "the screen's request to fail")
+            XCTFail("The outgoing profile's own request still fails at the hand-off")
+        } catch HermesError.connectionClosed {}
+        let incoming = makeClient(transport: transport, profile: "home")
+        XCTAssertTrue(between.handOffSocket(to: incoming, carryingSessions: ["job-1"], carryingCallRequests: true))
+        between.disconnect()
+
+        try deliverReply([
+            "jsonrpc": "2.0", "id": createID,
+            "result": ["session_id": "job-2", "stored_session_id": "stored-2"]
+        ], on: socket)
+        let created = try await awaitResult(of: create, "the carried create to be answered")
+        XCTAssertEqual(created.sessionId, "job-2")
+
+        // The submit's answer comes on the same socket: the job learns it started.
+        try deliverReply(["jsonrpc": "2.0", "id": submitID, "result": ["status": "streaming"]], on: socket)
+        let outcome = try await awaitResult(of: submit, "the carried submit to be answered")
+        XCTAssertEqual(outcome, .accepted)
+        incoming.disconnect()
+    }
+
+    /// A carried spoken submit that an older Hermes refuses for its
+    /// `voice_turn` key is resent where the socket is now, not on the
+    /// client that handed it on.
+    func testACarriedSubmitsResendGoesToTheClientHoldingTheSocket() async throws {
+        let (outgoing, socket, transport) = try await connectedForHandOff()
+        let sent = Gate()
+        socket.onSend = { sent.signal() }
+        let submit = Task { try await outgoing.sendPrompt("job-1", text: "Book it", surface: "voice-live", voiceTurn: true) }
+        try await sent.wait("the job's submit to be sent")
+        let first = try lastRequest(on: socket)
+        let firstID = try XCTUnwrap(first["id"] as? Int)
+        XCTAssertEqual((first["params"] as? [String: Any])?["voice_turn"] as? Bool, true)
+
+        let incoming = makeClient(transport: transport, profile: "work")
+        XCTAssertTrue(outgoing.handOffSocket(to: incoming, carryingSessions: ["job-1"], carryingCallRequests: true))
+        outgoing.disconnect()
+        XCTAssertTrue(outgoing.socketHolder === incoming)
+
+        let resent = Gate()
+        socket.onSend = { resent.signal() }
+        try deliverReply([
+            "jsonrpc": "2.0", "id": firstID,
+            "error": ["code": 4000, "message": "invalid params for prompt.submit: voice_turn: Extra inputs are not permitted"]
+        ], on: socket)
+        try await resent.wait("the resend without voice_turn")
+        let retry = try lastRequest(on: socket)
+        XCTAssertNil((retry["params"] as? [String: Any])?["voice_turn"])
+        try deliverReply(["jsonrpc": "2.0", "id": try XCTUnwrap(retry["id"] as? Int), "result": ["status": "streaming"]], on: socket)
+        let outcome = try await awaitResult(of: submit, "the resent submit to be answered")
+        XCTAssertEqual(outcome, .accepted)
+        incoming.disconnect()
     }
 
     func testALateAnswerToTheOutgoingProfilesRequestNeverSettlesTheNextOnes() async throws {

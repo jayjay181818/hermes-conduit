@@ -457,14 +457,14 @@ enum GroupMemberStatus: Equatable {
     /// (keys apart from the plain words, which mean other things elsewhere).
     var label: String {
         switch self {
-        case .needsApproval: return AppLocalization.string("· needs approval")
-        case .responding: return AppLocalization.string("· responding…")
-        case .waiting: return AppLocalization.string("· waiting")
-        case .replied: return AppLocalization.string("· replied")
-        case .passed: return AppLocalization.string("· passed")
-        case .failed: return AppLocalization.string("· failed")
-        case .stopped: return AppLocalization.string("· stopped")
-        case .unavailable: return AppLocalization.string("· unavailable")
+        case .needsApproval: return AppLocalization.string("· needs approval", table: .rooms)
+        case .responding: return AppLocalization.string("· responding…", table: .rooms)
+        case .waiting: return AppLocalization.string("· waiting", table: .rooms)
+        case .replied: return AppLocalization.string("· replied", table: .rooms)
+        case .passed: return AppLocalization.string("· passed", table: .rooms)
+        case .failed: return AppLocalization.string("· failed", table: .rooms)
+        case .stopped: return AppLocalization.string("· stopped", table: .rooms)
+        case .unavailable: return AppLocalization.string("· unavailable", table: .rooms)
         }
     }
 
@@ -1228,6 +1228,14 @@ enum GroupRoomReplyQuote {
 /// function of the log, so replaying it here names the member whose turn is
 /// running. Presentation only — routing stays the gateway's.
 enum GroupRoomTurns {
+    /// Whether Group Info offers per-room choices for your agents: only
+    /// beside other people's agents, and only once the room's people read
+    /// says it isn't a room of only your own Hermes (`ownHermes` nil until
+    /// then), so such a room never paints or reads them first.
+    static func offersChoices(canSet: Bool, members: [GroupMember], ownHermes: Bool?) -> Bool {
+        canSet && members.contains(where: \.isPeer) && ownHermes == false
+    }
+
     /// `MAX_DISCUSSION_ROUNDS` / `MAX_DISCUSSION_MESSAGES` upstream.
     static let maxRounds = 3
     static let maxMessages = 10
@@ -1417,22 +1425,30 @@ enum GroupRoomTurns {
     }
 
     /// Whose another person's agent is, for the chip beside its name in
-    /// its bubble (GroupMemberOwnerChip); nil for yours and an unnamed one.
-    static func shownOwner(of member: GroupMember?) -> String? {
-        guard let member, member.isPeer, !member.isYours,
+    /// its bubble (GroupMemberOwnerChip); nil for yours and an unnamed one,
+    /// and for every bot in a room of only your own Hermes (`ownHermes`).
+    static func shownOwner(of member: GroupMember?, ownHermes: Bool = false) -> String? {
+        guard let member, member.isPeer, !member.isYours, !ownHermes,
               let owner = member.owner?.trimmingCharacters(in: .whitespacesAndNewlines), !owner.isEmpty else { return nil }
         return owner
     }
 
-    /// Group Info's line under a member: whose agent it is.
-    static func ownerLine(of member: GroupMember) -> String {
+    /// Group Info's line under a member: whose agent it is. In a room of
+    /// only your own Hermes (`ownHermes`) a far bot is yours too, on the
+    /// Hermes its Link names.
+    static func ownerLine(of member: GroupMember, ownHermes: Bool = false) -> String {
         let whose: String
+        let owner = member.owner?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         if !member.isPeer || member.isYours {
-            whose = AppLocalization.string("Your agent")
+            whose = AppLocalization.string("Your agent", table: .rooms)
+        } else if ownHermes {
+            whose = owner.isEmpty
+                ? AppLocalization.string("Your agent, on your other Hermes", table: .rooms)
+                : AppLocalization.string("Your agent, on \(owner)", table: .rooms)
         } else if let owner = member.owner?.trimmingCharacters(in: .whitespacesAndNewlines), !owner.isEmpty {
-            whose = AppLocalization.string("\(owner)'s agent")
+            whose = AppLocalization.string("\(owner)'s agent", table: .rooms)
         } else {
-            whose = AppLocalization.string("On another Hermes")
+            whose = AppLocalization.string("On another Hermes", table: .rooms)
         }
         guard let out = member.out else { return whose }
         return AppLocalization.string("\(whose) · \(RoomLeaveText.outLine(out))")
@@ -1445,7 +1461,7 @@ enum GroupRoomTurns {
             if let trimmed = candidate?.trimmingCharacters(in: .whitespacesAndNewlines),
                !trimmed.isEmpty { return trimmed }
         }
-        return AppLocalization.string("A member")
+        return AppLocalization.string("A member", table: .rooms)
     }
 
     /// The member whose turn the driver is running (or will run next) for
@@ -2006,17 +2022,37 @@ enum GroupRoomTurns {
 /// installation the room ends for everyone, the plugin deletes your agents'
 /// hidden sessions for it, and agents on other people's Hermes keep theirs
 /// (notifier 0.81, Eric 2026-10-26). A room of only your own agents ends
-/// whole.
+/// whole. A host set to keep a disbanded room's sessions (`chatsKept`, the
+/// plugin's `room_chats_kept`, notifier #443) keeps them in either room.
 enum GroupRoomDisband {
-    static func warning(members: [GroupMember]) -> String {
-        if members.contains(where: \.isPeer) {
+    static func warning(members: [GroupMember], chatsKept: Bool = false, ownHermes: Bool = false) -> String {
+        let withPeers = members.contains(where: \.isPeer)
+        // Every Hermes is yours: each keeps or deletes its own bots' sessions.
+        if withPeers, ownHermes {
+            return chatsKept
+                ? AppLocalization.string(
+                    "The room ends. This Hermes is set to keep its bots' sessions for it, and your other Hermes keeps its bots' sessions. This cannot be undone.", table: .rooms)
+                : AppLocalization.string(
+                    "The room ends, and this Hermes deletes its bots' sessions for it. Your other Hermes keeps its bots' sessions. This cannot be undone.", table: .rooms)
+        }
+        switch (withPeers, chatsKept) {
+        case (true, false):
             return AppLocalization.string(
-                "The room ends for everyone, and your agents' sessions for it are deleted. Agents on other people's Hermes keep theirs. This cannot be undone."
+                "The room ends for everyone, and your agents' sessions for it are deleted. Agents on other people's Hermes keep theirs. This cannot be undone.", table: .rooms
+            )
+        case (true, true):
+            return AppLocalization.string(
+                "The room ends for everyone. Your Hermes is set to keep your agents' sessions for it, and agents on other people's Hermes keep theirs. This cannot be undone."
+            )
+        case (false, false):
+            return AppLocalization.string(
+                "The room, its history, and every member's session end permanently. This cannot be undone."
+            )
+        case (false, true):
+            return AppLocalization.string(
+                "The room and its history end permanently. Your Hermes is set to keep its members' sessions. This cannot be undone."
             )
         }
-        return AppLocalization.string(
-            "The room, its history, and every member's session end permanently. This cannot be undone."
-        )
     }
 }
 
@@ -2096,7 +2132,7 @@ enum MentionAutocomplete {
                   !handle.isEmpty, seen.insert(handle.lowercased()).inserted else { continue }
             result.append(Candidate(tag: handle, title: GroupRoomTurns.displayName(of: member)))
         }
-        result.append(Candidate(tag: "all", title: AppLocalization.string("Everyone")))
+        result.append(Candidate(tag: "all", title: AppLocalization.string("Everyone", table: .rooms)))
         return result
     }
 

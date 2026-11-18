@@ -99,8 +99,8 @@ struct V2FinishSetupCard: View {
         let icon = "puzzlepiece.extension"
         switch plugin {
         case .unknown:
-            FinishSetupRow(icon: icon, title: title, detail: AppLocalization.string("Needed for notifications and calls from Hermes"), identifier: "finish-setup.plugin") {
-                actionButton(AppLocalization.string("Check"), action: openPluginPage)
+            FinishSetupRow(icon: icon, title: title, detail: AppLocalization.string("Needed for notifications and calls from Hermes", table: .chat), identifier: "finish-setup.plugin") {
+                actionButton(AppLocalization.string("Check", table: .chat), action: openPluginPage)
             }
         case .updating:
             FinishSetupRow(icon: icon, title: title, detail: AppLocalization.string("Updating…"), identifier: "finish-setup.plugin") {
@@ -109,7 +109,7 @@ struct V2FinishSetupCard: View {
                     .accessibilityHidden(true)
             }
         case .install:
-            FinishSetupRow(icon: icon, title: title, detail: AppLocalization.string("Needed for notifications and calls from Hermes"), identifier: "finish-setup.plugin") {
+            FinishSetupRow(icon: icon, title: title, detail: AppLocalization.string("Needed for notifications and calls from Hermes", table: .chat), identifier: "finish-setup.plugin") {
                 actionButton(AppLocalization.string("Install"), action: openPluginPage)
             }
         case .update:
@@ -117,7 +117,9 @@ struct V2FinishSetupCard: View {
                 actionButton(AppLocalization.string("Update"), action: openPluginPage)
             }
         case .restart:
-            FinishSetupRow(icon: icon, title: title, detail: AppLocalization.string("The new plugin is on the host. Hermes needs a restart to use it."), identifier: "finish-setup.plugin") {
+            FinishSetupRow(icon: icon, title: title, detail: appState.notifierPluginOnlyDashboardLeft
+                ? AppLocalization.string("The new plugin is on the host, and only the dashboard still runs the old one. Restart the dashboard on the host once.")
+                : AppLocalization.string("The new plugin is on the host. Hermes needs a restart to use it."), identifier: "finish-setup.plugin") {
                 actionButton(AppLocalization.string("Finish Update"), action: openPluginPage)
             }
         case .notRunning:
@@ -134,8 +136,8 @@ struct V2FinishSetupCard: View {
     private var pluginDoneDetail: String {
         switch FinishSetupStatus.pluginDoneNote(appState.notifierPlugin) {
         case .upToDate: return AppLocalization.string("Up to date on this dashboard's host")
-        case .newerVersionWaits: return AppLocalization.string("Works with this app. Newer versions wait in Settings.")
-        case .featuresWait: return AppLocalization.string("Works with this app. Some features need the newer version in Settings.")
+        case .newerVersionWaits: return AppLocalization.string("Works with this app. Newer versions wait in Settings.", table: .chat)
+        case .featuresWait: return AppLocalization.string("Works with this app. Some features need the newer version in Settings.", table: .chat)
         case .managed: return NotifierPluginStatus.managedText(appState.notifierPlugin.managedBy)
         }
     }
@@ -155,11 +157,11 @@ struct V2FinishSetupCard: View {
                 FinishSetupRow(
                     icon: icon,
                     title: title,
-                    detail: notifications.lastError ?? AppLocalization.string("Hear back when Hermes replies"),
+                    detail: notifications.lastError ?? AppLocalization.string("Hear back when Hermes replies", table: .chat),
                     detailIsWarning: notifications.lastError != nil,
                     identifier: "finish-setup.notifications"
                 ) {
-                    actionButton(AppLocalization.string("Turn on")) {
+                    actionButton(AppLocalization.string("Turn on", table: .chat)) {
                         Task { await appState.turnOnNotificationsFromSetup() }
                     }
                     .disabled(notifications.isPairing)
@@ -187,7 +189,7 @@ struct V2FinishSetupCard: View {
                 doneMark
             }
         } else {
-            FinishSetupRow(icon: icon, title: title, detail: AppLocalization.string("Talk to Hermes hands-free"), identifier: "finish-setup.voice") {
+            FinishSetupRow(icon: icon, title: title, detail: AppLocalization.string("Talk to Hermes hands-free", table: .chat), identifier: "finish-setup.voice") {
                 actionButton(AppLocalization.string("Set up")) {
                     appState.settingsLinkRequest = .voice
                 }

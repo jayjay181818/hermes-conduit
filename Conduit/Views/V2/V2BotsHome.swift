@@ -148,7 +148,7 @@ struct BotRoomPortraitLabel<Icon: View>: View {
             if talking {
                 HStack(spacing: 4) {
                     BotsLiveDot(animates: animates)
-                    Text(AppLocalization.string("Talking now"))
+                    Text(AppLocalization.string("Talking now", table: .bots))
                         .scaledFont(.caption2.weight(.semibold))
                         .foregroundStyle(Color.conduitAccent)
                         .lineLimit(1)
@@ -314,7 +314,7 @@ struct GroupRoomPortrait: View {
             }
         }
         Button(action: actions.reorder) {
-            Label(AppLocalization.string("Reorder Group Chats"), systemImage: "arrow.up.arrow.down")
+            Label(AppLocalization.string("Reorder Group Chats", table: .bots), systemImage: "arrow.up.arrow.down")
         }
         if let disband = actions.disband {
             Divider()
@@ -327,7 +327,7 @@ struct GroupRoomPortrait: View {
     private var accessibilityValue: String {
         var parts = [AppLocalization.string("\(room.members.count) members")]
         if room.isLinked { parts.insert(AppLocalization.string("With linked people"), at: 0) }
-        if talking { parts.insert(AppLocalization.string("Talking now"), at: 0) }
+        if talking { parts.insert(AppLocalization.string("Talking now", table: .bots), at: 0) }
         return parts.joined(separator: ", ")
     }
 }
@@ -576,7 +576,7 @@ struct NewRoomPortrait: View {
         ))
         .accessibilityLabel(Text(verbatim: name))
         .accessibilityValue(Text(verbatim: members))
-        .accessibilityHint(Text(AppLocalization.string("Names the room in the bar below.")))
+        .accessibilityHint(Text(AppLocalization.string("Names the room in the bar below.", table: .bots)))
         .accessibilityIdentifier("bots.newRoom.tile")
     }
 
@@ -591,9 +591,10 @@ struct NewRoomPortrait: View {
                 BotAvatarView(
                     name: bot.name,
                     label: bot.displayLabel,
-                    colorString: bot.appearanceColor,
+                    colorString: bot.shownColor,
                     image: appState.botAvatarImage(for: bot),
-                    size: size * spot.diameter
+                    size: size * spot.diameter,
+                    face: bot.faceLook
                 )
                 .overlay {
                     if shown.count > 1 {
@@ -676,20 +677,32 @@ struct BotsLiveDot: View {
 /// The bots as a grid of portraits. Three across on a phone; as many as
 /// fit at about the same size on a wider column, and fewer at the largest
 /// Text Sizes, where a name needs the room.
-struct BotPortraitGrid<Cell: View>: View {
-    let bots: [BotProfile]
+struct BotPortraitGrid<Item: Identifiable, Cell: View>: View {
+    let items: [Item]
     /// A portrait dropped past the last one.
     var onDropAtEnd: ((String) -> Void)?
-    @ViewBuilder let cell: (BotProfile) -> Cell
+    @ViewBuilder let cell: (Item) -> Cell
     @Environment(\.dynamicTypeSize) private var typeSize
+
+    /// Any kind of cell: Bots Home's mixed grid of a combined group's bots
+    /// (CombinedBotsHomeItem).
+    init(
+        items: [Item],
+        onDropAtEnd: ((String) -> Void)? = nil,
+        @ViewBuilder cell: @escaping (Item) -> Cell
+    ) {
+        self.items = items
+        self.onDropAtEnd = onDropAtEnd
+        self.cell = cell
+    }
 
     var body: some View {
         let columns = typeSize.isAccessibilitySize
             ? [GridItem(.flexible(), spacing: 10), GridItem(.flexible(), spacing: 10)]
             : [GridItem(.adaptive(minimum: 100, maximum: 150), spacing: 10)]
         LazyVGrid(columns: columns, alignment: .center, spacing: 22) {
-            ForEach(bots) { bot in
-                cell(bot)
+            ForEach(items) { item in
+                cell(item)
             }
         }
         .padding(.top, 14)
@@ -705,6 +718,16 @@ struct BotPortraitGrid<Cell: View>: View {
     }
 }
 
+extension BotPortraitGrid where Item == BotProfile {
+    init(
+        bots: [BotProfile],
+        onDropAtEnd: ((String) -> Void)? = nil,
+        @ViewBuilder cell: @escaping (BotProfile) -> Cell
+    ) {
+        self.init(items: bots, onDropAtEnd: onDropAtEnd, cell: cell)
+    }
+}
+
 /// Where Bots Home is in starting a room.
 enum BotPortraitRoom: Equatable {
     /// No room being started.
@@ -712,6 +735,21 @@ enum BotPortraitRoom: Equatable {
     /// One is: this bot is in it, or could be added.
     case member
     case notMember
+
+    /// What a portrait's tap does while a room is being started, for
+    /// VoiceOver; nil when none is (each portrait says its own).
+    var hint: String? {
+        switch self {
+        case .off: return nil
+        case .member: return AppLocalization.string("Takes this bot out of the new room.", table: .bots)
+        case .notMember: return AppLocalization.string("Adds this bot to the new room.", table: .bots)
+        }
+    }
+
+    /// The part of a portrait's VoiceOver value that says it's in the room.
+    var valuePart: String? {
+        self == .member ? AppLocalization.string("In the new room", table: .bots) : nil
+    }
 }
 
 /// Bots Home's one tip (Eric, 2026-11-06, #1850): touch and hold a bot for
@@ -722,13 +760,13 @@ struct BotsHomeGesturesTip: Tip {
     /// Bots Home shows two or more bots, so there's something to arrange.
     @Parameter static var hasBotsToArrange: Bool = false
 
-    var title: Text { Text(AppLocalization.string("Arrange your bots")) }
+    var title: Text { Text(AppLocalization.string("Arrange your bots", table: .bots)) }
 
     var message: Text? {
         // A Mac has no touch and hold: its menu is a right-click.
         Text(ProcessInfo.processInfo.runsOnMac
-             ? AppLocalization.string("Right-click a bot for its menu. Drag it to move it, or hold it over another bot to start a room.")
-             : AppLocalization.string("Touch and hold a bot for its menu. Drag it to move it, or hold it over another bot to start a room."))
+             ? AppLocalization.string("Right-click a bot for its menu. Drag it to move it, or hold it over another bot to start a room.", table: .bots)
+             : AppLocalization.string("Touch and hold a bot for its menu. Drag it to move it, or hold it over another bot to start a room.", table: .bots))
     }
 
     var image: Image? { Image(systemName: "hand.draw") }
@@ -989,27 +1027,48 @@ enum BotPortraitStatus: Equatable {
     /// Answering another bot's ask (an open ask_in), by that bot's name.
     case helping(String)
     case working(Int)
+    /// Background agents the Bot Chat itself started, still running: its
+    /// workstreams are off, or it does the work itself (app issue 2206).
+    case agents(Int)
     /// Talking in group rooms now (their driver works), by room name,
     /// talked in last first.
     case inRooms([String])
     /// Its own ask to another bot is unanswered (an ask_out waiting).
     case waitingOn(String)
+    /// A chat of its replying, its Bot Chat's own turn included: not a
+    /// workstream, so it never says "working" (Eric, 2026-11-16: the
+    /// coordinator talking read as a workstream running).
+    case replying
     case idle
 
     /// What needs the user first, then helping another bot, its own work,
-    /// talking in a room, and waiting on another bot. `rooms`: the talking
-    /// rooms it's in, which show without the plugin's workstreams too.
-    static func of(_ snapshot: BotWorkSnapshot?, talkingIn rooms: [String] = []) -> BotPortraitStatus {
+    /// the Bot Chat's own background agents, talking in a room, its chats'
+    /// running turns, and waiting on another bot. `rooms`: the talking
+    /// rooms it's in, which show without the plugin's workstreams too. The
+    /// Bot Chat's agents show with its workstreams off too: then it's the
+    /// one delegating. `chats`: what its chats do (its profile's live
+    /// registry and the plugin's waits, its workstreams left out), which
+    /// show without the workstreams too: a chat waiting on the user counts
+    /// as needing them, and running chats add to its work, after its rooms
+    /// when nothing else works (a room's own turns run in the bot's chats).
+    static func of(_ snapshot: BotWorkSnapshot?, talkingIn rooms: [String] = [], chats: BotLiveChats? = nil) -> BotPortraitStatus {
         let quiet: BotPortraitStatus = rooms.isEmpty ? .idle : .inRooms(rooms)
-        guard let snapshot, snapshot.isOn else { return quiet }
-        if snapshot.needsYouCount > 0 { return .needsYou(snapshot.needsYouCount) }
-        if let ask = snapshot.items.first(where: {
+        let chats = chats ?? BotLiveChats()
+        let work = snapshot?.isOn == true ? snapshot : nil
+        let needsYou = (work?.needsYouCount ?? 0) + chats.waiting
+        if needsYou > 0 { return .needsYou(needsYou) }
+        if let ask = work?.items.first(where: {
             $0.kind == .askIn && !$0.isClosed && ["starting", "running"].contains($0.status) && !$0.otherBot.isEmpty
         }) {
             return .helping(ask.otherBot)
         }
-        if snapshot.workingCount > 0 { return .working(snapshot.workingCount) }
+        // Its workstreams only: its chats replying aren't work running.
+        if let work, work.workingCount > 0 { return .working(work.workingCount) }
+        let agents = snapshot?.botChatAgentCount ?? 0
+        if agents > 0 { return .agents(agents) }
         if !rooms.isEmpty { return quiet }
+        if chats.working > 0 { return .replying }
+        guard let snapshot = work else { return quiet }
         if let ask = snapshot.items.first(where: {
             $0.kind == .askOut && !$0.isClosed && $0.status == "waiting" && !$0.otherBot.isEmpty
         }) {
@@ -1035,12 +1094,14 @@ enum BotPortraitStatus: Equatable {
 
     var title: String {
         switch self {
-        case .needsYou(let count): return AppLocalization.string("\(count) needs you")
-        case .helping(let name): return AppLocalization.string("Helping \(name)")
-        case .working(let count): return AppLocalization.string("\(count) working")
+        case .needsYou(let count): return AppLocalization.string("\(count) needs you", table: .bots)
+        case .helping(let name): return AppLocalization.string("Helping \(name)", table: .bots)
+        case .working(let count): return AppLocalization.string("\(count) working", table: .bots)
+        case .agents(let count): return AppLocalization.string("\(count) agents running", table: .bots)
         case .inRooms(let rooms) where rooms.count == 1: return AppLocalization.string("In \(rooms[0])")
-        case .inRooms(let rooms): return AppLocalization.string("In \(rooms.count) rooms")
-        case .waitingOn(let name): return AppLocalization.string("Waiting on \(name)")
+        case .inRooms(let rooms): return AppLocalization.string("In \(rooms.count) rooms", table: .bots)
+        case .waitingOn(let name): return AppLocalization.string("Waiting on \(name)", table: .bots)
+        case .replying: return AppLocalization.string("Replying", table: .bots)
         // Idle says nothing: the portrait's still ring says it.
         case .idle: return ""
         }
@@ -1049,7 +1110,7 @@ enum BotPortraitStatus: Equatable {
     var tint: Color {
         switch self {
         case .needsYou: return .orange
-        case .helping, .working, .inRooms: return .conduitAccent
+        case .helping, .working, .agents, .inRooms, .replying: return .conduitAccent
         case .waitingOn, .idle: return .secondary
         }
     }
@@ -1059,8 +1120,10 @@ enum BotPortraitStatus: Equatable {
         case .needsYou: return "exclamationmark.circle.fill"
         case .helping: return "arrowshape.turn.up.left.fill"
         case .working: return "arrow.triangle.2.circlepath"
+        case .agents: return "person.2.fill"
         case .inRooms: return "bubble.left.and.bubble.right.fill"
         case .waitingOn: return "hourglass"
+        case .replying: return "ellipsis.bubble.fill"
         case .idle: return nil
         }
     }
@@ -1093,6 +1156,19 @@ struct BotPortraitCell<MenuContent: View>: View {
     /// while still in hand.
     var onSlide: ((_ dragged: String) -> Void)?
     var onToggleRoom: (() -> Void)?
+    /// What waits on the user in each profile's chats (Needs you), which
+    /// the status counts.
+    @ObservedObject var needsYou: NeedsYouStore
+    /// The face at the default Text Size: 72 in the grid, larger when Bots
+    /// Home has only one or two bots (BotsHomeFew), with a larger name.
+    var portraitSize: CGFloat = 72
+    /// In a combined group's mixed grid, the dashboard whose bot this is:
+    /// every portrait there carries its badge, this dashboard's too.
+    var dashboardBadge: UUID?
+    /// In the mixed grid, VoiceOver's way to arrange it (a drag there has
+    /// no accessible form, and Reorder Bots arranges this dashboard only).
+    var onMoveEarlier: (() -> Void)?
+    var onMoveLater: (() -> Void)?
     @EnvironmentObject private var appState: AppState
     @Environment(\.v2OpenBeside) private var openBeside
     @Environment(\.v2Shell) private var shell
@@ -1137,8 +1213,31 @@ struct BotPortraitCell<MenuContent: View>: View {
     /// Without the plugin's workstreams, nothing to show, even if a read
     /// from before is still kept (the overview hides Work then too).
     private var status: BotPortraitStatus {
-        .of(appState.servesBotWorkstreams ? work.snapshot(bot.name) : nil,
-            talkingIn: appState.talkingRooms(of: bot.name).map(\.name))
+        let snapshot = appState.servesBotWorkstreams ? work.snapshot(bot.name) : nil
+        return .of(snapshot,
+                   talkingIn: appState.talkingRooms(of: bot.name).map(\.name),
+                   chats: appState.botLiveChats(bot.name, leavingOut: snapshot?.knownSessionIDs ?? []))
+    }
+
+    /// The pill's tap: a wait in the bot's chats, when none of its
+    /// workstreams waits, opens that chat at its card, as Needs you does;
+    /// anything else opens the overview, where its work is.
+    private func statusTapped(_ status: BotPortraitStatus) {
+        if let wait = chatWaitThePillOpens(status) {
+            appState.openNeedsYou(wait)
+            return
+        }
+        onOverview()
+    }
+
+    /// The wait in the bot's chats its "needs you" opens: only when none
+    /// of its workstreams waits, whose list the overview shows.
+    private func chatWaitThePillOpens(_ status: BotPortraitStatus) -> NeedsYouItem? {
+        guard case .needsYou = status else { return nil }
+        // As the status counts them: a bot whose work is off has none.
+        let snapshot = appState.servesBotWorkstreams ? work.snapshot(bot.name) : nil
+        guard (snapshot?.isOn == true ? snapshot?.needsYouCount ?? 0 : 0) == 0 else { return nil }
+        return appState.newestBotChatWait(bot.name, leavingOut: snapshot?.knownSessionIDs ?? [])
     }
 
     private var color: Color { appState.botColor(bot) }
@@ -1168,7 +1267,20 @@ struct BotPortraitCell<MenuContent: View>: View {
             .accessibilityLabel(Text(bot.displayLabel))
             .accessibilityValue(Text(accessibilityValue(status)))
             .accessibilityHint(Text(portraitHint))
-            .accessibilityAction(named: Text(AppLocalization.string("Overview"))) { onOverview() }
+            .accessibilityAction(named: Text(AppLocalization.string("Overview", table: .bots))) { onOverview() }
+            // The pill is hidden from VoiceOver: a wait in the bot's chats
+            // that it opens gets its own action, beside Overview.
+            .accessibilityActions {
+                if let wait = chatWaitThePillOpens(status) {
+                    Button(AppLocalization.string("Needs you")) { appState.openNeedsYou(wait) }
+                }
+                if let onMoveEarlier {
+                    Button(AppLocalization.string("Move Earlier"), action: onMoveEarlier)
+                }
+                if let onMoveLater {
+                    Button(AppLocalization.string("Move Later"), action: onMoveLater)
+                }
+            }
             .v2SelectedTrait(selection)
 
             // The name, and the ⓘ beside it; at accessibility sizes the ⓘ
@@ -1176,7 +1288,7 @@ struct BotPortraitCell<MenuContent: View>: View {
             HStack(spacing: 0) {
                 Button(action: tapped) {
                     Text(bot.displayLabel)
-                        .scaledFont(.subheadline.weight(.semibold))
+                        .scaledFont(portraitSize > 72 ? ScaledFont.title3.weight(.bold) : ScaledFont.subheadline.weight(.semibold))
                         .foregroundStyle(.primary)
                         .lineLimit(1)
                         .minimumScaleFactor(0.85)
@@ -1234,8 +1346,14 @@ struct BotPortraitCell<MenuContent: View>: View {
             guard shell.isTabActive else { return }
             await appState.refreshBotWork(profile: bot.name)
         }
-        .onChange(of: work.snapshot(bot.name)?.readyCount) { old, new in
-            if let old, let new, new > old { noteFinished() }
+        // Counted by a read on one dashboard: the phone's copy of an earlier
+        // read catching up, or a switch onto another whose bot of the same
+        // name has more ready, isn't a result coming back (Eric, 2026-11-16:
+        // opening a far bot flashed another bot's ring).
+        .onChange(of: ReadyCount(dashboardID: appState.activeDashboardID, snapshot: work.snapshot(bot.name))) { old, new in
+            if old.dashboardID == new.dashboardID, !old.isKept, let was = old.count, let now = new.count, now > was {
+                noteFinished()
+            }
         }
         .onChange(of: isShown) { _, shown in
             if shown && finishPending { noteFinished() }
@@ -1250,13 +1368,9 @@ struct BotPortraitCell<MenuContent: View>: View {
             onToggleRoom()
             return
         }
-        appState.beginOpeningBotChat(bot.name)
         // This chat grows out of this portrait (BotZoomDestination),
         // unless it opens beside the list, or doesn't open.
-        if openBeside == nil { appState.botZoom.tap(bot.name) }
-        Task {
-            if await !appState.openBotChatFromList(bot) { appState.botZoom.openFailed(bot.name) }
-        }
+        appState.openBotChatFromHome(bot, zooms: openBeside == nil)
     }
 
     /// The ⓘ: the bot's overview, always. A small glyph with a 44-point-tall
@@ -1277,8 +1391,8 @@ struct BotPortraitCell<MenuContent: View>: View {
         .buttonStyle(PressableButtonStyle())
         .fixedSize()
         .padding(.horizontal, -7)
-        .help(AppLocalization.string("Overview"))
-        .accessibilityLabel(Text(AppLocalization.string("\(bot.displayLabel)’s overview")))
+        .help(AppLocalization.string("Overview", table: .bots))
+        .accessibilityLabel(Text(AppLocalization.string("\(bot.displayLabel)’s overview", table: .bots)))
         .accessibilityIdentifier("bots.overview.\(bot.name)")
     }
 
@@ -1295,7 +1409,7 @@ struct BotPortraitCell<MenuContent: View>: View {
         } else {
             Button {
                 Haptics.light()
-                onOverview()
+                statusTapped(status)
             } label: {
                 pill(status)
             }
@@ -1305,11 +1419,7 @@ struct BotPortraitCell<MenuContent: View>: View {
     }
 
     private var portraitHint: String {
-        switch room {
-        case .off: return AppLocalization.string("Opens this bot's chat.")
-        case .member: return AppLocalization.string("Takes this bot out of the new room.")
-        case .notMember: return AppLocalization.string("Adds this bot to the new room.")
-        }
+        room.hint ?? AppLocalization.string("Opens this bot's chat.", table: .bots)
     }
 
     private func beginTargeting() {
@@ -1406,9 +1516,10 @@ struct BotPortraitCell<MenuContent: View>: View {
 
     private func portrait(_ status: BotPortraitStatus) -> some View {
         let ringed = selection == .open || room == .member || mergeReady
-        // 72 at the default Text Size; the monogram scales it once, up to
-        // accessibility1 (about 115), so a two-column cell still holds it.
-        return BotMonogramView(bot: bot, size: 72, animates: animates)
+        // 72 at the default Text Size (larger with one or two bots); the
+        // monogram scales it once, up to accessibility1 (about 115 from 72),
+        // so a two-column cell still holds it.
+        return BotMonogramView(bot: bot, size: portraitSize, animates: animates)
             .dynamicTypeSize(...DynamicTypeSize.accessibility1)
             // Where its face flies from when it joins a room being started.
             .anchorPreference(key: BotsHomeAnchorKey.self, value: .bounds) { [BotsHomeAnchorKey.bot(bot.name): $0] }
@@ -1435,6 +1546,13 @@ struct BotPortraitCell<MenuContent: View>: View {
                         .background(Circle().fill(Color(.secondarySystemBackground)))
                         .overlay(Circle().strokeBorder(Color(.systemBackground), lineWidth: 2))
                         .offset(x: -2, y: -2)
+                        .accessibilityHidden(true)
+                }
+            }
+            .overlay(alignment: .bottomTrailing) {
+                if let dashboardBadge, !mergeReady, room != .member {
+                    CombinedDashboardBadge(dashboardID: dashboardBadge, size: 22)
+                        .offset(x: 2, y: 2)
                         .accessibilityHidden(true)
                 }
             }
@@ -1515,6 +1633,19 @@ struct BotPortraitCell<MenuContent: View>: View {
     /// A result came back (the bot's ready count went up): one ripple and a
     /// check on the badge, then still. Off screen, it waits for Bots Home
     /// to show again.
+    /// A bot's ready count and the dashboard it was read on.
+    private struct ReadyCount: Equatable {
+        let dashboardID: UUID?
+        let count: Int?
+        let isKept: Bool
+
+        init(dashboardID: UUID?, snapshot: BotWorkSnapshot?) {
+            self.dashboardID = dashboardID
+            count = snapshot?.readyCount
+            isKept = snapshot?.isKept ?? false
+        }
+    }
+
     private func noteFinished() {
         guard isShown else {
             finishPending = true
@@ -1532,6 +1663,31 @@ struct BotPortraitCell<MenuContent: View>: View {
     }
 
     private func pill(_ status: BotPortraitStatus) -> some View {
+        BotStatusPill(status: status)
+    }
+
+    private func accessibilityValue(_ status: BotPortraitStatus) -> String {
+        let parts = [
+            bot.isPinned ? AppLocalization.string("Pinned") : "",
+            room.valuePart ?? "",
+            status == .idle ? "" : status.title,
+        ]
+        return parts.filter { !$0.isEmpty }.joined(separator: ", ")
+    }
+}
+
+/// A bot's status pill on Bots Home, this dashboard's and another combined
+/// dashboard's alike.
+struct BotStatusPill: View {
+    let status: BotPortraitStatus
+
+    /// The ⓘ's words, which another combined dashboard's portrait shares.
+    static var overviewTitle: String { AppLocalization.string("Overview", table: .bots) }
+    static func overviewLabel(_ bot: BotProfile) -> String {
+        AppLocalization.string("\(bot.displayLabel)’s overview", table: .bots)
+    }
+
+    var body: some View {
         HStack(spacing: 4) {
             if let symbol = status.symbol {
                 Image(systemName: symbol)
@@ -1554,15 +1710,6 @@ struct BotPortraitCell<MenuContent: View>: View {
         // and truncate to nothing; the overview sheet says them in full.
         .dynamicTypeSize(...DynamicTypeSize.accessibility2)
     }
-
-    private func accessibilityValue(_ status: BotPortraitStatus) -> String {
-        let parts = [
-            bot.isPinned ? AppLocalization.string("Pinned") : "",
-            room == .member ? AppLocalization.string("In the new room") : "",
-            status == .idle ? "" : status.title,
-        ]
-        return parts.filter { !$0.isEmpty }.joined(separator: ", ")
-    }
 }
 
 /// A bot's overview: who it is, its chat a tap away, its work (the Work
@@ -1576,6 +1723,8 @@ struct BotOverviewSheet: View {
     /// Low Power Mode as it changes, so the motion stops when it turns on.
     @ObservedObject private var devicePower = DevicePowerState.shared
     @ObservedObject var work: BotWorkStore
+    /// The plugin's waits, which the header's chat counts include.
+    @ObservedObject var needsYou: NeedsYouStore
     let profile: String
     /// Edit Bot, for a bot that can be edited here; nil hides it.
     var onEdit: ((BotProfile) -> Void)?
@@ -1608,7 +1757,10 @@ struct BotOverviewSheet: View {
     private var showsWork: Bool { appState.servesBotWorkstreams }
 
     private var headerStatus: BotPortraitStatus {
-        .of(showsWork ? work.snapshot(profile) : nil, talkingIn: appState.talkingRooms(of: profile).map(\.name))
+        let snapshot = showsWork ? work.snapshot(profile) : nil
+        return .of(snapshot,
+                   talkingIn: appState.talkingRooms(of: profile).map(\.name),
+                   chats: appState.botLiveChats(profile, leavingOut: snapshot?.knownSessionIDs ?? []))
     }
 
     private var shown: Section { showsWork ? section : .artifacts }
@@ -1621,7 +1773,7 @@ struct BotOverviewSheet: View {
                     Haptics.light()
                     onChat()
                 } label: {
-                    Label(AppLocalization.string("Chat with \(botName)"), systemImage: "bubble.left.fill")
+                    Label(AppLocalization.string("Chat with \(botName)", table: .bots), systemImage: "bubble.left.fill")
                         .frame(maxWidth: .infinity, minHeight: 44)
                 }
                 // Settings' primary button, as every sheet's.
@@ -1633,7 +1785,7 @@ struct BotOverviewSheet: View {
                 .padding(.bottom, showsWork ? 0 : 12)
                 .accessibilityIdentifier("botOverview.chat")
                 if showsWork {
-                    Picker(AppLocalization.string("Overview"), selection: $section) {
+                    Picker(AppLocalization.string("Overview", table: .bots), selection: $section) {
                         Text(AppLocalization.string("Work")).tag(Section.work)
                         Text(AppLocalization.string("Artifacts")).tag(Section.artifacts)
                     }
@@ -1664,6 +1816,12 @@ struct BotOverviewSheet: View {
                 await appState.refreshTalkingRoomsIfDue(every: BotsTalkingRoomsReader.every)
                 try? await Task.sleep(for: BotsTalkingRoomsReader.every)
             }
+        }
+        // The header's chats, as its portrait's on Bots Home, which this
+        // covers (its reads stop then); opened from a Bot Chat too.
+        .task(id: "\(scenePhase == .active)|\(appState.isConnected)|\(profile)") {
+            guard scenePhase == .active, appState.isConnected else { return }
+            await appState.runBotsHomeLiveStatus(bots: [profile], key: "overview")
         }
         // A workstream opened from its list shows its own chat.
         .onChange(of: appState.activeSessionId) { _, _ in onClose() }
@@ -1716,6 +1874,25 @@ struct BotOverviewSheet: View {
                         .lineLimit(2)
                         .fixedSize(horizontal: false, vertical: true)
                 }
+                // What its chats do, as its portrait counts them (its
+                // workstreams' are in the line above), in words for
+                // VoiceOver too, which skips the portrait.
+                if let chats = appState.botLiveChats(profile, leavingOut: (showsWork ? work.snapshot(profile)?.knownSessionIDs : nil) ?? []),
+                   chats.waiting + chats.working > 0 {
+                    let parts = [
+                        chats.waiting > 0 ? BotPortraitStatus.needsYou(chats.waiting).title : nil,
+                        chats.working > 0 ? BotPortraitStatus.replying.title : nil,
+                    ].compactMap { $0 }
+                    Label {
+                        Text(verbatim: parts.joined(separator: " · "))
+                    } icon: {
+                        Image(systemName: "bubble.left.fill")
+                    }
+                    .scaledFont(.footnote)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+                }
                 // Where it talks now, as its portrait's pill says.
                 let rooms = appState.talkingRooms(of: profile).map(\.name)
                 if !rooms.isEmpty {
@@ -1735,7 +1912,7 @@ struct BotOverviewSheet: View {
             BotScreenButton(support: appState.botScreens, profile: profile, open: {
                 Haptics.light()
                 screenTarget = BotScreenTarget(profile: profile, botName: botName)
-            }, title: AppLocalization.string("\(botName)'s Screen"), iconOnly: true)
+            }, title: AppLocalization.string("\(botName)'s Screen", table: .bots), iconOnly: true)
             if let bot, let onEdit {
                 Button {
                     Haptics.light()
@@ -1802,7 +1979,7 @@ struct BotReorderSheet: View {
                 }
             }
             .environment(\.editMode, .constant(.active))
-            .navigationTitle(AppLocalization.string("Reorder Bots"))
+            .navigationTitle(AppLocalization.string("Reorder Bots", table: .bots))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
@@ -1838,7 +2015,7 @@ struct GroupRoomReorderSheet: View {
                 }
             }
             .environment(\.editMode, .constant(.active))
-            .navigationTitle(AppLocalization.string("Reorder Group Chats"))
+            .navigationTitle(AppLocalization.string("Reorder Group Chats", table: .bots))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
@@ -1922,20 +2099,32 @@ struct BotZoomDestination: ViewModifier {
     let fromHome: Bool
     @EnvironmentObject private var appState: AppState
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    /// The portrait this chat grew from, once its chat landed. Back lets
+    /// the arm go at the pop's start; without this the screen changed
+    /// branch there and was built again as it shrank.
+    @State private var landedSource: String?
 
     func body(content: Content) -> some View {
         // A workstream opened from the Bot Chat shows in the same pushed
         // screen: it counts as its bot's, so the zoom holds through the
         // visit and Back still shrinks the Bot Chat home. A transition
         // changed on a pushed screen leaves Back with no animation.
-        if #available(iOS 18.0, *), route == .conversation, fromHome, !reduceMotion,
-           let source = appState.botZoom.source(open: appState.botZoomRoomKey
-                ?? appState.activeBotChatProfile ?? appState.activeWorkstream?.profile) {
-            content
-                .navigationTransition(.zoom(sourceID: source, in: namespace))
-                .environment(\.botChatZoomed, true)
-        } else {
-            content
+        let open = appState.botZoomRoomKey ?? appState.activeBotChatProfile ?? appState.activeWorkstream?.profile
+        let armed = route == .conversation && fromHome && !reduceMotion ? appState.botZoom.source(open: open) : nil
+        let held = reduceMotion ? nil : landedSource.flatMap { source in
+            open?.caseInsensitiveCompare(source) == .orderedSame ? source : nil
+        }
+        Group {
+            if #available(iOS 18.0, *), let source = armed ?? held {
+                content
+                    .navigationTransition(.zoom(sourceID: source, in: namespace))
+                    .environment(\.botChatZoomed, true)
+            } else {
+                content
+            }
+        }
+        .onChange(of: appState.botZoom.landed ? armed : nil, initial: true) { _, landed in
+            if let landed { landedSource = landed }
         }
     }
 }
@@ -2058,7 +2247,7 @@ struct BotPortraitMotion: ViewModifier {
 
     private var isWorking: Bool {
         switch status {
-        case .working, .helping: return true
+        case .working, .helping, .agents, .replying: return true
         default: return false
         }
     }

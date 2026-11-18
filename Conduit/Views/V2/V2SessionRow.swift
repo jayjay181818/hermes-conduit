@@ -76,7 +76,7 @@ enum V2SessionStatus: Equatable {
     var accessibilityWord: String? {
         switch self {
         case .running: return AppLocalization.string("Running")
-        case .approval: return AppLocalization.string("Needs approval")
+        case .approval: return AppLocalization.string("Needs approval", table: .chat)
         case .voice: return AppLocalization.string("Voice")
         case .scheduled: return AppLocalization.string("Scheduled")
         case .job: return AppLocalization.string("Voice Jobs")
@@ -151,6 +151,16 @@ struct V2ProfileBadge: Equatable {
     let profile: String
     let name: String
     let url: URL?
+    /// Another combined dashboard's profile, for its starter face.
+    var dashboardID: UUID? = nil
+}
+
+/// Another combined dashboard's row (all-live stage 4b): the first letter
+/// of its name on its color, as Needs you marks its waits.
+struct V2DashboardBadge: Equatable {
+    let letter: String
+    let colorIndex: Int
+    let name: String
 }
 
 struct V2SessionRow: View {
@@ -180,6 +190,9 @@ struct V2SessionRow: View {
     /// without an icon (a project page gathering profiles, issue 1761)
     /// ahead of the title.
     var profileBadge: V2ProfileBadge? = nil
+    /// Another combined dashboard's chat: its badge, on the icon's corner,
+    /// or on its profile's picture there in All.
+    var dashboardBadge: V2DashboardBadge? = nil
 
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @ScaledMetric(relativeTo: .callout) private var titleFaceSize: CGFloat = 16
@@ -194,11 +207,24 @@ struct V2SessionRow: View {
                                 profile: profileBadge.profile,
                                 displayName: profileBadge.name,
                                 url: profileBadge.url,
-                                size: 18
+                                size: 18,
+                                dashboardID: profileBadge.dashboardID
                             )
                             .overlay { Circle().strokeBorder(Color.black.opacity(0.35), lineWidth: 1) }
+                            // Another combined dashboard's profile: its
+                            // dashboard's mark on the picture's corner.
+                            .overlay(alignment: .bottomTrailing) {
+                                if let dashboardBadge {
+                                    CombinedDashboardBadge.Mark(badge: dashboardBadge, size: 11)
+                                        .offset(x: 3, y: 3)
+                                }
+                            }
                             .offset(x: 4, y: 4)
                             .accessibilityHidden(true)
+                        } else if let dashboardBadge {
+                            CombinedDashboardBadge.Mark(badge: dashboardBadge, size: 18)
+                                .offset(x: 4, y: 4)
+                                .accessibilityHidden(true)
                         }
                     }
                     .padding(.leading, 16)
@@ -214,7 +240,8 @@ struct V2SessionRow: View {
                             profile: profileBadge.profile,
                             displayName: profileBadge.name,
                             url: profileBadge.url,
-                            size: titleFaceSize
+                            size: titleFaceSize,
+                            dashboardID: profileBadge.dashboardID
                         )
                         // On the title's line rather than above its baseline.
                         .alignmentGuide(.firstTextBaseline) { $0[.bottom] - titleFaceSize * 0.2 }
@@ -308,10 +335,11 @@ struct V2SessionRow: View {
 
     private var accessibilityValue: String {
         [
-            profileBadge.map { AppLocalization.string("\($0.name) profile") },
+            dashboardBadge?.name,
+            profileBadge.map { AppLocalization.string("\($0.name) profile", table: .chat) },
             isUnread ? AppLocalization.string("Unread") : nil,
             isPinned ? AppLocalization.string("Pinned") : nil,
-            isStarred ? AppLocalization.string("Starred") : nil,
+            isStarred ? AppLocalization.string("Starred", table: .chat) : nil,
             status.accessibilityWord,
             preview.isEmpty ? nil : preview,
             time.isEmpty ? nil : time
@@ -389,7 +417,7 @@ struct V2ContentMatchRow: View {
     private var accessibilityValue: String {
         [
             isUnread ? AppLocalization.string("Unread") : nil,
-            isStarred ? AppLocalization.string("Starred") : nil,
+            isStarred ? AppLocalization.string("Starred", table: .chat) : nil,
             snippet.plainText.isEmpty ? nil : snippet.plainText,
             time.isEmpty ? nil : time
         ]
@@ -414,6 +442,10 @@ struct V2RowDivider: View {
 extension View {
     /// Plain V2 list chrome: no background, no system separator, the row's
     /// own hairline, full-width insets.
+    /// The traits reach the List only from the row's own view, not from
+    /// inside an `.equatable()` wrapper (the rows drew black with system
+    /// insets, #2500): a row that compares its content puts that behind
+    /// `.equatable()` and sets these on the outside (`V2ChatsRow`).
     func v2ListRow(divider: Bool = true, dividerInset: CGFloat = 32) -> some View {
         self
             .overlay(alignment: .bottom) {

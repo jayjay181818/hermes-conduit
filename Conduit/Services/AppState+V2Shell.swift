@@ -13,20 +13,39 @@ import SwiftUI
 extension AppState {
     /// A bot's own color, as its chat's glow shows it: the color picked
     /// for its profile or drawn from its photo, else its Hermes color, else
-    /// its name's hue. Bots Home's rings and the overview use it, so a
+    /// its starter face's (StarterFaces). Bots Home's rings and the overview use it, so a
     /// ring matches the bot (build 248: the rings took the name's hue
     /// whenever Hermes kept no color).
     func botColor(_ bot: BotProfile) -> Color {
-        Self.botColor(bot, glow: profileGlowColors()[bot.name])
+        if let carried = carriedCombinedGlow(bot.name) { return carried.color }
+        return Self.botColor(bot, glow: profileGlowColors()[bot.name])
+    }
+
+    /// A combined dashboard just switched to: the color its bot wore on the
+    /// grid as another dashboard's, until this one's profiles are in. Until
+    /// then its colors are drawn from part of its profiles (the one in use
+    /// alone), so a bot took another of its picture's colors, or the name's
+    /// stand-in, for a moment: the same bot each switch (Eric, 2026-11-16:
+    /// "green shouldn't even be raiden's color").
+    private func carriedCombinedGlow(_ name: String) -> ProfileGlowRGB? {
+        guard let id = activeDashboardID, let seen = combinedDashboardBots[id],
+              let glow = seen.glows[name] else { return nil }
+        // In once every bot is a listed profile and every picture it had
+        // there is known here too (both load after the switch).
+        let listed = Set(profiles.map { $0.lowercased() })
+        let profilesIn = seen.bots.allSatisfy { listed.contains($0.name.lowercased()) }
+        let picturesIn = seen.avatars.keys.allSatisfy { profileAvatarURLs[$0] != nil }
+        return profilesIn && picturesIn ? nil : glow
     }
 
     static func botColor(_ bot: BotProfile, glow: ProfileGlowRGB?) -> Color {
-        glow?.color ?? BotAvatarView.color(for: bot.appearanceColor, name: bot.name)
+        glow?.color ?? BotAvatarView.color(for: bot.shownColor, name: bot.name)
     }
 
     /// The color the backdrop's warm glow takes for a profile: the one
     /// picked for it or drawn from its photo (`profileGlowColors`), else the
-    /// color its bot was given in Hermes, or nil (the gold accent). The bot
+    /// color its bot was given in Hermes, else its bot's starter face's,
+    /// or nil (the gold accent) for a profile with no bot. The bot
     /// branch resolves the roster row like every other bot lookup
     /// (`linkedBot`), so it also answers a RENAME — an old name surviving
     /// only in previousNames — and it applies to any profile name that
@@ -38,8 +57,7 @@ extension AppState {
         let roster = shownBotRoster
         guard !roster.isEmpty else { return nil }
         guard let bot = Self.linkedBot(named: profile, in: roster),
-              let color = bot.appearanceColor?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !color.isEmpty else { return nil }
+              let color = bot.shownColor else { return nil }
         return BotAvatarView.color(for: color, name: bot.name)
     }
 

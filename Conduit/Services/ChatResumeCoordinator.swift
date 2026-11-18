@@ -42,6 +42,9 @@ final class ChatResumeCoordinator {
     private let store: ChatResumeStore
     private var pendingFallbackSelection = false
     private var pendingSessionKey: ChatScrollSessionKey?
+    /// The automatic sync that staged `pendingSessionKey` (its operation
+    /// id), when one did: only it retires that state on failure.
+    private var pendingOwner: UUID?
     private var pendingFlushTask: Task<Void, Never>?
     private var viewportIsFrozen = false
     private var nextGeneration: UInt64 = 0
@@ -61,23 +64,27 @@ final class ChatResumeCoordinator {
     /// A mixed batch may retain an expired sibling while another question
     /// remains answerable; only request-level expiry makes the whole card stale.
     static func pendingClarifyMessageID(in messages: [ChatMessage]) -> String? {
-        messages.last { message in
-            if let approval = message.approval {
-                // An answer on its way isn't waiting on the user, as a
-                // question's isn't; the voice panels still show its card.
-                return approval.status == .pending || approval.status == .error
-            }
-            if let prompt = message.inputPrompt {
-                // A password, login or code Hermes is waiting for.
-                return prompt.isAnswerable
-            }
-            if let connection = message.connection {
-                // Something to connect Hermes is waiting on.
-                return connection.needsUser
-            }
-            guard let clarify = message.clarify else { return false }
-            return clarify.needsAnswer
-        }?.id
+        messages.last { isWaitingOnUser($0) }?.id
+    }
+
+    /// Shared by selecting the resume card and placing the viewport: a
+    /// card answered since selection must fall back to the saved place.
+    static func isWaitingOnUser(_ message: ChatMessage) -> Bool {
+        if let approval = message.approval {
+            // An answer on its way isn't waiting on the user, as a
+            // question's isn't; the voice panels still show its card.
+            return approval.status == .pending || approval.status == .error
+        }
+        if let prompt = message.inputPrompt {
+            // A password, login or code Hermes is waiting for.
+            return prompt.isAnswerable
+        }
+        if let connection = message.connection {
+            // Something to connect Hermes is waiting on.
+            return connection.needsUser
+        }
+        guard let clarify = message.clarify else { return false }
+        return clarify.needsAnswer
     }
 
     func beginAutomaticWork() -> ChatResumeAutomaticWorkToken {
@@ -149,7 +156,8 @@ final class ChatResumeCoordinator {
         currentSessionID: String?,
         botOwnedSessionIDs: Set<String> = [],
         savedSelectionIsAuthoritative: Bool = true,
-        unlistedSessionIDs: Set<String> = []
+        unlistedSessionIDs: Set<String> = [],
+        owner: UUID? = nil
     ) -> SessionSummary? {
         let savedSessionID = store.lastSessionID(for: profile)
         let selected = ChatResumeSessionResolver.target(
@@ -177,6 +185,7 @@ final class ChatResumeCoordinator {
             ChatScrollSessionKey(profile: profile, sessionID: $0.id)
         }.flatMap { $0.isValid ? $0 : nil }
         pendingFallbackSelection = pendingFallbackSelection && pendingSessionKey != nil
+        pendingOwner = owner
         // Freeze the viewport whenever we have a valid pending session.
         // If target is nil, preserve any existing freeze (e.g. set by
         // freezeViewport before the catalog loaded) rather than unfreezing,
@@ -193,12 +202,14 @@ final class ChatResumeCoordinator {
     func prepareDirectTarget(
         sessionID: String,
         profile: String,
-        purpose: ChatResumeSyncPurpose
+        purpose: ChatResumeSyncPurpose,
+        owner: UUID? = nil
     ) {
         guard purpose == .automaticReturn else { return }
         pendingRestoration = nil
         let key = ChatScrollSessionKey(profile: profile, sessionID: sessionID)
         pendingSessionKey = key.isValid ? key : nil
+        pendingOwner = owner
         pendingFallbackSelection = false
         if pendingSessionKey != nil { viewportIsFrozen = true }
     }
@@ -270,7 +281,15 @@ final class ChatResumeCoordinator {
     /// Clears pending state and unfreezes the viewport so scroll recording
     /// resumes. Does NOT cancel the automatic-work epoch so the reconnect
     /// retry can still proceed.
-    func abandonPendingAutomaticSync() {
+    ///
+    /// `owner` is the failing sync's operation id. A superseded sync that
+    /// fails late retires only what it staged itself: pending state a newer
+    /// sync staged, and the freeze that keeps its restore from recording
+    /// transitional rows, stay (issue 2461).
+    func abandonPendingAutomaticSync(ownedBy owner: UUID? = nil) {
+        // Through its published restoration too, which keeps the freeze
+        // until the scroll place is restored.
+        if pendingSessionKey != nil || pendingRestoration != nil, let pendingOwner, pendingOwner != owner { return }
         pendingSessionKey = nil
         pendingFallbackSelection = false
         viewportIsFrozen = false
@@ -373,6 +392,16 @@ final class ChatResumeCoordinator {
     func clearResumeState() {
         cancelViewportRestoration()
         store.clearResumeState()
+    }
+
+    /// A dashboard switch: each dashboard keeps its own chats to resume.
+    func switchServer(from previous: String, to identity: String) {
+        cancelViewportRestoration()
+        store.switchServer(from: previous, to: identity)
+    }
+
+    func forgetServer(_ identity: String) {
+        store.forgetServer(identity)
     }
 
     func removeSessions(profile: String, sessionIDs: [String]) {

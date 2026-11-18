@@ -63,9 +63,9 @@ enum V2SessionFilter: Equatable, Hashable {
     var title: String {
         switch self {
         case .all: return AppLocalization.string("All")
-        case .starred: return AppLocalization.string("Starred")
+        case .starred: return AppLocalization.string("Starred", table: .chat)
         case .unread: return AppLocalization.string("Unread")
-        case .needsApproval: return AppLocalization.string("Needs approval")
+        case .needsApproval: return AppLocalization.string("Needs approval", table: .chat)
         case .running: return AppLocalization.string("Running")
         case .voice: return AppLocalization.string("Voice")
         case .scheduled: return AppLocalization.string("Scheduled")
@@ -116,21 +116,21 @@ enum V2SessionFilter: Equatable, Hashable {
 
     var emptyTitle: String {
         switch self {
-        case .starred: return AppLocalization.string("No starred chats")
+        case .starred: return AppLocalization.string("No starred chats", table: .chat)
         case .unread: return SessionStatusFilter.unread.emptyTitle
         case .needsApproval: return SessionStatusFilter.needsInput.emptyTitle
         case .running: return SessionStatusFilter.working.emptyTitle
-        default: return AppLocalization.string("No Sessions")
+        default: return AppLocalization.string("No Sessions", table: .chat)
         }
     }
 
     var emptyDescription: String {
         switch self {
-        case .starred: return AppLocalization.string("Swipe a chat or touch and hold it to star it.")
+        case .starred: return AppLocalization.string("Swipe a chat or touch and hold it to star it.", table: .chat)
         case .unread: return SessionStatusFilter.unread.emptyDescription
         case .needsApproval: return SessionStatusFilter.needsInput.emptyDescription
         case .running: return SessionStatusFilter.working.emptyDescription
-        default: return AppLocalization.string("Sessions will appear here once created.")
+        default: return AppLocalization.string("Sessions will appear here once created.", table: .chat)
         }
     }
 }
@@ -275,7 +275,21 @@ struct V2FilterSelection: Equatable {
     }
 }
 
-struct V2ChatsView: View, Equatable {
+/// Mounts the Chats list behind `.equatable()`, equal by AppState
+/// identity: redrawn by its own changes only, while the shell redraws on
+/// every publish. Its own small type with a synthesized `==`, so a new
+/// member of the list doesn't recompile the app
+/// (Conduit/Services/EquatableWrappers.swift).
+struct V2ChatsViewGate: View, Equatable {
+    @IdentityEquatable var appState: AppState
+
+    var body: some View {
+        V2ChatsView(appState: appState)
+    }
+}
+
+/// The Chats list, mounted through V2ChatsViewGate.
+struct V2ChatsView: View {
     @ObservedObject var appLanguage = AppLanguageStore.shared
     /// Followed through `updates`, which holds AppState's changes back
     /// while a chat or a page covers the list or another tab is up.
@@ -364,14 +378,23 @@ struct V2ChatsView: View, Equatable {
     private var hiddenProjects: Set<String> {
         let projects = filterProjects
         guard filtersProjects, !projects.isEmpty else { return [] }
-        let stored = HiddenChatProjects.ids(in: updates.defaults.object(forKey: HiddenChatProjects.key), profile: appState.activeProfile)
+        let stored = HiddenChatProjects.ids(
+            in: updates.defaults.object(forKey: HiddenChatProjects.key),
+            dashboard: AppState.dashboardPreferenceBucket(appState.activeDashboardID),
+            profile: appState.activeProfile
+        )
         guard !stored.isEmpty else { return [] }
         return stored.intersection(Set(projects.map(\.id)).union([HiddenChatProjects.noProject]))
     }
 
     private func setHiddenProjects(_ ids: Set<String>) {
         updates.set(
-            HiddenChatProjects.setting(ids, profile: appState.activeProfile, in: updates.defaults.object(forKey: HiddenChatProjects.key)),
+            HiddenChatProjects.setting(
+                ids,
+                dashboard: AppState.dashboardPreferenceBucket(appState.activeDashboardID),
+                profile: appState.activeProfile,
+                in: updates.defaults.object(forKey: HiddenChatProjects.key)
+            ),
             forKey: HiddenChatProjects.key
         )
     }
@@ -440,13 +463,13 @@ struct V2ChatsView: View, Equatable {
         ]))
     }
 
-    /// Redrawn by its own changes only; the shell redraws on every publish.
-    nonisolated static func == (lhs: V2ChatsView, rhs: V2ChatsView) -> Bool {
-        lhs.appState === rhs.appState
-    }
-
     /// Nothing pushed over the list, on the selected tab.
-    private var isShown: Bool { shell.isTabActive && !shell.isRootCovered }
+    private var isShown: Bool { visibility.isShown }
+
+    /// What shows the list: its tab, and nothing pushed over it.
+    private var visibility: V2ListVisibility {
+        V2ListVisibility(tabActive: shell.isTabActive, covered: shell.isRootCovered, split: shell.isSplit)
+    }
 
     /// No chat covers the list: none is open, or a wide window shows the
     /// list beside it.
@@ -476,11 +499,30 @@ struct V2ChatsView: View, Equatable {
 
     /// What leads a row's list id: nothing outside All, else its profile.
     private func rowScope(_ session: SessionSummary) -> String {
-        appState.isAllProfilesChatsOn ? appState.rowProfile(session) + "\u{1F}" : ""
+        // Another dashboard's row is scoped by its dashboard and its own
+        // profile, so two of its profiles' chats never share an id.
+        guard appState.isAllProfilesChatsOn else { return "" }
+        if let dashboard = session.combinedDashboardID {
+            return dashboard.uuidString + "\u{1F}" + (session.profile ?? "") + "\u{1F}"
+        }
+        return appState.rowProfile(session) + "\u{1F}"
     }
 
     private func profileBadge(for session: SessionSummary) -> V2ProfileBadge? {
         guard badgesRows else { return nil }
+        // Another combined dashboard's row carries its own profile's
+        // picture, as saved for that dashboard, with the dashboard's mark
+        // on it (Eric, 2026-11-16: they all showed the dashboard's badge).
+        if let dashboardID = session.combinedDashboardID {
+            let profile = session.profile ?? "default"
+            return V2ProfileBadge(
+                profile: profile,
+                name: profile,
+                url: appState.combinedDashboardBots[dashboardID]?.avatars[profile]
+                    ?? appState.otherCombinedDashboardProfileAvatar(profile, in: dashboardID),
+                dashboardID: dashboardID
+            )
+        }
         let profile = appState.rowProfile(session)
         return V2ProfileBadge(
             profile: profile,
@@ -496,7 +538,12 @@ struct V2ChatsView: View, Equatable {
             // Pulse's own chat stays behind the Pulse screen, in All too.
             let sessions = appState.chatListSessions
             let chats = appState.pulseHomeChat == nil ? sessions : sessions.filter { !appState.isPulseHomeChat($0) }
-            return (chats, appState.chatListCronSessions)
+            // The other combined dashboards' chats (all-live stage 4b), only
+            // in All: one profile's list holds that profile's chats alone
+            // (Eric, 2026-11-16). Merged in by activity, or grouped by
+            // profile under a section per dashboard of their own.
+            let others = appState.chatListCombinedChats(excluding: Set(chats.map(\.id)))
+            return (others.isEmpty ? chats : V2FilterSelection.mergedByRecency(chats, others), appState.chatListCronSessions)
         }
     }
 
@@ -557,13 +604,16 @@ struct V2ChatsView: View, Equatable {
                 .withAllProfilesChip()
         }
         .safeAreaInset(edge: .bottom, spacing: 0) {
-            MinimisedLiveVoiceBar()
+            V2ListCallBar()
         }
         .environmentObject(updates)
         // The feed's every-minute read, drawn by the tab so hiding the bar's
         // Pulse button doesn't stop it (Sessions bar, #2020).
         .background(PulseFeedReader())
-        .toolbar(.hidden, for: .navigationBar)
+        // Shown and empty, not hidden: a chat pushed over the list finds
+        // its bar already in place (`V2ListNavigationBar`). Hidden on a Mac
+        // (`V2ListNavigationBarPolicy`, issue 2671).
+        .v2ListNavigationBar()
         .navigationTitle(V2Tab.chats.title)
         .background { searchCommand }
         .onChange(of: shell.hasChatBeside, initial: true) { _, beside in
@@ -578,8 +628,9 @@ struct V2ChatsView: View, Equatable {
                 sessionPresentationRaw = "sessions"
             }
         }
-        .onChange(of: isShown, initial: true) { _, shown in
-            updates.isShown = shown
+        .onChange(of: visibility, initial: true) { was, now in
+            let shown = now.isShown
+            updates.follow(now, from: was)
             // Anything over the list (a chat, a page, another tab) puts the
             // keyboard away and keeps the search: SwiftUI otherwise hands
             // focus back to the field on the way back, over the results.
@@ -674,8 +725,8 @@ struct V2ChatsView: View, Equatable {
         }
         .sheet(item: $projectPendingRename) { project in
             RenameSheet(
-                title: AppLocalization.string("Rename project"),
-                placeholder: AppLocalization.string("Project name"),
+                title: AppLocalization.string("Rename project", table: .chat),
+                placeholder: AppLocalization.string("Project name", table: .chat),
                 initialText: project.title,
                 normalize: { SessionRenameOperation.normalizedTitle($0, currentTitle: project.title) }
             ) { name in
@@ -693,7 +744,7 @@ struct V2ChatsView: View, Equatable {
             }
             Button("Cancel", role: .cancel) { projectPendingDeletion = nil }
         } message: {
-            Text(AppLocalization.string("This removes \(projectPendingDeletion?.title ?? "") from Hermes. Its folders, files and conversations are kept."))
+            Text(AppLocalization.string("This removes \(projectPendingDeletion?.title ?? "") from Hermes. Its folders, files and conversations are kept.", table: .chat))
         }
         .alert("Delete conversation?", isPresented: Binding(
             get: { sessionPendingDeletion != nil },
@@ -745,8 +796,8 @@ struct V2ChatsView: View, Equatable {
                 }
                 .buttonStyle(PressableButtonStyle())
                 .disabled(appState.isAllProfilesChatsOn)
-                .accessibilityLabel(showingProjects ? AppLocalization.string("Show sessions") : AppLocalization.string("Browse projects"))
-                .macTooltip(showingProjects ? AppLocalization.string("Show sessions") : AppLocalization.string("Browse projects"))
+                .accessibilityLabel(showingProjects ? AppLocalization.string("Show sessions") : AppLocalization.string("Browse projects", table: .chat))
+                .macTooltip(showingProjects ? AppLocalization.string("Show sessions") : AppLocalization.string("Browse projects", table: .chat))
             }
 
             if sessionsBar.showsPulse {
@@ -801,7 +852,7 @@ struct V2ChatsView: View, Equatable {
         let included = appState.allProfilesIncluded
         let ordered = included.filter { $0 == appState.activeProfile } + included.filter { $0 != appState.activeProfile }
         return Menu {
-            Section(AppLocalization.string("New chat in")) {
+            Section(AppLocalization.string("New chat in", table: .chat)) {
                 ForEach(ordered, id: \.self) { profile in
                     Button {
                         Haptics.medium()
@@ -946,9 +997,13 @@ struct V2ChatsView: View, Equatable {
                 Image(systemName: "line.3.horizontal.decrease")
                     .font(.system(size: 14, weight: .semibold))
                     .conduitFixedGlyph()
+                // On a 375 pt phone a long or combined filter shrinks a
+                // little before it truncates (issue 2654); the menu names
+                // the whole selection.
                 Text(showingProjects ? AppLocalization.string("Projects") : selectionTitles(separator: ", "))
                     .scaledFont(.subheadline.weight(.semibold))
                     .lineLimit(1)
+                    .minimumScaleFactor(0.8)
                 Spacer(minLength: 0)
                 Image(systemName: "chevron.down")
                     .font(.system(size: 11, weight: .semibold))
@@ -989,16 +1044,9 @@ struct V2ChatsView: View, Equatable {
                 }
                 .disabled(!canCreateProject)
             } else {
-                if appState.servesNeedsYou {
-                    // Every profile's waiting chats, beside the filters
-                    // that narrow this list to its own.
-                    Button {
-                        Haptics.selection()
-                        showNeedsYou = true
-                    } label: {
-                        Label(AppLocalization.string("Needs you"), systemImage: "exclamationmark.bubble")
-                    }
-                }
+                // Every profile's waiting chats, beside the filters that
+                // narrow this list to its own.
+                NeedsYouMenuEntry(store: appState.needsYou) { showNeedsYou = true }
                 filterToggle(.all)
                 filterToggle(.starred)
 
@@ -1008,7 +1056,7 @@ struct V2ChatsView: View, Equatable {
                     }
                 }
 
-                Section(AppLocalization.string("Sources")) {
+                Section(AppLocalization.string("Sources", table: .chat)) {
                     ForEach(sourceFilters, id: \.self) { option in
                         filterToggle(option)
                     }
@@ -1029,7 +1077,7 @@ struct V2ChatsView: View, Equatable {
                                 appState.setAllProfilesGroupsByProfile(grouped)
                             }
                         )) {
-                            Label(AppLocalization.string("Group by profile"), systemImage: "rectangle.stack")
+                            Label(AppLocalization.string("Group by profile", table: .chat), systemImage: "rectangle.stack")
                         }
                         .menuActionDismissBehavior(.disabled)
                     }
@@ -1046,7 +1094,7 @@ struct V2ChatsView: View, Equatable {
                         Haptics.selection()
                         showPinnedReplies = true
                     } label: {
-                        Label(AppLocalization.string("Pinned replies"), systemImage: "pin")
+                        Label(AppLocalization.string("Pinned replies", table: .chat), systemImage: "pin")
                     }
                     Button {
                         Haptics.light()
@@ -1063,11 +1111,11 @@ struct V2ChatsView: View, Equatable {
         }
         .menuOrder(.fixed)
         // With Projects showing, the menu only makes projects.
-        .accessibilityLabel(showingProjects ? AppLocalization.string("Projects") : AppLocalization.string("Filter"))
-        .macTooltip(showingProjects ? AppLocalization.string("Projects") : AppLocalization.string("Filter"))
+        .accessibilityLabel(showingProjects ? AppLocalization.string("Projects") : AppLocalization.string("Filter", table: .chat))
+        .macTooltip(showingProjects ? AppLocalization.string("Projects") : AppLocalization.string("Filter", table: .chat))
         .accessibilityValue([
             showingProjects ? nil : spokenSelection,
-            waitingApprovalCount > 0 ? AppLocalization.string("\(waitingApprovalCount) waiting for approval") : nil
+            waitingApprovalCount > 0 ? AppLocalization.string("\(waitingApprovalCount) waiting for approval", table: .chat) : nil
         ].compactMap { $0 }.joined(separator: ", "))
     }
 
@@ -1099,14 +1147,14 @@ struct V2ChatsView: View, Equatable {
                 Haptics.selection()
                 setHiddenProjects([])
             } label: {
-                Label(AppLocalization.string("Show all projects"), systemImage: "eye")
+                Label(AppLocalization.string("Show all projects", table: .chat), systemImage: "eye")
             }
             .disabled(hiddenProjectCount == 0)
 
             Section {
                 projectToggle(
                     HiddenChatProjects.noProject,
-                    title: home ?? AppLocalization.string("Not in a project"),
+                    title: home ?? AppLocalization.string("Not in a project", table: .chat),
                     symbol: home == nil ? "tray" : "house",
                     hidden: hidden
                 )
@@ -1143,8 +1191,13 @@ struct V2ChatsView: View, Equatable {
     /// user's order.
     private var sourceFilters: [V2SessionFilter] {
         let fixed: [V2SessionFilter] = [.voice, .scheduled]
+        let listing = SidebarSourceRows.sourcesWithRows(
+            sessions: listed.sessions,
+            category: category,
+            hasVoiceCalls: hasVoiceCalls
+        )
         let others = appState.sessionFilterOrder.filter { source in
-            source != .voice && source != .cron && !sourceRows(source).isEmpty
+            source != .voice && source != .cron && listing.contains(source)
         }
         return fixed + others.map { V2SessionFilter.source($0) }
     }
@@ -1160,14 +1213,14 @@ struct V2ChatsView: View, Equatable {
         var parts = names
         if hidden.contains(HiddenChatProjects.noProject) {
             if let home = appState.projects.first(where: \.isHome)?.title {
-                parts.append(AppLocalization.string("\(home) hidden"))
+                parts.append(AppLocalization.string("\(home) hidden", table: .chat))
             } else {
-                parts.append(AppLocalization.string("Chats outside projects hidden"))
+                parts.append(AppLocalization.string("Chats outside projects hidden", table: .chat))
             }
         }
         let projectCount = hidden.subtracting([HiddenChatProjects.noProject]).count
         if projectCount > 0 {
-            parts.append(AppLocalization.string("\(projectCount) projects hidden"))
+            parts.append(AppLocalization.string("\(projectCount) projects hidden", table: .chat))
         }
         return parts.joined(separator: separator)
     }
@@ -1312,6 +1365,8 @@ struct V2ChatsView: View, Equatable {
         [session.title, session.model, session.id, session.preview ?? "", category(session).label]
             .contains { $0.localizedCaseInsensitiveContains(query) }
             || projectTitle(for: session)?.localizedCaseInsensitiveContains(query) == true
+            // Another combined dashboard's chats by its name too.
+            || appState.combinedChatBadge(session)?.name.localizedCaseInsensitiveContains(query) == true
     }
 
     private var isSearching: Bool {
@@ -1455,12 +1510,12 @@ struct V2ChatsView: View, Equatable {
                         filteredOutRows: !listed.sessions.isEmpty || !listed.cron.isEmpty
                     ),
                     emptyTitle: hidesEverything
-                        ? AppLocalization.string("No chats to show")
+                        ? AppLocalization.string("No chats to show", table: .chat)
                         : selection.emptyStateFilter.emptyTitle,
                     emptyDescription: hidesEverything
-                        ? AppLocalization.string("The chats here are hidden in Filter > Projects. Tick them again to show them.")
+                        ? AppLocalization.string("The chats here are hidden in Filter > Projects. Tick them again to show them.", table: .chat)
                         : isSearching
-                            ? AppLocalization.string("Try a different search.")
+                            ? AppLocalization.string("Try a different search.", table: .chat)
                             : selection.emptyStateFilter.emptyDescription,
                     retry: { Task { await appState.refreshSessionCatalog() } }
                 )
@@ -1469,9 +1524,14 @@ struct V2ChatsView: View, Equatable {
             }
 
             if layout.liveSections && appState.allProfilesGroupsByProfile {
-                // A section per profile, its pinned chats first.
+                // A section per profile, its pinned chats first; then a
+                // section per other combined dashboard's profile, under its
+                // badge.
                 ForEach(profileGroups(sections), id: \.profile) { group in
                     profileSection(group.profile, nodes: group.items, expanded: expanded)
+                }
+                ForEach(combinedDashboardGroups(sections), id: \.id) { group in
+                    combinedDashboardSection(group.dashboardID, profile: group.profile, nodes: group.items, expanded: expanded)
                 }
             } else {
                 if layout.liveSections && !sections.pinned.isEmpty {
@@ -1505,8 +1565,14 @@ struct V2ChatsView: View, Equatable {
         .v2HoldsUpdatesWhileScrolling(updates)
         .refreshable {
             appState.refreshAllProfilesCatalog()
+            // The other combined dashboards' chats only show in All.
+            let others = Task {
+                guard appState.isAllProfilesChatsOn else { return }
+                await appState.readOtherCombinedDashboardsChats(force: true)
+            }
             await appState.refreshSessionCatalog()
             await appState.allProfilesCatalogTask?.value
+            await others.value
         }
         .onAppear {
             revealActiveNestAncestors()
@@ -1579,11 +1645,95 @@ struct V2ChatsView: View, Equatable {
         _ sections: (pinned: [SessionNesting.Node], recent: [SessionNesting.Node])
     ) -> [(profile: String, items: [SessionNesting.Node])] {
         AllProfilesChats.groups(
-            sections.pinned + sections.recent,
+            // Another combined dashboard's rows have sections of their own.
+            (sections.pinned + sections.recent).filter { $0.session.combinedDashboardID == nil },
             profiles: appState.allProfilesIncluded,
             fallback: appState.activeProfile,
             owner: { appState.rowProfile($0.session) }
         )
+    }
+
+    /// The other combined dashboards' rows, a group per dashboard and
+    /// profile, in Saved Dashboards order and each dashboard's profile
+    /// order, for All's sections by profile.
+    private func combinedDashboardGroups(
+        _ sections: (pinned: [SessionNesting.Node], recent: [SessionNesting.Node])
+    ) -> [(id: String, dashboardID: UUID, profile: String, items: [SessionNesting.Node])] {
+        var byDashboard: [UUID: [SessionNesting.Node]] = [:]
+        for node in sections.pinned + sections.recent {
+            guard let id = appState.combinedChatDashboard(node.session) else { continue }
+            byDashboard[id, default: []].append(node)
+        }
+        guard !byDashboard.isEmpty else { return [] }
+        return appState.savedDashboardRegistry.dashboards.flatMap { dashboard -> [(id: String, dashboardID: UUID, profile: String, items: [SessionNesting.Node])] in
+            guard let nodes = byDashboard[dashboard.id] else { return [] }
+            let order = appState.combinedDashboardChats[dashboard.id]?.profiles ?? []
+            var byProfile: [String: [SessionNesting.Node]] = [:]
+            var seen: [String] = []
+            for node in nodes {
+                let profile = node.session.profile ?? "default"
+                let key = order.first { appState.profilesMatch($0, profile) } ?? profile
+                if byProfile[key] == nil { seen.append(key) }
+                byProfile[key, default: []].append(node)
+            }
+            let profiles = order.filter { byProfile[$0] != nil } + seen.filter { !order.contains($0) }
+            return profiles.map { profile in
+                ("\(dashboard.id.uuidString)\u{1F}\(profile)", dashboard.id, profile, byProfile[profile] ?? [])
+            }
+        }
+    }
+
+    /// One profile of another combined dashboard: its chats under the
+    /// dashboard's badge and name and the profile's: its newest few until "Show more", as a
+    /// profile's section lists them. Never pinned here, so nothing moves.
+    private func combinedDashboardSection(
+        _ dashboardID: UUID,
+        profile: String,
+        nodes: [SessionNesting.Node],
+        expanded: Set<String>
+    ) -> some View {
+        let key = "dashboard\u{1F}" + dashboardID.uuidString + "\u{1F}" + profile
+        return Section {
+            let preview = AllProfilesChats.preview(
+                nodes,
+                showsAll: !sectionsCollapsible,
+                isPinned: { _ in false },
+                isOpen: holdsOpenChat,
+                activity: ChatListSection.latestActivity(in:)
+            )
+            let showsAll = profilesShowingAll.contains(key)
+            listRows(V2ChatsListItem.items(showsAll ? nodes : preview.shown, expanded: expanded, scope: rowScope))
+            if preview.hidden > 0 {
+                profileShowMoreRow(key, hiddenCount: preview.hidden)
+            }
+        } header: {
+            combinedDashboardSectionHeader(dashboardID, profile: profile)
+        }
+    }
+
+    private func combinedDashboardSectionHeader(_ dashboardID: UUID, profile: String) -> some View {
+        let name = appState.combinedDashboardBadge(dashboardID)?.name ?? ""
+        return HStack(spacing: 8) {
+            CombinedDashboardBadge(dashboardID: dashboardID, size: 20)
+            Text(verbatim: name)
+                .lineLimit(1)
+            // Its main profile goes unnamed: the dashboard's name says it.
+            if !profile.isEmpty, profile.lowercased() != "default" {
+                Text(verbatim: profile)
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 6)
+        }
+        .scaledFont(.footnote.weight(.semibold))
+        .foregroundStyle(.secondary)
+        .textCase(nil)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 2)
+        .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+        .listRowInsets(EdgeInsets())
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(.isHeader)
     }
 
     private func isProfileCollapsed(_ profile: String) -> Bool {
@@ -1718,7 +1868,7 @@ struct V2ChatsView: View, Equatable {
         .disabled(!collapsible)
         .listRowInsets(EdgeInsets())
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel(Text(AppLocalization.string("\(name) profile")))
+        .accessibilityLabel(Text(AppLocalization.string("\(name) profile", table: .chat)))
         .accessibilityAddTraits(.isHeader)
         .accessibilityValue(collapsible
             ? (collapsed
@@ -1833,12 +1983,12 @@ struct V2ChatsView: View, Equatable {
     /// "In messages", with a spinner while Hermes is still searching.
     private var contentSearchHeader: some View {
         HStack(spacing: 6) {
-            sectionHeader(AppLocalization.string("In messages"))
+            sectionHeader(AppLocalization.string("In messages", table: .chat))
                 .fixedSize()
             if contentSearch.isSearching {
                 ProgressView()
                     .controlSize(.mini)
-                    .accessibilityLabel(AppLocalization.string("Searching messages"))
+                    .accessibilityLabel(AppLocalization.string("Searching messages", table: .chat))
             }
             Spacer(minLength: 0)
         }
@@ -1907,10 +2057,10 @@ struct V2ChatsView: View, Equatable {
 
     /// "Search Home" names the profile the list belongs to.
     private var searchPrompt: String {
-        if showingProjects { return AppLocalization.string("Search projects") }
-        if appState.isAllProfilesChatsOn { return AppLocalization.string("Search all profiles") }
+        if showingProjects { return AppLocalization.string("Search projects", table: .chat) }
+        if appState.isAllProfilesChatsOn { return AppLocalization.string("Search all profiles", table: .chat) }
         let name = appState.profileDisplayName(appState.activeProfile)
-        return AppLocalization.string("Search \(name)")
+        return AppLocalization.string("Search \(name)", table: .chat)
     }
 
     /// The 40 pt glass search capsule, with the active filters as one
@@ -1960,7 +2110,7 @@ struct V2ChatsView: View, Equatable {
                     .background(Color.conduitAccent, in: Capsule())
                 }
                 .buttonStyle(PressableButtonStyle())
-                .accessibilityLabel(AppLocalization.string("Remove filter \(spokenSelection)"))
+                .accessibilityLabel(AppLocalization.string("Remove filter \(spokenSelection)", table: .chat))
                 .transition(.scale(scale: 0.6, anchor: .leading).combined(with: .opacity))
             }
             TextField(searchPrompt, text: $searchText)
@@ -2073,12 +2223,12 @@ struct V2ChatsView: View, Equatable {
         let count = descendants.count
         let allJobs = !descendants.isEmpty && descendants.allSatisfy { category($0) == .voiceJob }
         var parts = [allJobs
-            ? AppLocalization.string("\(count) jobs")
+            ? AppLocalization.string("\(count) jobs", table: .chat)
             : AppLocalization.string("\(count) sessions")]
         let runningCount = descendants.filter { liveStatus($0) == .working }.count
         if runningCount > 0 { parts.append(AppLocalization.string("\(runningCount) running")) }
         let approvalCount = descendants.filter { liveStatus($0) == .needsInput }.count
-        if approvalCount > 0 { parts.append(AppLocalization.string("\(approvalCount) to approve")) }
+        if approvalCount > 0 { parts.append(AppLocalization.string("\(approvalCount) to approve", table: .chat)) }
         return parts.joined(separator: " · ")
     }
 
@@ -2148,9 +2298,9 @@ struct V2ChatsView: View, Equatable {
                     .listRowSeparator(.hidden)
             } else if displayedProjects.isEmpty && !isSearching && appState.projectsLoadFailed {
                 ContentUnavailableView {
-                    Label(AppLocalization.string("Couldn’t Load Projects"), systemImage: "exclamationmark.triangle")
+                    Label(AppLocalization.string("Couldn’t Load Projects", table: .chat), systemImage: "exclamationmark.triangle")
                 } description: {
-                    Text(AppLocalization.string("Hermes didn’t answer. Pull down or try again."))
+                    Text(AppLocalization.string("Hermes didn’t answer. Pull down or try again.", table: .chat))
                 } actions: {
                     Button(AppLocalization.string("Try Again")) {
                         Task { await appState.refreshProjects() }
@@ -2160,12 +2310,12 @@ struct V2ChatsView: View, Equatable {
                 .listRowSeparator(.hidden)
             } else if displayedProjects.isEmpty && !(isSearching && !pinned.isEmpty) {
                 ContentUnavailableView {
-                    Label(isSearching ? AppLocalization.string("No Matching Projects") : AppLocalization.string("No Projects"),
+                    Label(isSearching ? AppLocalization.string("No Matching Projects", table: .chat) : AppLocalization.string("No Projects", table: .chat),
                           systemImage: "folder")
                 } description: {
                     Text(!isSearching
-                        ? AppLocalization.string("Projects you make here or in Hermes Desktop show here.")
-                        : AppLocalization.string("Try a different search."))
+                        ? AppLocalization.string("Projects you make here or in Hermes Desktop show here.", table: .chat)
+                        : AppLocalization.string("Try a different search.", table: .chat))
                 } actions: {
                     if !isSearching {
                         Button(AppLocalization.string("New Project")) {
@@ -2226,8 +2376,8 @@ struct V2ChatsView: View, Equatable {
             V2ProjectRow(project: project, runningCount: runningCount(project), isUnread: isUnread)
         }
         .accessibilityHint(appState.isProjectEditable(project)
-            ? AppLocalization.string("Opens the conversations in this project. Swipe or touch and hold to rename or delete it.")
-            : AppLocalization.string("Opens the conversations in this project."))
+            ? AppLocalization.string("Opens the conversations in this project. Swipe or touch and hold to rename or delete it.", table: .chat)
+            : AppLocalization.string("Opens the conversations in this project.", table: .chat))
         .contextMenu {
             if appState.isProjectEditable(project) {
                 projectActions(project)
@@ -2291,8 +2441,8 @@ struct V2ChatsView: View, Equatable {
 /// number of rows (the row, its "3 jobs" line, its open children), so on
 /// every redraw the List built every row of the list just to count them.
 /// With one List row per item it builds only the rows on screen.
-struct V2ChatsListItem: Identifiable {
-    enum Kind {
+struct V2ChatsListItem: Identifiable, Equatable {
+    enum Kind: Equatable {
         /// A conversation at the top of its nest, or on its own.
         case session(SessionNesting.Node)
         /// The "3 jobs · 1 running" line under a parent: its expander.
@@ -2353,15 +2503,12 @@ struct V2ChatsListItem: Identifiable {
     }
 }
 
-/// One Chats list row. It works out its own dot, status and preview, so
-/// only the rows on screen do.
-private struct V2ChatsRow: View {
-    /// The list's updates (`V2ShownUpdates`): a row under a pushed chat
-    /// waits with the list.
+/// A Chats list row: its list traits (clear background, hidden separator,
+/// insets, its own hairline) and its swipe and menu actions, around the
+/// row's content, which compares on what it shows (`V2ChatsRowContent`).
+struct V2ChatsRow: View {
     @EnvironmentObject private var updates: V2ShownUpdates
     private var appState: AppState { updates.appState }
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @Environment(\.v2OpenBeside) private var openBeside
     let item: V2ChatsListItem
     /// The project a listed project chat sits in, named before its preview.
     let projectTitle: String?
@@ -2374,25 +2521,117 @@ private struct V2ChatsRow: View {
     /// Opens or closes the nest with this key.
     let setExpanded: (String, Bool) -> Void
 
+    init(
+        item: V2ChatsListItem,
+        projectTitle: String?,
+        profileBadge: @escaping (SessionSummary) -> V2ProfileBadge?,
+        onRename: @escaping (SessionSummary) -> Void,
+        onDelete: @escaping (SessionSummary) -> Void,
+        onReorderPinned: @escaping (SessionSummary) -> Void,
+        setExpanded: @escaping (String, Bool) -> Void
+    ) {
+        self.item = item
+        self.projectTitle = projectTitle
+        self.profileBadge = profileBadge
+        self.onRename = onRename
+        self.onDelete = onDelete
+        self.onReorderPinned = onReorderPinned
+        self.setExpanded = setExpanded
+    }
+
+    /// The list re-runs its body as a chat is pushed over it or popped off
+    /// it (the shell's covered flag), with new closures each time. Drawn as
+    /// the pop's finger lifted, every row's content held its first frame
+    /// (iPhone 16 Pro Max, 2026-11-15), so the content sits behind
+    /// `.equatable()`. The list traits and actions stay out here, on the
+    /// row itself: inside an `EquatableView` they never reached the List,
+    /// and the rows drew black with system insets.
     var body: some View {
+        let content = V2ChatsRowContent(item: item, projectTitle: projectTitle, profileBadge: profileBadge, setExpanded: setExpanded)
+            .equatable()
         switch item.kind {
         case .session(let node):
-            sessionRow(node)
-        case .nest(let node, let key, let isExpanded):
-            nestDisclosure(node, key: key, isExpanded: isExpanded)
+            let session = node.session
+            content
+                .v2ListRow(divider: node.children.isEmpty, dividerInset: V2SessionRow.iconTextInset)
+                .sessionActions(
+                    appState: appState,
+                    session: session,
+                    // Worked out when an action shows, not on every re-run
+                    // of the list (2 ms a pop at finger lift).
+                    nest: SessionNesting.readToggleInputs(
+                        for: node,
+                        aggregateIsUnread: SessionNesting.signals(
+                            node,
+                            isUnread: appState.isSessionUnread,
+                            liveStatus: appState.sessionLiveStatus
+                        ).isUnread
+                    ),
+                    // Another combined dashboard's row only opens: its
+                    // actions would act on this dashboard's chats.
+                    isSavedRow: appState.isSavedChatRow(session) || session.combinedDashboardID != nil,
+                    onRename: { onRename(session) },
+                    onDelete: { onDelete(session) },
+                    onReorderPinned: { onReorderPinned(session) }
+                )
+        case .nest(_, _, let isExpanded):
+            content
                 .v2ListRow(divider: !isExpanded, dividerInset: V2SessionRow.iconTextInset)
-        case .child(let session, let depth, let parentTitle, let isLast):
-            childRow(session, depth: depth, parentTitle: parentTitle)
+        case .child(let session, _, _, let isLast):
+            content
                 .v2ListRow(divider: isLast, dividerInset: V2SessionRow.iconTextInset)
                 .sessionActions(
                     appState: appState,
                     session: session,
                     nest: nil,
-                    isSavedRow: appState.isSavedChatRow(session),
+                    isSavedRow: appState.isSavedChatRow(session) || session.combinedDashboardID != nil,
                     onRename: { onRename(session) },
                     onDelete: { onDelete(session) }
                 )
                 .transition(.opacity.combined(with: .move(edge: .top)))
+        }
+    }
+}
+
+/// What a Chats row shows. Compared on its item and project title, it
+/// redraws for those or a draw of the list's updates, which it observes
+/// itself, never because the list re-ran. The closures write the list's
+/// own state, the same storage whichever render made them.
+struct V2ChatsRowContent: View, Equatable {
+    @EnvironmentObject private var updates: V2ShownUpdates
+    private var appState: AppState { updates.appState }
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.v2OpenBeside) private var openBeside
+    let item: V2ChatsListItem
+    let projectTitle: String?
+    let profileBadge: (SessionSummary) -> V2ProfileBadge?
+    let setExpanded: (String, Bool) -> Void
+
+    init(
+        item: V2ChatsListItem,
+        projectTitle: String?,
+        profileBadge: @escaping (SessionSummary) -> V2ProfileBadge?,
+        setExpanded: @escaping (String, Bool) -> Void
+    ) {
+        self.item = item
+        self.projectTitle = projectTitle
+        self.profileBadge = profileBadge
+        self.setExpanded = setExpanded
+    }
+
+    nonisolated static func == (lhs: V2ChatsRowContent, rhs: V2ChatsRowContent) -> Bool {
+        lhs.item == rhs.item && lhs.projectTitle == rhs.projectTitle
+    }
+
+    var body: some View {
+        let _ = TranscriptPerf.note(.chatsListRowBody)
+        switch item.kind {
+        case .session(let node):
+            sessionRow(node)
+        case .nest(let node, let key, let isExpanded):
+            nestDisclosure(node, key: key, isExpanded: isExpanded)
+        case .child(let session, let depth, let parentTitle, _):
+            childRow(session, depth: depth, parentTitle: parentTitle)
         }
     }
 
@@ -2422,25 +2661,18 @@ private struct V2ChatsRow: View {
                 selection: selection(session),
                 icon: appState.sessionCategory(for: session),
                 hasNestBelow: hasChildren,
-                profileBadge: profileBadge(session)
+                profileBadge: profileBadge(session),
+                dashboardBadge: appState.combinedChatBadge(session)
             )
         }
         .buttonStyle(.plain)
         // Its saved copy comes into memory as it shows, so a tap opens on it
         // without a read on the main thread.
         .onAppear { appState.warmSavedCopy(of: session) }
-        .accessibilityHint(AppLocalization.string("Swipe or touch and hold for conversation actions."))
+        .accessibilityHint(session.combinedDashboardID == nil
+            ? AppLocalization.string("Swipe or touch and hold for conversation actions.")
+            : AppLocalization.string("Switches to that dashboard and opens the chat", table: .chat))
         .v2SelectedTrait(selection(session))
-        .v2ListRow(divider: !hasChildren, dividerInset: V2SessionRow.iconTextInset)
-        .sessionActions(
-            appState: appState,
-            session: session,
-            nest: SessionNesting.readToggleInputs(for: node, aggregateIsUnread: signals.isUnread),
-            isSavedRow: appState.isSavedChatRow(session),
-            onRename: { onRename(session) },
-            onDelete: { onDelete(session) },
-            onReorderPinned: { onReorderPinned(session) }
-        )
     }
 
     /// The parent's summary of what sits under it, and its expander.
@@ -2485,6 +2717,9 @@ private struct V2ChatsRow: View {
         let isUnread = appState.isSessionUnread(session)
         let isStarred = appState.isSessionStarred(session)
         let rowSelection = selection(session, faintAlone: false)
+        // Another combined dashboard's chat nested under its parent: badged,
+        // and it only opens, as its own row does.
+        let dashboardBadge = appState.combinedChatBadge(session)
         return Button {
             Haptics.light()
             appState.dismissSidebarDrawer()
@@ -2497,6 +2732,10 @@ private struct V2ChatsRow: View {
                     .padding(.leading, 34 + CGFloat(min(depth, 3)) * 14)
                     .padding(.trailing, 6)
                 V2StatusGlyph(status: status == .none ? .source(appState.sessionCategory(for: session)) : status)
+                if let dashboardBadge {
+                    CombinedDashboardBadge.Mark(badge: dashboardBadge, size: 14)
+                        .accessibilityHidden(true)
+                }
                 Text(session.title)
                     .scaledFont(.subheadline.weight(isUnread ? .semibold : .regular))
                     .foregroundStyle(.primary)
@@ -2525,12 +2764,15 @@ private struct V2ChatsRow: View {
         .accessibilityLabel(Text(session.title))
         .accessibilityValue(Text([
             AppLocalization.string("From \(parentTitle)"),
+            dashboardBadge?.name,
             isUnread ? AppLocalization.string("Unread") : nil,
-            isStarred ? AppLocalization.string("Starred") : nil,
+            isStarred ? AppLocalization.string("Starred", table: .chat) : nil,
             status.accessibilityWord,
             session.updatedLabel
         ].compactMap { $0 }.joined(separator: ", ")))
-        .accessibilityHint(AppLocalization.string("Swipe or touch and hold for conversation actions."))
+        .accessibilityHint(dashboardBadge == nil
+            ? AppLocalization.string("Swipe or touch and hold for conversation actions.")
+            : AppLocalization.string("Switches to that dashboard and opens the chat", table: .chat))
         .accessibilityAddTraits(.isButton)
         .v2SelectedTrait(rowSelection)
     }
@@ -2558,7 +2800,7 @@ extension View {
     func sessionActions(
         appState: AppState,
         session: SessionSummary,
-        nest: NestReadToggle?,
+        nest: @autoclosure @escaping () -> NestReadToggle?,
         excludingProjectID: String? = nil,
         isSavedRow: Bool = false,
         onRename: @escaping () -> Void,
@@ -2580,24 +2822,44 @@ extension View {
     }
 }
 
+/// The row's actions. Its body runs with every row each time the list
+/// re-runs (a chat pushed or popped over it), so it only places the
+/// menu and the swipes: what they say (Pin or Unpin, the localized
+/// labels, the nest's read state) is worked out in their own views,
+/// which draw when the menu or a swipe shows (6 ms a pop at finger lift
+/// on an iPhone 16 Pro Max, 2026-11-15).
 private struct V2SessionActions: ViewModifier {
     /// Not followed here: the row redraws its actions, so a Chats row
     /// under a pushed chat waits with its list.
     let appState: AppState
     let session: SessionSummary
-    let nest: NestReadToggle?
+    let nest: () -> NestReadToggle?
     let excludingProjectID: String?
     let isSavedRow: Bool
     let onRename: () -> Void
     let onDelete: () -> Void
     let onChanged: () -> Void
     let onReorderPinned: (() -> Void)?
+    @Environment(\.v2OpenBeside) private var openBeside
+    @Environment(\.v2BesideChatFits) private var besideChatFits
 
     func body(content: Content) -> some View {
         content
             .contextMenu {
+                // Beside a chat in a window with the room: this one opens
+                // and that one stays in a pane beside it (all-live stage 2).
+                // Another profile's row in All opens with a switch, which
+                // closes the pane: not offered there.
+                if !isSavedRow, besideChatFits, openBeside == .chat, !appState.isOtherProfileRow(session) {
+                    Button {
+                        Haptics.selection()
+                        appState.openBeside(session)
+                    } label: {
+                        Label(AppLocalization.string("Open Beside", table: .chat), systemImage: "rectangle.split.2x1")
+                    }
+                }
                 if !isSavedRow {
-                    SessionActionMenuItems(
+                    V2SessionMenuItems(
                         session: session,
                         excludingProjectID: excludingProjectID,
                         nest: nest,
@@ -2610,58 +2872,107 @@ private struct V2SessionActions: ViewModifier {
             }
             .swipeActions(edge: .leading, allowsFullSwipe: false) {
                 if !isSavedRow {
-                    Button {
-                        Haptics.light()
-                        appState.toggleSessionPinned(session)
-                    } label: {
-                        Label(
-                            appState.isSessionPinned(session) ? AppLocalization.string("Unpin") : AppLocalization.string("Pin"),
-                            systemImage: appState.isSessionPinned(session) ? "pin.slash" : "pin"
-                        )
-                    }
-                    .tint(.conduitAccent)
-
-                    Button {
-                        Haptics.light()
-                        appState.toggleSessionStarred(session)
-                    } label: {
-                        Label(
-                            appState.isSessionStarred(session) ? AppLocalization.string("Unstar") : AppLocalization.string("Star"),
-                            systemImage: appState.isSessionStarred(session) ? "star.slash" : "star"
-                        )
-                    }
-                    .tint(.yellow)
-
-                    ReadStateToggleButton(session: session, nest: nest)
-                        .tint(.blue)
+                    V2SessionLeadingSwipes(appState: appState, session: session, nest: nest)
                 }
             }
             .swipeActions(edge: .trailing, allowsFullSwipe: false) {
                 if !isSavedRow {
-                    Button {
-                        Task {
-                            let archived = await appState.archiveSession(session)
-                            Haptics.mutationCompleted(archived)
-                            if archived { onChanged() }
-                        }
-                    } label: {
-                        Label("Archive", systemImage: "archivebox")
-                    }
-                    .tint(.orange)
-                    .disabled(appState.isSessionMutationInFlight(session))
-
-                    // Not a destructive role: that removes the row before the
-                    // confirmation is answered, and on a Mac it can blank the list (#1364).
-                    Button {
-                        Haptics.warning()
-                        onDelete()
-                    } label: {
-                        Label("Delete", systemImage: "trash")
-                    }
-                    .tint(.red)
-                    .disabled(appState.isSessionMutationInFlight(session))
+                    V2SessionTrailingSwipes(appState: appState, session: session, onDelete: onDelete, onChanged: onChanged)
                 }
             }
+    }
+}
+
+/// The row's touch-and-hold menu, read when it opens.
+private struct V2SessionMenuItems: View {
+    let session: SessionSummary
+    let excludingProjectID: String?
+    let nest: () -> NestReadToggle?
+    let onRename: () -> Void
+    let onDelete: () -> Void
+    let onChanged: () -> Void
+    let onReorderPinned: (() -> Void)?
+
+    var body: some View {
+        SessionActionMenuItems(
+            session: session,
+            excludingProjectID: excludingProjectID,
+            nest: nest(),
+            onRename: onRename,
+            onDelete: onDelete,
+            onChanged: onChanged,
+            onReorderPinned: onReorderPinned
+        )
+    }
+}
+
+/// Swiping right: Pin, Star, and the read toggle.
+private struct V2SessionLeadingSwipes: View {
+    let appState: AppState
+    let session: SessionSummary
+    let nest: () -> NestReadToggle?
+
+    var body: some View {
+        let pinned = appState.isSessionPinned(session)
+        let starred = appState.isSessionStarred(session)
+        Button {
+            Haptics.light()
+            appState.toggleSessionPinned(session)
+        } label: {
+            Label(
+                pinned ? AppLocalization.string("Unpin") : AppLocalization.string("Pin"),
+                systemImage: pinned ? "pin.slash" : "pin"
+            )
+        }
+        .tint(.conduitAccent)
+
+        Button {
+            Haptics.light()
+            appState.toggleSessionStarred(session)
+        } label: {
+            Label(
+                starred ? AppLocalization.string("Unstar", table: .chat) : AppLocalization.string("Star", table: .chat),
+                systemImage: starred ? "star.slash" : "star"
+            )
+        }
+        .tint(.yellow)
+
+        ReadStateToggleButton(session: session, nest: nest())
+            .tint(.blue)
+    }
+}
+
+/// Swiping left: Archive and Delete.
+private struct V2SessionTrailingSwipes: View {
+    let appState: AppState
+    let session: SessionSummary
+    let onDelete: () -> Void
+    let onChanged: () -> Void
+
+    var body: some View {
+        let busy = appState.isSessionMutationInFlight(session)
+        Button {
+            Task {
+                let archived = await appState.archiveSession(session)
+                Haptics.mutationCompleted(archived)
+                if archived { onChanged() }
+            }
+        } label: {
+            Label("Archive", systemImage: "archivebox")
+        }
+        .tint(.orange)
+        .disabled(busy)
+
+        // Not a destructive role: that removes the row before the
+        // confirmation is answered, and on a Mac it can blank the list (#1364).
+        Button {
+            Haptics.warning()
+            onDelete()
+        } label: {
+            Label("Delete", systemImage: "trash")
+        }
+        .tint(.red)
+        .disabled(busy)
     }
 }
 

@@ -732,6 +732,338 @@ extension NotificationE2ETests {
         XCTAssertEqual(controller.unsentSpotEntryCount, 0, "Nothing left: a second forget changes nothing")
     }
 
+    /// Sign Out of the bound dashboard drops what wasn't sent yet, so the
+    /// next sign-in there doesn't send it under another account; another
+    /// dashboard's Sign Out keeps it (issue 2482).
+    @MainActor
+    func testSignOutOfTheBoundDashboardDropsWhatWasntSent() {
+        var unsent = LocationUnsent()
+        unsent.keep(fix: LocationFixtures.fix(latitude: 51.5, longitude: -0.1), events: [
+            LocationPlaceEvent(id: "e_1", kind: .arrive, placeID: "p_home", at: LocationFixtures.at, isPrivate: false),
+        ])
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent("location-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let engine = LocationSyncEngine(store: LocationSyncStateStore(url: folder.appendingPathComponent("state.json")),
+                                        keys: LocationKeyStore.memory())
+        let controller = LocationSharingController(engine: engine, config: LocationFixtures.config(background: true),
+                                                   unsent: unsent, dropMarker: .memory())
+        XCTAssertTrue(controller.hasUnsent)
+
+        controller.dropUnsent(boundTo: UUID())
+        XCTAssertTrue(controller.hasUnsent, "Another dashboard's Sign Out keeps the queue")
+
+        XCTAssertTrue(controller.spotRepliesLand)
+        controller.dropUnsent(boundTo: LocationFixtures.dashboardID)
+        XCTAssertFalse(controller.hasUnsent)
+        XCTAssertEqual(controller.binding?.dashboardID, LocationFixtures.dashboardID, "Sharing stays bound")
+        XCTAssertFalse(controller.spotRepliesLand, "a reply to a batch sent before it lists no shops (issue 2616)")
+    }
+
+    /// Sign Out while the config can't be read still drops what wasn't
+    /// sent, unless the host pass names another dashboard (issue 2591).
+    @MainActor
+    func testSignOutWhileTheConfigCantBeReadStillDropsWhatWasntSent() {
+        var folders: [URL] = []
+        defer { folders.forEach { try? FileManager.default.removeItem(at: $0) } }
+        func controller(passFor dashboard: UUID?) -> LocationSharingController {
+            var unsent = LocationUnsent()
+            unsent.keep(fix: LocationFixtures.fix(latitude: 51.5, longitude: -0.1), events: [
+                LocationPlaceEvent(id: "e_1", kind: .arrive, placeID: "p_home", at: LocationFixtures.at, isPrivate: false),
+            ])
+            let folder = FileManager.default.temporaryDirectory.appendingPathComponent("location-\(UUID().uuidString)", isDirectory: true)
+            folders.append(folder)
+            let engine = LocationSyncEngine(store: LocationSyncStateStore(url: folder.appendingPathComponent("state.json")),
+                                            keys: LocationKeyStore.memory())
+            let controller = LocationSharingController(engine: engine, unsent: unsent, readStoredConfig: { .unreadable },
+                                                       dropMarker: .memory())
+            controller.hostPassDashboardID = { dashboard }
+            XCTAssertTrue(controller.configUnreadable)
+            XCTAssertTrue(controller.hasUnsent)
+            return controller
+        }
+
+        let noPass = controller(passFor: nil)
+        noPass.dropUnsent(boundTo: LocationFixtures.dashboardID)
+        XCTAssertFalse(noPass.hasUnsent, "With nothing naming the binding, the queue goes")
+
+        let ownPass = controller(passFor: LocationFixtures.dashboardID)
+        ownPass.dropUnsent(boundTo: LocationFixtures.dashboardID)
+        XCTAssertFalse(ownPass.hasUnsent, "The host pass names the dashboard signed out of")
+
+        let otherPass = controller(passFor: UUID())
+        otherPass.dropUnsent(boundTo: LocationFixtures.dashboardID)
+        XCTAssertTrue(otherPass.hasUnsent, "Sharing is bound to another dashboard: its queue stays")
+    }
+
+    /// A host pass read during a connect is kept only while nothing signed
+    /// the dashboard out or moved the binding (issue 2562).
+    @MainActor
+    func testAHostPassReadDuringASignOutIsntKept() {
+        let dashboard = UUID()
+        let pass = LocationHostPass(dashboardID: dashboard, baseURL: "https://one.example", headers: [:], expiresAt: nil, savedAt: Date())
+        XCTAssertTrue(AppState.keepsReadHostPass(pass, readAtGeneration: 3, generationNow: 3, boundDashboardID: dashboard))
+        XCTAssertFalse(AppState.keepsReadHostPass(pass, readAtGeneration: 3, generationNow: 4, boundDashboardID: dashboard),
+                       "Signed out while the cookies were read")
+        XCTAssertFalse(AppState.keepsReadHostPass(pass, readAtGeneration: 3, generationNow: 3, boundDashboardID: nil),
+                       "Unbound while it was read")
+        XCTAssertFalse(AppState.keepsReadHostPass(pass, readAtGeneration: 3, generationNow: 3, boundDashboardID: UUID()),
+                       "Bound to another dashboard meanwhile")
+    }
+
+    /// #2606's review: launched before the config and the queue's file
+    /// could be read, memory holds no queue while the file still does. A
+    /// Sign Out then must keep the file's copy from coming back once the
+    /// config reads; what was recorded since stays.
+    @MainActor
+    func testAQueueDroppedWhileUnreadableIsntReadBackFromItsFile() {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent("location-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let engine = LocationSyncEngine(store: LocationSyncStateStore(url: folder.appendingPathComponent("state.json")),
+                                        keys: LocationKeyStore.memory())
+        var onDisk = LocationUnsent()
+        onDisk.keep(fix: LocationFixtures.fix(latitude: 51.5, longitude: -0.1), events: [
+            LocationPlaceEvent(id: "e_old", kind: .arrive, placeID: "p_home", at: LocationFixtures.at, isPrivate: false),
+        ])
+        var configReadable = false
+        var fileReadable = false
+        var fileWritable = false
+        var written: [LocationUnsent] = []
+        let controller = LocationSharingController(
+            engine: engine,
+            readStoredConfig: { configReadable ? .value(LocationFixtures.config(background: true)) : .unreadable },
+            readStoredUnsent: { fileReadable ? onDisk : LocationUnsent() },
+            writeStoredUnsent: { queue in
+                guard fileWritable else { return false }
+                written.append(queue)
+                return true
+            },
+            dropMarker: .memory()
+        )
+        controller.hostPassDashboardID = { nil }
+        // Without a drop, the file's queue is read once it can be.
+        let kept = LocationSharingController(
+            engine: engine,
+            readStoredConfig: { configReadable ? .value(LocationFixtures.config(background: true)) : .unreadable },
+            readStoredUnsent: { fileReadable ? onDisk : LocationUnsent() },
+            writeStoredUnsent: { _ in true },
+            dropMarker: .memory()
+        )
+        XCTAssertFalse(controller.hasUnsent, "Nothing could be read at launch")
+
+        controller.dropUnsent(boundTo: LocationFixtures.dashboardID)
+        XCTAssertTrue(controller.unsentDroppedWhileUnreadable, "The drop's write failed: the file still holds the queue")
+        configReadable = true
+        fileReadable = true
+        XCTAssertTrue(controller.readConfigIfNeeded())
+        XCTAssertFalse(controller.hasUnsent, "The dropped queue's file copy isn't read back")
+        XCTAssertTrue(controller.unsentDroppedWhileUnreadable, "The write over it failed again: it's tried later")
+        XCTAssertTrue(written.isEmpty)
+
+        fileWritable = true
+        controller.retryDroppedUnsentSave()
+        XCTAssertFalse(controller.unsentDroppedWhileUnreadable)
+        XCTAssertEqual(written.count, 1)
+        XCTAssertTrue(written.last?.isEmpty == true, "The file is written over with the empty queue")
+
+        XCTAssertTrue(kept.readConfigIfNeeded())
+        XCTAssertTrue(kept.hasUnsent, "With no Sign Out meanwhile, the file's queue is read as before")
+    }
+
+    @MainActor
+    func testADroppedQueueIsWrittenOverWhenTheConfigTurnsOutMissing() {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent("location-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let engine = LocationSyncEngine(store: LocationSyncStateStore(url: folder.appendingPathComponent("state.json")),
+                                        keys: LocationKeyStore.memory())
+        var configMissing = false
+        var fileWritable = false
+        var written: [LocationUnsent] = []
+        let controller = LocationSharingController(
+            engine: engine,
+            readStoredConfig: { configMissing ? .missing : .unreadable },
+            readStoredUnsent: { LocationUnsent() },
+            writeStoredUnsent: { queue in
+                guard fileWritable else { return false }
+                written.append(queue)
+                return true
+            },
+            dropMarker: .memory()
+        )
+        controller.hostPassDashboardID = { nil }
+        controller.dropUnsent(boundTo: LocationFixtures.dashboardID)
+        XCTAssertTrue(controller.unsentDroppedWhileUnreadable)
+
+        configMissing = true
+        fileWritable = true
+        XCTAssertTrue(controller.readConfigIfNeeded())
+        XCTAssertFalse(controller.unsentDroppedWhileUnreadable)
+        XCTAssertEqual(written.count, 1, "The dropped queue's file is written over even with no config")
+    }
+
+    /// #2612's review: a Sign Out's drop whose write fails while the config
+    /// reads (a full disk) is tried again too, and a relaunch before it
+    /// lands doesn't read the dropped queue back from its file.
+    @MainActor
+    func testADroppedQueuesFailedWriteSurvivesARelaunch() {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent("location-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let engine = LocationSyncEngine(store: LocationSyncStateStore(url: folder.appendingPathComponent("state.json")),
+                                        keys: LocationKeyStore.memory())
+        var onDisk = LocationUnsent()
+        onDisk.keep(fix: LocationFixtures.fix(latitude: 51.5, longitude: -0.1), events: [
+            LocationPlaceEvent(id: "e_old", kind: .arrive, placeID: "p_home", at: LocationFixtures.at, isPrivate: false),
+        ])
+        var fileWritable = false
+        var written: [LocationUnsent] = []
+        let marker = LocationDropMarker.Box()
+        func launch() -> LocationSharingController {
+            LocationSharingController(
+                engine: engine,
+                readStoredConfig: { .value(LocationFixtures.config(background: true)) },
+                readStoredUnsent: { onDisk },
+                writeStoredUnsent: { queue in
+                    guard fileWritable else { return false }
+                    written.append(queue)
+                    onDisk = queue
+                    return true
+                },
+                dropMarker: .memory(marker)
+            )
+        }
+        let controller = launch()
+        XCTAssertTrue(controller.hasUnsent, "The config reads, so the file's queue is read at launch")
+
+        controller.dropUnsent(boundTo: LocationFixtures.dashboardID)
+        XCTAssertFalse(controller.hasUnsent)
+        XCTAssertTrue(controller.unsentDroppedWhileUnreadable, "The write failed with the config readable: it's tried again")
+        XCTAssertTrue(marker.isSet, "…and remembered outside the queue's file")
+
+        let relaunched = launch()
+        XCTAssertFalse(relaunched.hasUnsent, "A relaunch before the write lands doesn't read the dropped queue back")
+        XCTAssertTrue(relaunched.unsentDroppedWhileUnreadable)
+
+        fileWritable = true
+        relaunched.retryDroppedUnsentSave()
+        XCTAssertFalse(relaunched.unsentDroppedWhileUnreadable)
+        XCTAssertFalse(marker.isSet, "Written over: nothing dropped is left to remember")
+        XCTAssertEqual(written.last?.isEmpty, true)
+        XCTAssertFalse(launch().hasUnsent, "The next launch reads the empty file as usual")
+    }
+
+    /// #2613's review: a drop note the Keychain can't be read for at launch
+    /// (before the first unlock) still counts once the config reads, and a
+    /// clear the Keychain refused is tried again at the next save.
+    @MainActor
+    func testADropNoteUnreadableAtLaunchStillKeepsTheQueueDropped() {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent("location-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let engine = LocationSyncEngine(store: LocationSyncStateStore(url: folder.appendingPathComponent("state.json")),
+                                        keys: LocationKeyStore.memory())
+        var onDisk = LocationUnsent()
+        onDisk.keep(fix: LocationFixtures.fix(latitude: 51.5, longitude: -0.1), events: [
+            LocationPlaceEvent(id: "e_old", kind: .arrive, placeID: "p_home", at: LocationFixtures.at, isPrivate: false),
+        ])
+        var unlocked = false
+        var written: [LocationUnsent] = []
+        let note = LocationDropMarker.Box(true)
+        let marker = LocationDropMarker(isSet: { unlocked && note.isSet }, set: LocationDropMarker.memory(note).set)
+        let controller = LocationSharingController(
+            engine: engine,
+            readStoredConfig: { unlocked ? .value(LocationFixtures.config(background: true)) : .unreadable },
+            readStoredUnsent: { unlocked ? onDisk : LocationUnsent() },
+            writeStoredUnsent: { queue in
+                written.append(queue)
+                onDisk = queue
+                return true
+            },
+            dropMarker: marker
+        )
+        controller.hostPassDashboardID = { nil }
+        XCTAssertFalse(controller.unsentDroppedWhileUnreadable, "Nothing could be read before the first unlock")
+
+        unlocked = true
+        note.writable = false
+        XCTAssertTrue(controller.readConfigIfNeeded())
+        XCTAssertFalse(controller.hasUnsent, "The dropped queue isn't read back once the note can be read")
+        XCTAssertEqual(written.last?.isEmpty, true, "…and the file is written over")
+        XCTAssertFalse(controller.unsentDroppedWhileUnreadable)
+        XCTAssertTrue(note.isSet, "The Keychain refused the clear")
+
+        note.writable = true
+        controller.dropUnsent(boundTo: LocationFixtures.dashboardID)
+        XCTAssertFalse(note.isSet, "The next save that lands clears the note")
+    }
+
+    /// Issue 2619 (#2618's review leftovers): the note is read after the
+    /// queue, so a first unlock between the two doesn't read the dropped
+    /// queue back; a note unreadable at launch counts when the config turns
+    /// out missing too; a note the Keychain refused is tried again.
+    @MainActor
+    func testTheDropNoteIsReadAfterTheQueueCountsWithNoConfigAndIsTriedAgain() {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent("location-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let engine = LocationSyncEngine(store: LocationSyncStateStore(url: folder.appendingPathComponent("state.json")),
+                                        keys: LocationKeyStore.memory())
+        var onDisk = LocationUnsent()
+        onDisk.keep(fix: LocationFixtures.fix(latitude: 51.5, longitude: -0.1), events: [
+            LocationPlaceEvent(id: "e_old", kind: .arrive, placeID: "p_home", at: LocationFixtures.at, isPrivate: false),
+        ])
+        var unlocked = false
+        let note = LocationDropMarker.Box(true)
+        let marker = LocationDropMarker(isSet: { unlocked && note.isSet }, set: LocationDropMarker.memory(note).set)
+        let unlockedMidLaunch = LocationSharingController(
+            engine: engine,
+            readStoredConfig: { .value(LocationFixtures.config(background: true)) },
+            readStoredUnsent: {
+                unlocked = true
+                return onDisk
+            },
+            writeStoredUnsent: { _ in false },
+            dropMarker: marker
+        )
+        XCTAssertFalse(unlockedMidLaunch.hasUnsent, "unlocked between the reads: the dropped queue isn't kept")
+        XCTAssertTrue(unlockedMidLaunch.unsentDroppedWhileUnreadable)
+
+        unlocked = false
+        var configMissing = false
+        var written: [LocationUnsent] = []
+        let noConfig = LocationSharingController(
+            engine: engine,
+            readStoredConfig: { configMissing ? .missing : .unreadable },
+            readStoredUnsent: { unlocked ? onDisk : LocationUnsent() },
+            writeStoredUnsent: { queue in
+                written.append(queue)
+                return true
+            },
+            dropMarker: marker
+        )
+        noConfig.hostPassDashboardID = { nil }
+        unlocked = true
+        configMissing = true
+        XCTAssertTrue(noConfig.readConfigIfNeeded())
+        XCTAssertEqual(written.count, 1, "the note counts with no config: the file is written over")
+        XCTAssertFalse(note.isSet)
+
+        note.writable = false
+        var fileWritable = false
+        let refused = LocationSharingController(
+            engine: engine,
+            readStoredConfig: { .value(LocationFixtures.config(background: true)) },
+            readStoredUnsent: { onDisk },
+            writeStoredUnsent: { _ in fileWritable },
+            dropMarker: marker
+        )
+        refused.dropUnsent(boundTo: LocationFixtures.dashboardID)
+        XCTAssertTrue(refused.unsentDroppedWhileUnreadable)
+        XCTAssertFalse(note.isSet, "the Keychain refused the note")
+        note.writable = true
+        refused.retryDroppedUnsentSave()
+        XCTAssertTrue(note.isSet, "tried again while the drop hasn't reached the file")
+        fileWritable = true
+        refused.retryDroppedUnsentSave()
+        XCTAssertFalse(note.isSet)
+    }
+
     @MainActor
     func testAMessageAtThePlaceTheHostHasSendsNoFixAgain() throws {
         let folder = FileManager.default.temporaryDirectory.appendingPathComponent("location-\(UUID().uuidString)", isDirectory: true)

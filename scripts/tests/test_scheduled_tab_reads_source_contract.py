@@ -11,7 +11,7 @@ import re
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
-APP_STATE = ROOT / "Conduit/Services/AppState.swift"
+ONE_CHAT_TWO_DEVICES = ROOT / "Conduit/Services/AppState+OneChatTwoDevices.swift"
 CRON_NOTIFICATIONS = ROOT / "Conduit/Services/AppState+CronNotifications.swift"
 SHELL = ROOT / "Conduit/Views/V2/V2Shell.swift"
 
@@ -36,7 +36,7 @@ def function(source, signature):
 class ScheduledTabReadsSourceContractTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.app_state = APP_STATE.read_text()
+        cls.app_state = ONE_CHAT_TWO_DEVICES.read_text()
         cls.notifications = CRON_NOTIFICATIONS.read_text()
         cls.shell = SHELL.read_text()
 
@@ -74,16 +74,16 @@ class ScheduledTabReadsSourceContractTests(unittest.TestCase):
     def test_a_read_asked_for_during_a_save_is_not_dropped(self):
         body = function(self.notifications, "func refreshCronNotifications() async {")
         guard = body.index("guard cronNotificationsChangingJobID == nil else {")
-        deferred = body.index("cronNotificationsReadDeferred = true", guard)
+        deferred = body.index("shownBot.cronNotificationsReadDeferred = true", guard)
         self.assertLess(guard, deferred)
 
     def test_the_save_ends_by_running_the_deferred_read(self):
         body = function(self.notifications, "func setCronJobNotifies(")
         defer = body.index("defer {")
-        retry = body.index("if cronNotificationsReadDeferred", defer)
+        retry = body.index("if shownBot.cronNotificationsReadDeferred", defer)
         self.assertLess(defer, retry)
         helper = function(self.notifications, "private func refreshCronNotificationsAfterSave()")
-        self.assertIn("cronNotificationsReadDeferred = false", helper)
+        self.assertIn("shownBot.cronNotificationsReadDeferred = false", helper)
 
 
 if __name__ == "__main__":

@@ -34,6 +34,8 @@ struct LargeMarkdownDocumentView: View {
     let foregroundStyle: Color
     let usesAccentSurface: Bool
     let gatewayMediaDataURL: ((String) async -> String?)?
+    /// MarkdownText's: false for a Markdown file shown as a document.
+    var keepsLineBreaks = true
 
     @Environment(\.chatRowDisclosure) private var disclosure
     @State private var expanded = false
@@ -44,7 +46,8 @@ struct LargeMarkdownDocumentView: View {
                 source: source,
                 foregroundStyle: foregroundStyle,
                 usesAccentSurface: usesAccentSurface,
-                gatewayMediaDataURL: gatewayMediaDataURL
+                gatewayMediaDataURL: gatewayMediaDataURL,
+                keepsLineBreaks: keepsLineBreaks
             )
         } else {
             collapsedView
@@ -63,7 +66,8 @@ struct LargeMarkdownDocumentView: View {
                 foregroundStyle: foregroundStyle,
                 usesAccentSurface: usesAccentSurface,
                 gatewayMediaDataURL: gatewayMediaDataURL,
-                mayEndMidBlock: true
+                mayEndMidBlock: true,
+                keepsLineBreaks: keepsLineBreaks
             )
 
             LargeDocumentBanner(
@@ -200,7 +204,7 @@ struct LargeMarkdownPreparedDocument {
     /// String work only — no UIKit — so it runs off the MainActor as a
     /// cooperative child of the caller's task (cancellation stops the pass
     /// between stages instead of wasting a megabyte parse after a switch).
-    static func prepare(_ source: String) async -> LargeMarkdownPreparedDocument? {
+    static func prepare(_ source: String, keepsLineBreaks: Bool = true) async -> LargeMarkdownPreparedDocument? {
         let document = MarkdownParser.parseDocument(source)
         guard !Task.isCancelled else { return nil }
         let chunks = MarkdownLargeChunkPlanner.chunks(for: document.blocks)
@@ -225,11 +229,16 @@ struct LargeMarkdownPreparedDocument {
         var specializedByChunk: [Int: LargeSpecializedRichContent] = [:]
         for (chunkIndex, chunk) in chunks.enumerated() {
             switch chunk {
-            case .flow:
+            case .flow(let blocks):
+                // A chunk that starts with a list nested under the list
+                // ending the chunk before copies on the next line, as an
+                // outline does in one view.
+                let previousBlock = chunkIndex > 0 ? chunks[chunkIndex - 1].lastBlock : nil
+                let inOutline = blocks.first.map { MarkdownProseRun.continuesOutline($0, after: previousBlock) } ?? false
                 let descriptor = MarkdownSelectionSegmentDescriptor(
                     id: "lmd-flow-\(chunkIndex)",
                     order: all.count,
-                    separatorBefore: all.isEmpty ? "" : "\n\n"
+                    separatorBefore: all.isEmpty ? "" : (inOutline ? "\n" : "\n\n")
                 )
                 descriptorsByChunk.append([descriptor])
                 all.append(descriptor)
@@ -252,6 +261,7 @@ struct LargeMarkdownPreparedDocument {
                         pieceBlocks.append(blocks)
                         pieceReferences.append(
                             MarkdownReferenceResolver.subset(for: blocks.map(\.flattenedText).joined(), definitions: definitions)
+                                .withLineBreaks(kept: keepsLineBreaks)
                         )
                         pieceDescriptors.append(MarkdownSelectionSegmentDescriptor(
                             id: "lmd-callout-\(chunkIndex)-p\(pieceIndex)",
@@ -287,6 +297,7 @@ struct LargeMarkdownPreparedDocument {
                             pieceBlocks.append(blocks)
                             pieceReferences.append(
                                 MarkdownReferenceResolver.subset(for: blocks.map(\.flattenedText).joined(), definitions: definitions)
+                                .withLineBreaks(kept: keepsLineBreaks)
                             )
                             pieceDescriptors.append(MarkdownSelectionSegmentDescriptor(
                                 id: "lmd-columns-\(chunkIndex)-c\(columnIndex)-p\(pieceIndex)",
@@ -332,23 +343,26 @@ struct LargeMarkdownPreparedDocument {
         for chunk in chunks {
             referencesByChunk.append(
                 MarkdownReferenceResolver.subset(for: chunk.flattenedText, definitions: definitions)
+                    .withLineBreaks(kept: keepsLineBreaks)
             )
         }
 
         return LargeMarkdownPreparedDocument(
             chunks: chunks,
-            references: document.references,
+            references: document.references.withLineBreaks(kept: keepsLineBreaks),
             referencesByChunk: referencesByChunk,
             segmentDescriptors: all,
             descriptorsByChunk: descriptorsByChunk,
             specializedByChunk: specializedByChunk,
-            sourceIdentity: Self.identity(of: source)
+            sourceIdentity: Self.identity(of: source, keepsLineBreaks: keepsLineBreaks)
         )
     }
 
-    static func identity(of source: String) -> String {
+    static func identity(of source: String, keepsLineBreaks: Bool = true) -> String {
         // Hermes' @session links take the chat's name once Conduit lists it.
-        "\(source.utf8.count)-\(source.hashValue)-\(HermesSessionReference.titleKey(for: source).hashValue)"
+        // The line-break choice is in it, as in the render cache's key, so a
+        // view whose choice changed prepares its plan again.
+        "\(source.utf8.count)-\(source.hashValue)-\(HermesSessionReference.titleKey(for: source).hashValue)-\(keepsLineBreaks ? 1 : 0)"
     }
 
     /// Web-page units per chunk (diagrams and formulas are chunks of
@@ -383,7 +397,7 @@ extension MarkdownBlock {
         switch self {
         case .heading(_, let text), .paragraph(let text): return text
         case .quote(let lines): return lines.map(\.text).joined(separator: "\n")
-        case .unorderedList(let items), .orderedList(let items, _): return items.joined(separator: "\n")
+        case .unorderedList(let items, _), .orderedList(let items, _, _): return items.joined(separator: "\n")
         case .table(let headers, _, let rows):
             return ([headers] + rows).map { $0.joined(separator: " ") }.joined(separator: "\n")
         case .code(_, let source): return source
@@ -453,6 +467,7 @@ struct LargeMarkdownExpandedView: View {
     let foregroundStyle: Color
     let usesAccentSurface: Bool
     let gatewayMediaDataURL: ((String) async -> String?)?
+    var keepsLineBreaks = true
 
     @StateObject private var selectionCoordinator = MarkdownSelectionCoordinator()
     @State private var prepared: LargeMarkdownPreparedDocument?
@@ -465,7 +480,9 @@ struct LargeMarkdownExpandedView: View {
     /// Chunks added per explicit Continue action.
     static let continueChunkBatch = 25
 
-    private var sourceIdentity: String { LargeMarkdownPreparedDocument.identity(of: source) }
+    private var sourceIdentity: String {
+        LargeMarkdownPreparedDocument.identity(of: source, keepsLineBreaks: keepsLineBreaks)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -509,7 +526,7 @@ struct LargeMarkdownExpandedView: View {
             // Nonisolated async → runs on the global executor (a structured
             // child of this task, so cancellation stops the parse instead of
             // merely discarding its result).
-            guard let plan = await LargeMarkdownPreparedDocument.prepare(source) else { return }
+            guard let plan = await LargeMarkdownPreparedDocument.prepare(source, keepsLineBreaks: keepsLineBreaks) else { return }
             guard !Task.isCancelled, plan.sourceIdentity == sourceIdentity else { return }
             withAnimation(.easeInOut(duration: 0.15)) {
                 prepared = plan
@@ -810,7 +827,9 @@ struct LargeFlowChunkView: View {
                 lineSpacing: 4,
                 linkColor: usesAccentSurface ? .white : .link,
                 selectionCoordinator: selectionCoordinator,
-                selectionSegment: selectionSegment
+                selectionSegment: selectionSegment,
+                // Lists and quotes carry their hanging indents.
+                keepsParagraphStyles: true
             )
             .frame(maxWidth: .infinity, alignment: .leading)
         } else {
@@ -838,10 +857,10 @@ struct LargeMarkdownCallout: View {
 
     private var detail: (title: String, icon: String, color: Color) {
         switch calloutKind.lowercased() {
-        case "tip", "hint": (AppLocalization.string("Tip"), "lightbulb.fill", .green)
+        case "tip", "hint": (AppLocalization.string("Tip", table: .chat), "lightbulb.fill", .green)
         case "warning", "caution": (AppLocalization.string("Warning"), "exclamationmark.triangle.fill", .orange)
-        case "danger", "error": (AppLocalization.string("Important"), "exclamationmark.octagon.fill", .red)
-        case "important": (AppLocalization.string("Important"), "exclamationmark.circle.fill", .purple)
+        case "danger", "error": (AppLocalization.string("Important", table: .chat), "exclamationmark.octagon.fill", .red)
+        case "important": (AppLocalization.string("Important", table: .chat), "exclamationmark.circle.fill", .purple)
         default: (AppLocalization.string("Note"), "info.circle.fill", .blue)
         }
     }
@@ -1041,7 +1060,7 @@ struct LargeCodeBlockView: View {
 
     private var header: some View {
         HStack {
-            Text(normalizedLanguage == "plain" ? AppLocalization.string("Code") : normalizedLanguage)
+            Text(normalizedLanguage == "plain" ? AppLocalization.string("Code", table: .chat) : normalizedLanguage)
                 .scaledFont(.caption2.monospaced().weight(.semibold))
                 .foregroundStyle(usesAccentSurface ? Color.white.opacity(0.86) : .secondary)
             Spacer()

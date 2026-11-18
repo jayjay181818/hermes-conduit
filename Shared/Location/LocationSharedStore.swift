@@ -214,6 +214,7 @@ enum LocationKeychain {
     static let service = "com.milim.relay.location"
     static let keyAccount = "location-key.v1"
     static let hostPassAccount = "location-host-pass.v1"
+    static let unsentDroppedAccount = "location-unsent-dropped.v1"
 
     static func loadKey() -> LocationCrypto.SessionKey? {
         load(account: keyAccount).flatMap { try? JSONDecoder().decode(LocationCrypto.SessionKey.self, from: $0) }
@@ -240,6 +241,26 @@ enum LocationKeychain {
     }
 
     static func clearHostPass() { delete(account: hostPassAccount) }
+
+    /// A Sign Out dropped the unsent queue and its file hasn't been written
+    /// over yet: kept here, beside the file rather than in it, so a relaunch
+    /// before that write lands doesn't read the dropped queue back.
+    static func unsentDropped() -> Bool { load(account: unsentDroppedAccount) != nil }
+
+    /// False when the Keychain refused the change (logged on a save).
+    @discardableResult
+    static func setUnsentDropped(_ dropped: Bool) -> Bool {
+        if dropped {
+            return save(Data([1]), account: unsentDroppedAccount)
+        }
+        #if targetEnvironment(macCatalyst)
+        delete(account: unsentDroppedAccount)
+        return !unsentDropped()
+        #else
+        let status = SecItemDelete(query(account: unsentDroppedAccount) as CFDictionary)
+        return status == errSecSuccess || status == errSecItemNotFound
+        #endif
+    }
 
     #if targetEnvironment(macCatalyst)
     // The Mac build can't reach a keychain (KeychainFileBackend.swift): its

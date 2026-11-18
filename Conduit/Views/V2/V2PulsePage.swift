@@ -51,7 +51,7 @@ struct V2PulseButton: View {
         .buttonStyle(PressableButtonStyle())
         .simultaneousGesture(TapGesture().onEnded { Haptics.selection() })
         .accessibilityLabel(appState.pulseUnseen > 0
-            ? AppLocalization.string("Pulse, new cards")
+            ? AppLocalization.string("Pulse, new cards", table: .pulse)
             : AppLocalization.string("Pulse"))
         .accessibilityIdentifier(named ? "bots.pulse" : "chats.pulse")
     }
@@ -118,8 +118,8 @@ struct PulseMessageMark: View {
                 .contentShape(Rectangle())
         }
         .buttonStyle(PressableButtonStyle())
-        .accessibilityLabel(AppLocalization.string("Pulse follows this up"))
-        .accessibilityHint(AppLocalization.string("Opens its card in Pulse"))
+        .accessibilityLabel(AppLocalization.string("Pulse follows this up", table: .pulse))
+        .accessibilityHint(AppLocalization.string("Opens its card in Pulse", table: .pulse))
     }
 }
 
@@ -128,8 +128,18 @@ struct V2PulsePage: View {
     @EnvironmentObject private var appState: AppState
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.openURL) private var openURL
-    /// On screen (not under a chat pushed over it): only then is it read and marked seen.
+    @Environment(\.v2Shell) private var shell
+    /// Mounted and not under a chat pushed over it.
     @State private var isShown = false
+    /// On screen: shown, in the tab that shows. The shell keeps a visited
+    /// tab mounted behind the one selected, where `onDisappear` never fires,
+    /// so the tab's own flag counts too. Only a visible page polls the feed
+    /// and marks cards seen (issue 2515); away, the Chats tab's reader polls.
+    private var isVisible: Bool { Self.isVisible(shown: isShown, in: shell) }
+
+    static func isVisible(shown: Bool, in shell: V2ShellContext) -> Bool {
+        shown && shell.isTabActive
+    }
     @ObservedObject var appLanguage = AppLanguageStore.shared
 
     @State private var page: PulseFeedPage?
@@ -154,6 +164,9 @@ struct V2PulsePage: View {
     @State private var newCards: Set<Int>?
     /// The last Done or Not now, for the Undo bar.
     @State private var undo: PulseUndo?
+    /// This visit to the page: an action's Undo shows only in the visit
+    /// that started it (#2636's review, issue 2633).
+    @State private var visit = UUID()
     /// The card Not now asks "until when?" about.
     @State private var restCard: PulseCard?
     /// Quiet for today, or End quiet time, on its way to the plugin.
@@ -209,14 +222,26 @@ struct V2PulsePage: View {
 
     var body: some View {
         pageWithDialogs
-        .task(id: PulseRefreshKey(dashboard: appState.activeDashboardID, active: isShown && scenePhase == .active,
+        .task(id: PulseRefreshKey(dashboard: appState.activeDashboardID, active: isVisible && scenePhase == .active,
                                   served: appState.notifierPlugin.reports(PulseClient.feedCapability),
                                   available: appState.showsPulseScreen)) {
-            guard isShown, scenePhase == .active else { return }
+            guard isVisible, scenePhase == .active else { return }
+            // A card asked for while the tab was hidden opens on the cards
+            // the page already has, without waiting on a read that may fail.
+            // One the page doesn't have yet waits for the read that brings it.
+            if let request = appState.pulseOpenRequest,
+               request.card == nil || page?.cards.contains(where: { $0.id == request.card }) == true {
+                focus(request)
+            }
             // Cards that come in while the page is open show up too, and the
             // feed is read again once the plugin answers after a launch.
             while !Task.isCancelled {
                 await load()
+                // Hidden or replaced meanwhile: the other dashboards' reads
+                // wait for the page to show again.
+                guard !Task.isCancelled else { break }
+                // The other combined dashboards' chips (all-live stage 4d).
+                await appState.readOtherCombinedDashboardsPulse()
                 try? await Task.sleep(for: .seconds(60))
             }
         }
@@ -230,16 +255,18 @@ struct V2PulsePage: View {
         .onAppear { isShown = true }
         .onDisappear {
             isShown = false
-            reasonCard = nil
-            restCard = nil
-            undoCard = nil
-            keptCards = []
-            newCards = nil
-            focusedCard = nil
-            voiceOverCard = nil
-            undo = nil  // an undo belongs to the visit that made it
-            expandedBriefs = []
-            expandedWhy = []
+            leaveVisit()
+        }
+        // Another tab selected over a page kept mounted: the visit ends as if
+        // it had gone, so the next one marks its own new cards.
+        .onChange(of: shell.isTabActive) { _, active in
+            if !active { leaveVisit() }
+        }
+        // Backgrounded: a read already under way (a retry or reload outside
+        // the page's task) belongs to the visit before, so it marks nothing
+        // seen. The page's cards and highlights stay for the return.
+        .onChange(of: scenePhase) { _, phase in
+            if phase != .active { visit = UUID() }
         }
         .onChange(of: appState.activeDashboardID) { _, _ in
             reasonCard = nil
@@ -264,7 +291,7 @@ struct V2PulsePage: View {
         }
         .onChange(of: appState.pulseOpenRequest) { _, request in
             // Only the page on screen: one covered by a chat leaves it to the one pushed over it.
-            if let request, isShown { focus(request) }
+            if let request, isVisible { focus(request) }
         }
         .onChange(of: page) { _, page in
             // Done, Not now and Undo here change the cards before the next
@@ -276,7 +303,7 @@ struct V2PulsePage: View {
     private var pageWithDialogs: some View {
         pageSheets
         .confirmationDialog(
-            AppLocalization.string("What was wrong with it?"),
+            AppLocalization.string("What was wrong with it?", table: .pulse),
             isPresented: Binding(get: { reasonCard != nil }, set: { if !$0 { reasonCard = nil } }),
             titleVisibility: .visible,
             presenting: reasonCard
@@ -284,12 +311,12 @@ struct V2PulsePage: View {
             ForEach(appState.pulseDownReasons) { reason in
                 Button(reason.title) { rate(card, up: false, reason: reason) }
             }
-            Button(AppLocalization.string("Just thumbs down")) { rate(card, up: false, reason: nil) }
+            Button(AppLocalization.string("Just thumbs down", table: .pulse)) { rate(card, up: false, reason: nil) }
         } message: { _ in
             Text("A reason changes what Pulse does right away, and you can undo it under What Pulse learned. Just thumbs down only teaches Pulse.")
         }
         .confirmationDialog(
-            AppLocalization.string("Not now, until when?"),
+            AppLocalization.string("Not now, until when?", table: .pulse),
             isPresented: Binding(get: { restCard != nil }, set: { if !$0 { restCard = nil } }),
             titleVisibility: .visible,
             presenting: restCard
@@ -297,12 +324,21 @@ struct V2PulsePage: View {
             ForEach(PulseRest.choices(night: page?.night, brief: page?.briefTime)) { rest in
                 Button(rest.title) { dismiss(card, true, until: rest) }
             }
-        } message: { _ in
-            Text("It comes back as new then, unless it got done meanwhile.")
+            // No Done on it (a whole report): the only way off the screen for good.
+            if appState.canPutPulseCardAwayForGood(card) {
+                Button(AppLocalization.string("Don't bring it back", table: .pulse)) { dismiss(card, true) }
+            }
+        } message: { card in
+            // With Don't bring it back in the menu, "then" is only the times'.
+            if appState.canPutPulseCardAwayForGood(card) {
+                Text(AppLocalization.string("With a time, it comes back as new then.", table: .pulse))
+            } else {
+                Text("It comes back as new then, unless it got done meanwhile.")
+            }
         }
         .confirmationDialog(
-            undoCard?.proposal?.isEvent == false ? AppLocalization.string("Remove it from your reminders?")
-                : AppLocalization.string("Remove it from your calendar?"),
+            undoCard?.proposal?.isEvent == false ? AppLocalization.string("Remove it from your reminders?", table: .pulse)
+                : AppLocalization.string("Remove it from your calendar?", table: .pulse),
             isPresented: Binding(get: { undoCard != nil }, set: { if !$0 { undoCard = nil } }),
             titleVisibility: .visible,
             presenting: undoCard
@@ -339,6 +375,8 @@ struct V2PulsePage: View {
         ZStack {
             V2Backdrop(drifts: false)
             content
+                // A chip per combined dashboard (all-live stage 4d).
+                .safeAreaInset(edge: .top, spacing: 0) { PulseDashboardChips() }
         }
         .navigationTitle(Text("Pulse"))
         .navigationBarTitleDisplayMode(.large)
@@ -352,7 +390,7 @@ struct V2PulsePage: View {
                         .padding(.bottom, 12)
                         .transition(.move(edge: .bottom).combined(with: .opacity))
                 }
-                MinimisedLiveVoiceBar()
+                V2ListCallBar()
             }
         }
     }
@@ -373,7 +411,7 @@ struct V2PulsePage: View {
                             .padding(.horizontal, 20)
                     }
                     ContentUnavailableView {
-                        Label(AppLocalization.string("Nothing yet"), systemImage: "waveform.path.ecg")
+                        Label(AppLocalization.string("Nothing yet", table: .pulse), systemImage: "waveform.path.ecg")
                     } description: {
                         Text("Your reports, your morning brief and the news on what Hermes promised to check land here.")
                     } actions: {
@@ -387,7 +425,7 @@ struct V2PulsePage: View {
             }
         } else if let loadError {
             ContentUnavailableView {
-                Label(AppLocalization.string("Couldn't read Pulse"), systemImage: "exclamationmark.triangle")
+                Label(AppLocalization.string("Couldn't read Pulse", table: .pulse), systemImage: "exclamationmark.triangle")
             } description: {
                 Text(verbatim: loadError)
             } actions: {
@@ -438,7 +476,7 @@ struct V2PulsePage: View {
                     }
                     if !earlier.isEmpty {
                         if !fresh.isEmpty || !layout.briefs.isEmpty {
-                            sectionHeading(AppLocalization.string("Earlier"))
+                            sectionHeading(AppLocalization.string("Earlier", table: .pulse))
                         }
                         ForEach(earlier) { card in listedCard(card) }
                     }
@@ -480,8 +518,8 @@ struct V2PulsePage: View {
     /// The line under the title: how many are new, or that nothing is open.
     @ViewBuilder private func summary(_ layout: PulseLayout, new count: Int) -> some View {
         if count > 0 || layout.isCaughtUp {
-            Text(verbatim: count > 0 ? AppLocalization.string("\(count) new since you last looked")
-                                     : AppLocalization.string("You're all caught up"))
+            Text(verbatim: count > 0 ? AppLocalization.string("\(count) new since you last looked", table: .pulse)
+                                     : AppLocalization.string("You're all caught up", table: .pulse))
                 .scaledFont(.subheadline)
                 .foregroundStyle(.secondary)
                 .padding(.horizontal, 4)
@@ -510,6 +548,7 @@ struct V2PulsePage: View {
 
     /// Not now: off the list, nothing learned. A plugin before 0.68.0 can't
     /// take it; one from 0.78.3 asks until when, and the card comes back then.
+    /// A card with no Done can also be put away for good there.
     /// On a suggestion it's for good: it won't be added.
     @ViewBuilder private func notNowButton(_ card: PulseCard) -> some View {
         if card.isProposal {
@@ -572,7 +611,7 @@ struct V2PulsePage: View {
                 Button {
                     quiet(false)
                 } label: {
-                    Text(verbatim: AppLocalization.string("End quiet time"))
+                    Text(verbatim: AppLocalization.string("End quiet time", table: .pulse))
                         .scaledFont(.footnote.weight(.semibold))
                         .frame(minHeight: 44)  // a full 44 pt to tap
                 }
@@ -659,7 +698,7 @@ struct V2PulsePage: View {
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.borderless)
-                .accessibilityLabel(AppLocalization.string("Fold the morning brief"))
+                .accessibilityLabel(AppLocalization.string("Fold the morning brief", table: .pulse))
                 .accessibilityIdentifier("pulse.brief.fold")
             }
             // In its parts when the plugin sends them (0.150.0), else as Hermes wrote it.
@@ -683,8 +722,8 @@ struct V2PulsePage: View {
     private func briefStamp(_ brief: PulseLayout.Brief) -> String? {
         let time = brief.card.createdAt.map { $0.formatted(date: .omitted, time: .shortened) }
         if brief.isSummary { return time }
-        let left = brief.isHandled ? AppLocalization.string("All handled")
-            : AppLocalization.string("\(Int(brief.left)) left")
+        let left = brief.isHandled ? AppLocalization.string("All handled", table: .pulse)
+            : AppLocalization.string("\(Int(brief.left)) left", table: .pulse)
         return [time, left].compactMap { $0 }.joined(separator: " · ")
     }
 
@@ -824,7 +863,7 @@ struct V2PulsePage: View {
         }
         .buttonStyle(.plain)
         .accessibilityAddTraits(.isHeader)
-        .accessibilityHint(Text(AppLocalization.string("Shows what the brief brought")))
+        .accessibilityHint(Text(AppLocalization.string("Shows what the brief brought", table: .pulse)))
         .accessibilityFocused($voiceOverCard, equals: brief.card.id)
         .accessibilityIdentifier("pulse.brief.open")
     }
@@ -838,7 +877,7 @@ struct V2PulsePage: View {
         } label: {
             HStack(spacing: 10) {
                 Image(systemName: "checkmark.circle")
-                Text(AppLocalization.string("Done and cleared"))
+                Text(AppLocalization.string("Done and cleared", table: .pulse))
                 Text(verbatim: "\(count)")
                     .foregroundStyle(.conduitTertiary)
                 Spacer(minLength: 0)
@@ -854,7 +893,7 @@ struct V2PulsePage: View {
         }
         .buttonStyle(.plain)
         .padding(.top, 6)
-        .accessibilityHint(Text(AppLocalization.string("Shows the cards that are done or swiped away")))
+        .accessibilityHint(Text(AppLocalization.string("Shows the cards that are done or swiped away", table: .pulse)))
         .accessibilityAddTraits(showsCleared ? .isSelected : [])
         .accessibilityIdentifier("pulse.done-cards")
         .pulseRow()
@@ -888,12 +927,28 @@ struct V2PulsePage: View {
         .accessibilityElement(children: .contain)
     }
 
-    private func showUndo(_ action: PulseUndo.Action, card: Int, back: Date? = nil) {
-        // The page was left before the plugin answered: no bar comes back later.
-        guard isShown else { return }
-        var message = AppLocalization.string("Marked done")
+    /// What one visit to the page leaves behind, cleared when it ends.
+    private func leaveVisit() {
+        reasonCard = nil
+        restCard = nil
+        undoCard = nil
+        keptCards = []
+        newCards = nil
+        focusedCard = nil
+        voiceOverCard = nil
+        undo = nil  // an undo belongs to the visit that made it
+        visit = UUID()
+        expandedBriefs = []
+        expandedWhy = []
+    }
+
+    private func showUndo(_ action: PulseUndo.Action, card: Int, back: Date? = nil, visit: UUID) {
+        // The page was left before the plugin answered: no bar comes back
+        // later, in this visit or the next.
+        guard isVisible, visit == self.visit else { return }
+        var message = AppLocalization.string("Marked done", table: .pulse)
         if action == .dismissed {
-            message = AppLocalization.string("Moved to Done and cleared. Pulse learned nothing from it.")
+            message = AppLocalization.string("Moved to Done and cleared. Pulse learned nothing from it.", table: .pulse)
             // Put off until a time: the one the plugin set, as the cleared row says it.
             if let back { message = PulseRest.returning(back).undoMessage }
         }
@@ -910,7 +965,7 @@ struct V2PulsePage: View {
     }
 
     private static var untoldNote: String {
-        AppLocalization.string("Pulse couldn't be told about this one. Tap Done once it's taken care of.")
+        AppLocalization.string("Pulse couldn't be told about this one. Tap Done once it's taken care of.", table: .pulse)
     }
 
     /// One request at a time per card, whichever of its buttons sent it.
@@ -1123,12 +1178,12 @@ struct V2PulsePage: View {
         VStack(spacing: 0) {
             Rectangle().fill(Color.primary.opacity(0.1)).frame(height: 1)
             ViewThatFits(in: .horizontal) {
-                HStack(spacing: 0) {
+                PulseBarRow {
                     cardButtons(card, untold: untold, bar: true)
                     if card.isRatable { cardThumbs(card).modifier(PulseBarDivider()) }
                 }
                 VStack(spacing: 0) {
-                    HStack(spacing: 0) { cardButtons(card, untold: untold, bar: true) }
+                    PulseBarRow { cardButtons(card, untold: untold, bar: true) }
                     if card.isRatable {
                         Rectangle().fill(Color.primary.opacity(0.1)).frame(height: 1)
                         HStack(spacing: 0) { Spacer(minLength: 0); cardThumbs(card) }
@@ -1166,7 +1221,7 @@ struct V2PulsePage: View {
             .foregroundStyle(.secondary) : nil
         // Rewritten since because the thing it follows changed (0.150.0): when, last.
         let stamp: String? = if card.wasUpdated, let updated = card.updatedAt {
-            AppLocalization.string("Updated \(PulseTopicTint.stamp(updated))")
+            AppLocalization.string("Updated \(PulseTopicTint.stamp(updated))", table: .pulse)
         } else {
             card.createdAt.map { PulseTopicTint.stamp($0) }
         }
@@ -1199,7 +1254,7 @@ struct V2PulsePage: View {
                     .buttonStyle(.borderless)
                     .accessibilityValue(expandedWhy.contains(card.id)
                         ? AppLocalization.string("Expanded") : AppLocalization.string("Collapsed"))
-                    .accessibilityHint(AppLocalization.string("Shows why Pulse brought this up"))
+                    .accessibilityHint(AppLocalization.string("Shows why Pulse brought this up", table: .pulse))
                 }
             }
         }
@@ -1268,7 +1323,7 @@ struct V2PulsePage: View {
         } label: {
             HStack(spacing: 6) {
                 Image(systemName: "checklist")
-                Text(verbatim: AppLocalization.string("Kanban task \(task)"))
+                Text(verbatim: AppLocalization.string("Kanban task \(task)", table: .pulse))
                     .lineLimit(1)
                 Image(systemName: "chevron.right")
                     .scaledFont(.caption2.weight(.semibold))
@@ -1277,7 +1332,7 @@ struct V2PulsePage: View {
             .foregroundStyle(.secondary)
         }
         .buttonStyle(.borderless)
-        .accessibilityHint(Text(AppLocalization.string("Opens the task on the board")))
+        .accessibilityHint(Text(AppLocalization.string("Opens the task on the board", table: .pulse)))
         .accessibilityIdentifier("pulse.card.task")
     }
 
@@ -1288,7 +1343,7 @@ struct V2PulsePage: View {
         } label: {
             HStack(spacing: 6) {
                 Image(systemName: "bubble.left")
-                Text(verbatim: card.chatTitle.isEmpty ? AppLocalization.string("Open the chat") : card.chatTitle)
+                Text(verbatim: card.chatTitle.isEmpty ? AppLocalization.string("Open the chat", table: .pulse) : card.chatTitle)
                     .lineLimit(1)
                 Image(systemName: "chevron.right")
                     .scaledFont(.caption2.weight(.semibold))
@@ -1321,9 +1376,10 @@ struct V2PulsePage: View {
                         .foregroundStyle(.orange)
                         .fixedSize(horizontal: false, vertical: true)
                 }
-                // One row when it fits; a pick's extra buttons can crowd a
-                // narrow phone or large text, so the thumbs then go below
-                // and the buttons scroll sideways.
+                // One row when it fits; with three buttons on a narrow phone
+                // (375 pt), a pick's extra buttons or large text, the thumbs
+                // go below and the buttons scroll sideways. Labels stay on
+                // one line either way (PulseActionStyle).
                 ViewThatFits(in: .horizontal) {
                     HStack(spacing: 8) {
                         cardButtons(card, untold: untold)
@@ -1380,12 +1436,12 @@ struct V2PulsePage: View {
                 Haptics.selection()
                 dismiss(card, false)
             } label: {
-                Text(AppLocalization.string("Put back"))
+                Text(AppLocalization.string("Put back", table: .pulse))
                     .scaledFont(.footnote.weight(.medium))
             }
             .buttonStyle(.borderless)
             .disabled(isBusy(card))
-            .accessibilityHint(Text(AppLocalization.string("Puts the card back on the list")))
+            .accessibilityHint(Text(AppLocalization.string("Puts the card back on the list", table: .pulse)))
         } else if card.doneAt != nil, appState.notifierPlugin.reports(PulseClient.doneCapability) {
             Button {
                 Haptics.selection()
@@ -1396,7 +1452,7 @@ struct V2PulsePage: View {
             }
             .buttonStyle(.borderless)
             .disabled(isBusy(card))
-            .accessibilityLabel(Text(AppLocalization.string("Undo Done")))
+            .accessibilityLabel(Text(AppLocalization.string("Undo Done", table: .pulse)))
             .accessibilityHint(Text(card.undoDoneHint))
             .accessibilityIdentifier("pulse.card.undo-done")
         }
@@ -1409,22 +1465,18 @@ struct V2PulsePage: View {
     @ViewBuilder private func proposalRow(_ card: PulseCard) -> some View {
         if let proposal = card.proposal {
             if proposal.state == .waiting {
-                HStack(spacing: 8) {
-                    addButton(card, proposal)
-                    Button {
-                        Haptics.light()
-                        dismissProposal(card)
-                    } label: {
-                        Text(AppLocalization.string("Not now"))
-                            .scaledFont(.footnote.weight(.semibold))
+                // Side by side, or one over the other at large text, each
+                // label on one line.
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 8) {
+                        addButton(card, proposal)
+                        proposalNotNowButton(card)
+                        Spacer(minLength: 0)
                     }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                    .tint(.gray)
-                    .disabled(isBusy(card))
-                    .accessibilityHint(Text(AppLocalization.string("Pulse won't add it")))
-                    .accessibilityIdentifier("pulse.card.proposal-not-now")
-                    Spacer(minLength: 0)
+                    VStack(alignment: .leading, spacing: 8) {
+                        addButton(card, proposal)
+                        proposalNotNowButton(card)
+                    }
                 }
             } else {
                 VStack(alignment: .leading, spacing: 4) {
@@ -1442,8 +1494,8 @@ struct V2PulsePage: View {
                             .buttonStyle(.borderless)
                             .disabled(isBusy(card))
                             .accessibilityHint(Text(proposal.isEvent
-                                ? AppLocalization.string("Removes it from your calendar")
-                                : AppLocalization.string("Removes it from your reminders")))
+                                ? AppLocalization.string("Removes it from your calendar", table: .pulse)
+                                : AppLocalization.string("Removes it from your reminders", table: .pulse)))
                             .accessibilityIdentifier("pulse.card.proposal-undo")
                         }
                     }
@@ -1458,6 +1510,21 @@ struct V2PulsePage: View {
         }
     }
 
+    /// A suggestion's Not now: it won't be added, for good.
+    private func proposalNotNowButton(_ card: PulseCard) -> some View {
+        Button {
+            Haptics.light()
+            dismissProposal(card)
+        } label: {
+            Text(AppLocalization.string("Not now"))
+                .scaledFont(.footnote.weight(.semibold))
+        }
+        .modifier(PulseActionStyle(bar: false, prominent: false, tint: .gray))
+        .disabled(isBusy(card))
+        .accessibilityHint(Text(AppLocalization.string("Pulse won't add it", table: .pulse)))
+        .accessibilityIdentifier("pulse.card.proposal-not-now")
+    }
+
     private func addButton(_ card: PulseCard, _ proposal: PulseProposal) -> some View {
         Button {
             Haptics.selection()
@@ -1470,14 +1537,11 @@ struct V2PulsePage: View {
                 Image(systemName: proposal.isEvent ? "calendar.badge.plus" : "plus.circle")
                     .foregroundStyle(.white)
             }
-            .labelStyle(.titleAndIcon)
             .scaledFont(.footnote.weight(.semibold))
         }
-        .buttonStyle(.borderedProminent)
-        .controlSize(.small)
-        .tint(.conduitAccent)
-        .accessibilityHint(Text(proposal.isEvent ? AppLocalization.string("Adds it to your calendar")
-                                                 : AppLocalization.string("Adds it to your reminders")))
+        .modifier(PulseActionStyle(bar: false, prominent: true, tint: .conduitAccent))
+        .accessibilityHint(Text(proposal.isEvent ? AppLocalization.string("Adds it to your calendar", table: .pulse)
+                                                 : AppLocalization.string("Adds it to your reminders", table: .pulse)))
         .disabled(isBusy(card))
         .accessibilityIdentifier("pulse.card.proposal-add")
     }
@@ -1539,13 +1603,12 @@ struct V2PulsePage: View {
                 Image(systemName: "arrow.right.circle")
                     .foregroundStyle(bar ? Color.conduitAccent : .white)
             }
-            .labelStyle(.titleAndIcon)
             .scaledFont(bar ? .subheadline.weight(.semibold) : .footnote.weight(.semibold))
         }
         .modifier(PulseActionStyle(bar: bar, prominent: true, tint: .conduitAccent))
         .contextMenu {
             if !bots.isEmpty {
-                Section(AppLocalization.string("Do it in")) {
+                Section(AppLocalization.string("Do it in", table: .pulse)) {
                     Button {
                         doIt(card, ask: ask, in: .newChat)
                     } label: {
@@ -1563,13 +1626,13 @@ struct V2PulsePage: View {
         }
         .accessibilityHint(Text(ask != nil
             ? (appState.pulseCardHasChat(card)
-                ? AppLocalization.string("Opens the chat with these words to edit before sending")
-                : bot.map { AppLocalization.string("Opens \($0.displayLabel)'s Bot Chat with these words to edit before sending") }
-                    ?? AppLocalization.string("Opens a new chat with these words to edit before sending"))
+                ? AppLocalization.string("Opens the chat with these words to edit before sending", table: .pulse)
+                : bot.map { AppLocalization.string("Opens \($0.displayLabel)'s Bot Chat with these words to edit before sending", table: .pulse) }
+                    ?? AppLocalization.string("Opens a new chat with these words to edit before sending", table: .pulse))
             : (appState.pulseCardHasChat(card)
-                ? AppLocalization.string("Opens the chat with this reminder ready to send")
-                : bot.map { AppLocalization.string("Opens \($0.displayLabel)'s Bot Chat with this reminder ready to send") }
-                    ?? AppLocalization.string("Opens a new chat with this reminder ready to send"))))
+                ? AppLocalization.string("Opens the chat with this reminder ready to send", table: .pulse)
+                : bot.map { AppLocalization.string("Opens \($0.displayLabel)'s Bot Chat with this reminder ready to send", table: .pulse) }
+                    ?? AppLocalization.string("Opens a new chat with this reminder ready to send", table: .pulse))))
         .disabled(actingCard != nil || isBusy(card))
         .accessibilityIdentifier("pulse.card.do-it")
     }
@@ -1668,8 +1731,8 @@ struct V2PulsePage: View {
         }
         .modifier(PulseActionStyle(bar: bar, prominent: false, tint: .conduitAccent))
         .accessibilityHint(Text(card.isFound
-            ? AppLocalization.string("Tells Pulse this is taken care of, so the next report knows it's done")
-            : AppLocalization.string("Tells Pulse this is taken care of, so it stops checking on it")))
+            ? AppLocalization.string("Tells Pulse this is taken care of, so the next report knows it's done", table: .pulse)
+            : AppLocalization.string("Tells Pulse this is taken care of, so it stops checking on it", table: .pulse)))
         .disabled(isBusy(card))
         .accessibilityIdentifier("pulse.card.done")
     }
@@ -1689,7 +1752,7 @@ struct V2PulsePage: View {
         }
         .buttonStyle(PressableButtonStyle())
         .disabled(isBusy(card))
-        .accessibilityLabel(up ? AppLocalization.string("Useful") : AppLocalization.string("Not useful"))
+        .accessibilityLabel(up ? AppLocalization.string("Useful", table: .pulse) : AppLocalization.string("Not useful", table: .pulse))
         .accessibilityAddTraits(chosen ? .isSelected : [])
     }
 
@@ -1697,19 +1760,26 @@ struct V2PulsePage: View {
 
     private func load() async {
         let dashboard = appState.activeDashboardID
+        // The visit the read began in: a retry's read that lands in a later
+        // visit, or after the page hid (which ends the visit), marks nothing
+        // seen. `visit` is state, so it reads the live value even from a
+        // retry's task holding an old copy of the view.
+        let visit = self.visit
         do {
             let loaded = try await client.feed(proposals: appState.pulseSuggests, looks: appState.pulseLooks)
             guard appState.activeDashboardID == dashboard else { return }
             page = loaded
-            if newCards == nil, isShown {
+            if newCards == nil, isVisible, scenePhase == .active, visit == self.visit {
                 newCards = Set(loaded.cards.filter { $0.seenAt == nil && !$0.isCleared }.map(\.id))
             }
             loadError = nil
             errorMessage = nil
             learnedNote = nil
             appState.applyPulseFeed(loaded)
-            if let request = appState.pulseOpenRequest, isShown { focus(request) }
-            if isShown, loaded.unseen > 0, (try? await client.markSeen(nil, proposals: appState.pulseSuggests)) != nil,
+            if let request = appState.pulseOpenRequest, isVisible { focus(request) }
+            // Backgrounded meanwhile (a retry or reload outside the page's
+            // task isn't cancelled by that): nothing was seen.
+            if !Task.isCancelled, isVisible, scenePhase == .active, visit == self.visit, loaded.unseen > 0, (try? await client.markSeen(nil, proposals: appState.pulseSuggests)) != nil,
                appState.activeDashboardID == dashboard {
                 appState.pulseUnseen = 0
             }
@@ -1731,6 +1801,7 @@ struct V2PulsePage: View {
     private func rate(_ card: PulseCard, up: Bool, reason: PulseDownReason?) {
         ratingCards.insert(card.id)
         let dashboard = appState.activeDashboardID
+        let visit = self.visit
         Task {
             defer { ratingCards.remove(card.id) }
             do {
@@ -1751,11 +1822,11 @@ struct V2PulsePage: View {
                         }
                         if focusedCard == card.id { focusedCard = nil; voiceOverCard = nil }
                     }
-                    showUndo(.dismissed, card: card.id, back: back)
+                    showUndo(.dismissed, card: card.id, back: back, visit: visit)
                 }
                 errorMessage = nil
                 learnedNote = rated.lessons.isEmpty ? nil
-                    : AppLocalization.string("Pulse learned: \(rated.lessons.map(\.text).joined(separator: "; "))")
+                    : AppLocalization.string("Pulse learned: \(rated.lessons.map(\.text).joined(separator: "; "))", table: .pulse)
             } catch {
                 guard appState.activeDashboardID == dashboard else { return }
                 showError(PulseRefusal.message(for: error))
@@ -1793,6 +1864,7 @@ struct V2PulsePage: View {
     private func dismiss(_ card: PulseCard, _ dismissed: Bool, until: PulseRest? = nil) {
         finishingCards.insert(card.id)
         let dashboard = appState.activeDashboardID
+        let visit = self.visit
         Task {
             defer { finishingCards.remove(card.id) }
             do {
@@ -1807,7 +1879,7 @@ struct V2PulsePage: View {
                     if focusedCard == card.id, dismissed { focusedCard = nil; voiceOverCard = nil }
                     if !dismissed { unfold(card) }
                 }
-                if dismissed { showUndo(.dismissed, card: card.id, back: answer.restUntil) }
+                if dismissed { showUndo(.dismissed, card: card.id, back: answer.restUntil, visit: visit) }
                 errorMessage = nil
             } catch {
                 guard appState.activeDashboardID == dashboard else { return }
@@ -1828,6 +1900,7 @@ struct V2PulsePage: View {
     private func markDone(_ card: PulseCard, _ done: Bool) {
         finishingCards.insert(card.id)
         let dashboard = appState.activeDashboardID
+        let visit = self.visit
         Task {
             defer { finishingCards.remove(card.id) }
             do {
@@ -1845,7 +1918,7 @@ struct V2PulsePage: View {
                 if !done { unfold(card) }
                 if done {
                     untoldCards.remove(card.id)
-                    showUndo(.done, card: card.id)
+                    showUndo(.done, card: card.id, visit: visit)
                 }
                 errorMessage = nil
             } catch {
@@ -1897,11 +1970,11 @@ struct V2PulsePage: View {
                 } else if outcome == .off {
                     // This phone never gets it: the device sharing the calendar does.
                     showError(AppLocalization.string(
-                        "This iPhone doesn't share its calendar with Hermes, so the change waits for a device that does."))
+                        "This iPhone doesn't share its calendar with Hermes, so the change waits for a device that does.", table: .pulse))
                 } else if outcome != .synced {
                     // Still Adding… because this phone's pass didn't get the change, not just slow.
                     showError(AppLocalization.string(
-                        "This iPhone couldn't get the change from Hermes yet. Conduit tries again the next time it syncs with Hermes."))
+                        "This iPhone couldn't get the change from Hermes yet. Conduit tries again the next time it syncs with Hermes.", table: .pulse))
                 }
                 // Synced and still Adding…: the label says so, and the next load settles it.
             } catch {
@@ -2048,7 +2121,7 @@ struct PulseLearnedSheet: View {
         NavigationStack {
             SettingsDetailContainer {
                 if let learned {
-                    ConduitSettingsSection(title: AppLocalization.string("How Pulse tells you"), symbol: "bell.badge", tint: .conduitAccent) {
+                    ConduitSettingsSection(title: AppLocalization.string("How Pulse tells you", table: .pulse), symbol: "bell.badge", tint: .conduitAccent) {
                         ForEach(learned.levels.keys.sorted(), id: \.self) { kind in
                             ConduitMenuPicker(
                                 value: learned.levels[kind] ?? .push,
@@ -2065,7 +2138,7 @@ struct PulseLearnedSheet: View {
                     if appState.pulseExplainsLearning {
                         preferencesSection(learned)
                     }
-                    ConduitSettingsSection(title: AppLocalization.string("Learned from your ratings"), symbol: "hand.thumbsup", tint: .blue) {
+                    ConduitSettingsSection(title: AppLocalization.string("Learned from your ratings", table: .pulse), symbol: "hand.thumbsup", tint: .blue) {
                         if learned.lessons.isEmpty {
                             Text(verbatim: PulseLearned.noLessons(learns: learns))
                                 .foregroundStyle(.secondary)
@@ -2084,7 +2157,7 @@ struct PulseLearnedSheet: View {
                                 Button(AppLocalization.string("Undo")) { undo(lesson) }
                                     .buttonStyle(.settings)
                                     .disabled(working)
-                                    .accessibilityLabel(Text(AppLocalization.string("Undo: \(lesson.text)")))
+                                    .accessibilityLabel(Text(AppLocalization.string("Undo: \(lesson.text)", table: .pulse)))
                             }
                         }
                     }
@@ -2108,11 +2181,11 @@ struct PulseLearnedSheet: View {
                 }
             }
             .confirmationDialog(
-                AppLocalization.string("Forget everything Pulse learned?"),
+                AppLocalization.string("Forget everything Pulse learned?", table: .pulse),
                 isPresented: $confirmsStartOver,
                 titleVisibility: .visible
             ) {
-                Button(AppLocalization.string("Forget everything"), role: .destructive) { reset(nil) }
+                Button(AppLocalization.string("Forget everything", table: .pulse), role: .destructive) { reset(nil) }
             } message: {
                 Text("Pulse forgets what your thumbs, Do it and Done taught it so far and learns again from what you do next. The levels you set and the lessons from your reasons stay, and Undo takes it back.")
             }
@@ -2131,7 +2204,7 @@ struct PulseLearnedSheet: View {
     /// What learning holds, strongest first, each with Reset (but the lean
     /// over Pulse's cards in general, which only Start over forgets).
     private func preferencesSection(_ learned: PulseLearned) -> some View {
-        ConduitSettingsSection(title: AppLocalization.string("From your thumbs, Do it and Done"), symbol: "sparkles", tint: .purple) {
+        ConduitSettingsSection(title: AppLocalization.string("From your thumbs, Do it and Done", table: .pulse), symbol: "sparkles", tint: .purple) {
             if learned.preferences.isEmpty {
                 Text(verbatim: PulseLearned.noPreferences)
                     .foregroundStyle(.secondary)
@@ -2141,11 +2214,11 @@ struct PulseLearnedSheet: View {
                     PulseLearnedLine(preference: preference, headed: false)
                     Spacer(minLength: 8)
                     if preference.canReset {
-                        Button(AppLocalization.string("Reset")) { reset(preference) }
+                        Button(AppLocalization.string("Reset", table: .pulse)) { reset(preference) }
                             .buttonStyle(.settings)
                             .disabled(working)
-                            .accessibilityLabel(Text(AppLocalization.string("Reset what Pulse learned: \(preference.subject)")))
-                            .accessibilityHint(Text(AppLocalization.string("Pulse forgets what it learned about this")))
+                            .accessibilityLabel(Text(AppLocalization.string("Reset what Pulse learned: \(preference.subject)", table: .pulse)))
+                            .accessibilityHint(Text(AppLocalization.string("Pulse forgets what it learned about this", table: .pulse)))
                     }
                 }
             }
@@ -2240,17 +2313,17 @@ struct PulseLeftOutSheet: View {
                         }
                     }
                     if !kept.isEmpty {
-                        ConduitSettingsSection(title: AppLocalization.string("Kept out by what you taught Pulse"), symbol: "hand.raised", tint: .purple) {
+                        ConduitSettingsSection(title: AppLocalization.string("Kept out by what you taught Pulse", table: .pulse), symbol: "hand.raised", tint: .purple) {
                             ForEach(kept) { entry in row(entry) }
                         }
                     }
                     if !reported.isEmpty {
-                        ConduitSettingsSection(title: AppLocalization.string("Left out of the report"), symbol: "doc.text", tint: .conduitAccent) {
+                        ConduitSettingsSection(title: AppLocalization.string("Left out of the report", table: .pulse), symbol: "doc.text", tint: .conduitAccent) {
                             ForEach(reported) { entry in row(entry) }
                         }
                     }
                     if !lookedAhead.isEmpty {
-                        ConduitSettingsSection(title: AppLocalization.string("Left out of the look ahead"), symbol: "binoculars", tint: .blue) {
+                        ConduitSettingsSection(title: AppLocalization.string("Left out of the look ahead", table: .pulse), symbol: "binoculars", tint: .blue) {
                             ForEach(lookedAhead) { entry in row(entry) }
                         }
                     }
@@ -2337,7 +2410,7 @@ struct PulseLeftOutSheet: View {
             HStack {
                 Spacer(minLength: 0)
                 if entry.cardID != nil {
-                    Label(AppLocalization.string("On the Pulse screen"), systemImage: "checkmark.circle.fill")
+                    Label(AppLocalization.string("On the Pulse screen", table: .pulse), systemImage: "checkmark.circle.fill")
                         .scaledFont(.footnote.weight(.semibold))
                         .foregroundStyle(.green)
                 } else {
@@ -2345,15 +2418,15 @@ struct PulseLeftOutSheet: View {
                         Haptics.selection()
                         bringUp(entry)
                     } label: {
-                        Label(AppLocalization.string("Bring it up"), systemImage: "arrow.up.circle")
+                        Label(AppLocalization.string("Bring it up", table: .pulse), systemImage: "arrow.up.circle")
                             .scaledFont(.footnote.weight(.semibold))
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.small)
                     .tint(.conduitAccent)
                     .disabled(bringing != nil)
-                    .accessibilityLabel(Text(AppLocalization.string("Bring it up: \(entry.text)")))
-                    .accessibilityHint(Text(AppLocalization.string("Makes it a card on the Pulse screen")))
+                    .accessibilityLabel(Text(AppLocalization.string("Bring it up: \(entry.text)", table: .pulse)))
+                    .accessibilityHint(Text(AppLocalization.string("Makes it a card on the Pulse screen", table: .pulse)))
                 }
             }
         }
@@ -2394,7 +2467,7 @@ struct PulseLeftOutSheet: View {
                 if PulseRefusal(error: error)?.code == "invalid" {
                     // It came up meanwhile, or the journal let it go: the list as it is now.
                     await load()
-                    errorMessage = AppLocalization.string("Pulse no longer has that one.")
+                    errorMessage = AppLocalization.string("Pulse no longer has that one.", table: .pulse)
                 } else {
                     errorMessage = PulseRefusal.message(for: error)
                 }
@@ -2406,6 +2479,13 @@ struct PulseLeftOutSheet: View {
 
 /// A Pulse card's action: a small pill in a card of words, a full-width
 /// segment of the bar in the Pulse frame (design D).
+/// A card's button. Its label stays on one line at its own width: a row
+/// that can't hold its buttons that way is laid out another way by its
+/// ViewThatFits, never squeezed until a word breaks ("Do / ne" beside Do it
+/// and Not now, which an HStack offering each button an equal share did).
+/// Off the bar it's a pill Pulse draws itself (`PulsePillButtonStyle`):
+/// iOS's bordered buttons set a Label's icon apart from its title, and at
+/// its one-line width dropped Done's title altogether (#2688).
 struct PulseActionStyle: ViewModifier {
     let bar: Bool
     let prominent: Bool
@@ -2416,21 +2496,48 @@ struct PulseActionStyle: ViewModifier {
             content
                 .buttonStyle(PulseBarButtonStyle(prominent: prominent, tint: tint))
                 .modifier(PulseBarDivider())
-        } else if prominent {
-            content
-                .buttonStyle(.borderedProminent)
-                .controlSize(.small)
-                .tint(tint)
         } else {
             content
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .tint(tint)
+                .buttonStyle(PulsePillButtonStyle(prominent: prominent, tint: tint))
+                .fixedSize(horizontal: true, vertical: false)
         }
     }
 }
 
-/// One segment of the Pulse frame's bar: as wide as it can be, 44 pt tall.
+/// A card's pill button: icon and title side by side, centred, on one line,
+/// filled with the tint when prominent and tinted lightly otherwise.
+struct PulsePillButtonStyle: ButtonStyle {
+    let prominent: Bool
+    let tint: Color
+    @Environment(\.isEnabled) private var isEnabled
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .labelStyle(PulsePillLabelStyle())
+            .lineLimit(1)
+            .fixedSize(horizontal: true, vertical: false)
+            .foregroundStyle(prominent ? Color.white : (tint == .gray ? Color.secondary : tint))
+            .padding(.horizontal, 12)
+            .padding(.vertical, 7)
+            .frame(minHeight: 32)
+            .background(Capsule(style: .continuous).fill(prominent ? tint : tint.opacity(tint == .gray ? 0.2 : 0.18)))
+            .contentShape(Capsule(style: .continuous))
+            .opacity(configuration.isPressed ? 0.7 : (isEnabled ? 1 : 0.4))
+    }
+}
+
+/// A pill's Label: its icon just before its title.
+struct PulsePillLabelStyle: LabelStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        HStack(spacing: 5) {
+            configuration.icon
+            configuration.title
+        }
+    }
+}
+
+/// One segment of the Pulse frame's bar: its label on one line, as wide as
+/// `PulseBarRow` makes it, 44 pt tall.
 struct PulseBarButtonStyle: ButtonStyle {
     let prominent: Bool
     let tint: Color
@@ -2438,8 +2545,9 @@ struct PulseBarButtonStyle: ButtonStyle {
 
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
-            .lineLimit(2)
-            .multilineTextAlignment(.center)
+            .labelStyle(PulsePillLabelStyle())
+            .lineLimit(1)
+            .fixedSize(horizontal: true, vertical: false)
             .foregroundStyle(prominent ? tint : (tint == .gray ? Color.secondary : Color.primary.opacity(0.85)))
             .padding(.horizontal, 12)
             .padding(.vertical, 6)
@@ -2455,6 +2563,37 @@ struct PulseBarDivider: ViewModifier {
     func body(content: Content) -> some View {
         content.overlay(alignment: .leading) {
             Rectangle().fill(Color.primary.opacity(0.1)).frame(width: 1)
+        }
+    }
+}
+
+/// The Pulse frame's bar: each segment at its one-line width, and what's
+/// left shared by the segments that stretch (the thumbs keep their 44 pt).
+/// Its ideal width is the segments' together, so the bar's ViewThatFits
+/// moves on to the next layout when they don't fit, rather than an HStack's
+/// equal shares squeezing a long label below its width.
+struct PulseBarRow: Layout {
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let ideals = subviews.map { $0.sizeThatFits(.unspecified) }
+        let width = ideals.reduce(0) { $0 + $1.width }
+        let height = ideals.map(\.height).max() ?? 0
+        guard let offered = proposal.width, offered.isFinite else { return CGSize(width: width, height: height) }
+        return CGSize(width: max(width, offered), height: height)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        let widths = subviews.map { $0.sizeThatFits(.unspecified).width }
+        let stretches = zip(subviews, widths).map { subview, ideal in
+            subview.sizeThatFits(ProposedViewSize(width: .infinity, height: nil)).width > ideal + 0.5
+        }
+        let stretching = stretches.filter { $0 }.count
+        let spare = stretching > 0 ? max(0, bounds.width - widths.reduce(0, +)) / CGFloat(stretching) : 0
+        var x = bounds.minX
+        for (index, subview) in subviews.enumerated() {
+            let width = widths[index] + (stretches[index] ? spare : 0)
+            subview.place(at: CGPoint(x: x, y: bounds.minY), anchor: .topLeading,
+                          proposal: ProposedViewSize(width: width, height: bounds.height))
+            x += width
         }
     }
 }

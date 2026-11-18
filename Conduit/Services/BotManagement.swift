@@ -577,7 +577,7 @@ struct BotCapabilities: Equatable, Codable {
         // follows.
         let onText = String(rows.filter(\.enabled).count)
         let allText = String(rows.count)
-        return AppLocalization.string("\(onText) of \(allText) on")
+        return AppLocalization.string("\(onText) of \(allText) on", table: .bots)
     }
 
     /// The lists as Hermes holds them once it took `sections` (as
@@ -606,9 +606,12 @@ struct BotEditorDraft: Equatable {
     var name: String = ""
     var description: String = ""
     var soul: String = ""
-    /// A CSS color string from `BotAvatarColor.swatches`, or nil for the
-    /// name's own hue.
+    /// The bot's color string: its starter face's once one is picked, a
+    /// color Hermes kept, or nil for its face's own.
     var color: String?
+    /// The starter face picked in the editor (StarterFaces); nil leaves the
+    /// bot's own, or gives a new bot the first free one.
+    var face: Int?
     /// A freshly chosen picture (normalized PNG). Nil = unchanged.
     var newAvatarPNG: Data?
     /// The user removed the existing picture.
@@ -633,6 +636,19 @@ struct BotEditorDraft: Equatable {
     /// loaded; only changed sections are written.
     var capabilities: BotCapabilities?
     var capabilitiesBaseline: BotCapabilities?
+
+    /// The draft made on another dashboard than the one its model list,
+    /// Start From and skills were read on: those go back to that
+    /// dashboard's defaults, the rest stays.
+    var readOnAnotherDashboard: BotEditorDraft {
+        var draft = self
+        draft.provider = ""
+        draft.model = ""
+        draft.cloneFrom = BotCreateRequest.mainProfile
+        draft.capabilities = nil
+        draft.capabilitiesBaseline = nil
+        return draft
+    }
 }
 
 /// Upstream `create-dialog.tsx` `ensureAgentCreated`: the `profiles.create`

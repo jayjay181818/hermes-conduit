@@ -26,6 +26,9 @@ struct RoomDraft: Identifiable, Equatable {
         let status: String
         /// The names of the agents they joined with.
         let agents: [String]
+        /// In it with none of their agents ("Just me", plugin 0.167.5+);
+        /// one who then left has status `left`.
+        var justMe = false
     }
 
     /// The room's id, which the room keeps once it starts.
@@ -96,6 +99,8 @@ struct LinkedRoomDrafts: Equatable {
     var list: RoomDraftsList
     /// Your Links that are linked: the people New Group Chat can invite.
     var people: [RoomLink]
+    /// Your other Hermes' bots, over own Links: offered beside your own.
+    var ownBots: [OwnHermesBot] = []
 }
 
 /// How New Group Chat's request for a draft went.
@@ -144,6 +149,18 @@ enum GroupCreateLimits {
         return bots >= 1 && people <= maxPeople && bots + people <= maxAgents
     }
 
+    /// With bots of your other Hermes too (`far`, by own Link): one bot of
+    /// this Hermes hosts it and every bot counts toward 6. They come from one
+    /// other Hermes and nobody else is invited, since their Hermes joins them
+    /// by itself only for an invite that names nobody else (room_own_bots);
+    /// any other mix would leave them waiting on a join card there.
+    static func canCreate(bots: Int, far: [String: Int], people: Int) -> Bool {
+        let picked = far.filter { $0.value > 0 }
+        guard !picked.isEmpty else { return canCreate(bots: bots, people: people) }
+        let farTotal = picked.values.reduce(0, +)
+        return bots >= 1 && people == 0 && picked.count == 1 && bots + farTotal <= maxAgents
+    }
+
     static func canPickBot(bots: Int, people: Int) -> Bool {
         bots + people < maxAgents
     }
@@ -152,7 +169,22 @@ enum GroupCreateLimits {
         people < maxPeople && bots + people < maxAgents
     }
 
-    /// One bot is enough when there's someone to invite.
+    /// Whether one more bot of your other Hermes over `link` can be picked:
+    /// the room it makes, with at least one bot here, stays within 6, with
+    /// bots of that one other Hermes and nobody invited.
+    static func canPickFar(bots: Int, far: [String: Int], link: String, people: Int) -> Bool {
+        var more = far
+        more[link, default: 0] += 1
+        return canCreate(bots: max(bots, 1), far: more, people: people)
+    }
+
+    /// Under your other Hermes' bots in New Group Chat.
+    static var farText: String {
+        AppLocalization.string("A room can bring bots from one of your other Hermes beside at least one of your bots here, and then invites no one else. They join by themselves.", table: .rooms)
+    }
+
+    /// One bot is enough when there's someone to invite, or a bot of your
+    /// other Hermes to bring.
     static func offersNewGroup(visibleBots: Int, invitesPeople: Bool) -> Bool {
         visibleBots >= 2 || (invitesPeople && visibleBots >= 1)
     }
@@ -179,23 +211,23 @@ enum RoomDraftText {
         case "ended":
             switch draft.reason {
             case "lapsed":
-                return AppLocalization.string("The invites ran out before everyone answered")
+                return AppLocalization.string("The invites ran out before everyone answered", table: .rooms)
             case "too_few":
-                return AppLocalization.string("Nobody else joined, so it didn't start")
+                return AppLocalization.string("Nobody else joined, so it didn't start", table: .rooms)
             case "start_failed":
-                return AppLocalization.string("Your Hermes couldn't start it")
+                return AppLocalization.string("Your Hermes couldn't start it", table: .rooms)
             case "withdrawn":
-                return AppLocalization.string("You took it back")
+                return AppLocalization.string("You took it back", table: .rooms)
             default:
-                return AppLocalization.string("It ended before it started")
+                return AppLocalization.string("It ended before it started", table: .rooms)
             }
         case "waiting":
             // Everyone answered: the rooms loop starts it on its next pass.
             guard !draft.waiting.isEmpty else { return AppLocalization.string("Starting…") }
             let waiting = names(draft.waiting.map(\.name))
             let joined = draft.joined.map(\.name)
-            guard !joined.isEmpty else { return AppLocalization.string("Waiting for \(waiting)") }
-            return AppLocalization.string("\(names(joined)) joined, waiting for \(waiting)")
+            guard !joined.isEmpty else { return AppLocalization.string("Waiting for \(waiting)", table: .rooms) }
+            return AppLocalization.string("\(names(joined)) joined, waiting for \(waiting)", table: .rooms)
         default:
             return AppLocalization.string("Starting…")
         }
@@ -204,10 +236,14 @@ enum RoomDraftText {
     /// How someone answered, or nil for a status a newer plugin adds.
     static func status(of person: RoomDraft.Person) -> String? {
         switch person.status {
+        case "joined" where person.justMe:
+            return AppLocalization.string("Joined without their bots", table: .rooms)
         case "joined":
-            return AppLocalization.string("Joined with \(names(person.agents))")
+            return AppLocalization.string("Joined with \(names(person.agents))", table: .rooms)
+        case "left":
+            return AppLocalization.string("Left", table: .rooms)
         case "waiting":
-            return AppLocalization.string("Hasn't answered yet")
+            return AppLocalization.string("Hasn't answered yet", table: .rooms)
         case "declined":
             return AppLocalization.string("Declined")
         default:
@@ -245,9 +281,13 @@ struct RoomDraftsClient {
 
     /// A room with the people of `links` and your `agents`, waiting for
     /// their answers, made in the room service `profile`'s requests use.
-    func create(name: String, agents: [RoomDraftAgent], links: [String], profile: String) async throws -> RoomDraft {
+    /// `bring` names, by own Link, the bots of your other Hermes that join
+    /// by themselves (plugin 0.171); each is one of `links`.
+    func create(name: String, agents: [RoomDraftAgent], links: [String], bring: [String: [String]] = [:],
+                profile: String) async throws -> RoomDraft {
         let path = DashboardPath.withProfile(Self.path, profile: profile, parameter: profileParameter)
-        let body: [String: Any] = ["name": name, "agents": agents.map(\.body), "links": links]
+        var body: [String: Any] = ["name": name, "agents": agents.map(\.body), "links": links]
+        if !bring.isEmpty { body["bring"] = bring }
         return try Self.parseDraft(try await request(path, "POST", body, RoomLinksClient.mailboxTimeoutMilliseconds))
     }
 
@@ -300,7 +340,9 @@ struct RoomDraftsClient {
         guard let link = object["link"] as? String, !link.isEmpty,
               let name = object["name"] as? String,
               let status = object["status"] as? String else { return nil }
-        return RoomDraft.Person(id: link, name: name, status: status, agents: names(object["agents"]))
+        var person = RoomDraft.Person(id: link, name: name, status: status, agents: names(object["agents"]))
+        person.justMe = object["just_me"] as? Bool == true
+        return person
     }
 
     /// The agents' display names.
@@ -324,7 +366,7 @@ struct RoomDraftsClient {
     /// still going out.
     static func createRefusal(for error: Error) -> String {
         if case DashboardTicketBridgeError.http(504, _) = error {
-            return AppLocalization.string("Your Hermes is still sending the invites. The room shows under Group Chats once it has.")
+            return AppLocalization.string("Your Hermes is still sending the invites. The room shows under Group Chats once it has.", table: .rooms)
         }
         return AppLocalization.string("Could not create the group chat: \(message(for: error))")
     }
@@ -389,7 +431,15 @@ extension AppState {
     /// start rooms with them.
     var invitableLinkedPeople: [RoomLink] {
         guard let drafts = currentLinkedRoomDrafts, drafts.list.startsAvailable else { return [] }
-        return drafts.people
+        // Your own other Hermes shows as its bots, not as a person to invite.
+        let ownLinks = Set(drafts.ownBots.map(\.linkID))
+        return drafts.people.filter { !ownLinks.contains($0.id) }
+    }
+
+    /// Your other Hermes' bots New Group Chat offers beside your own.
+    var invitableOwnBots: [OwnHermesBot] {
+        guard canBringOwnBots, let drafts = currentLinkedRoomDrafts, drafts.list.startsAvailable else { return [] }
+        return drafts.ownBots
     }
 
     /// The drafts are read for the dashboard in use, so New Group Chat
@@ -409,19 +459,49 @@ extension AppState {
     /// (a draft's sheet, which reads them every few seconds). A read that
     /// fails keeps what was read last, and one that a sign-out or another
     /// dashboard overtook is dropped, as the room list's is.
-    func refreshLinkedRoomDrafts(readingPeople: Bool = true) async {
+    func refreshLinkedRoomDrafts(readingPeople: Bool = true, since: Date? = nil) async {
+        guard canInviteLinkedPeople, groupChatPhase == .available, isConnected else { return }
+        // One at a time, with or without the people (issue 2359): an older
+        // read can't publish over a newer one.
+        // A caller that wants the people and joins a queued read without
+        // them still gets them: the read takes every ask made before it ran.
+        if readingPeople { linkedRoomDraftsPeopleAsked = true }
+        _ = await linkedRoomDraftsReader.read(key: linkedRoomListReadKey(), since: since) { [weak self] in
+            guard let self else { return false }
+            let readingPeople = self.linkedRoomDraftsPeopleAsked
+            self.linkedRoomDraftsPeopleAsked = false
+            await self.readLinkedRoomDraftsNow(readingPeople: readingPeople)
+            return true
+        }
+    }
+
+    private func readLinkedRoomDraftsNow(readingPeople: Bool) async {
         guard canInviteLinkedPeople, groupChatPhase == .available, isConnected else { return }
         let epoch = groupRoomEpoch
+        let generation = linkedRosterGeneration
         let client = roomDraftsClient
         let links = roomLinksClient
         do {
             let list = try await client.drafts()
-            var people = linkedRoomDrafts?.dashboardID == client.dashboardID ? linkedRoomDrafts?.people : nil
+            let kept = linkedRoomDrafts?.dashboardID == client.dashboardID ? linkedRoomDrafts : nil
+            var people = kept?.people
+            var ownBots = kept?.ownBots ?? []
             if readingPeople || people == nil, let read = try? await links.list() {
                 people = read.links.filter { $0.status == "linked" }
             }
-            guard groupRoomEpoch == epoch, activeDashboardID == client.dashboardID else { return }
-            linkedRoomDrafts = LinkedRoomDrafts(dashboardID: client.dashboardID, list: list, people: people ?? [])
+            if readingPeople, canBringOwnBots, let read = try? await links.ownBots() {
+                ownBots = read
+            }
+            // One a Block overtook could still list the person blocked.
+            guard groupRoomEpoch == epoch, linkedRosterGeneration == generation,
+                  activeDashboardID == client.dashboardID else { return }
+            let openRoom = activeRoomSurface.flatMap { $0.copy == nil ? $0.room : nil }
+            let hadPeople = openRoom.map { hasLinkedPeople($0) } ?? true
+            linkedRoomDrafts = LinkedRoomDrafts(dashboardID: client.dashboardID, list: list, people: people ?? [],
+                                                ownBots: ownBots)
+            // The open room turned out to have linked people (guests who all
+            // joined Just me): read who's in it, as opening it would have.
+            if !hadPeople, let openRoom, hasLinkedPeople(openRoom) { await refreshActiveRoomPeople() }
         } catch {
             // The rows stay as they were: a stale row is safer than none.
         }
@@ -443,6 +523,10 @@ extension AppState {
                 // The rooms you joined, as copies, which Group Chats lists.
                 await refreshLinkedRoomCopies()
                 followLinkedRoomsOnTheirWay()
+                // A room open before the plugin said it serves invites
+                // hasn't read its people: whether it's only the user's own
+                // Hermes is read now (issue 2405).
+                await refreshActiveRoomPeople()
             }
             if approvals {
                 await refreshLinkedRoomApprovals()
@@ -461,14 +545,20 @@ extension AppState {
     /// New Group Chat with people you've linked: a draft on this Hermes,
     /// which invites them and waits for their answers. The sheet shows why
     /// one wasn't made.
-    func createLinkedRoomDraft(name: String, bots: [BotProfile], links: [String]) async -> LinkedRoomDraftCreation {
+    /// `farBots`: bots of one of your own other Hermes, which join by
+    /// themselves; a draft with them invites no one else.
+    func createLinkedRoomDraft(name: String, bots: [BotProfile], links: [String],
+                               farBots: [OwnHermesBot] = []) async -> LinkedRoomDraftCreation {
         let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard canInviteLinkedPeople, isConnected else {
             errorMessage = AppLocalization.string("Connect to Hermes to create a group chat.")
             return .refused
         }
-        guard GroupCreateLimits.canCreate(bots: bots.count, people: links.count) else {
-            errorMessage = AppLocalization.string("A room holds up to 6 agents: your bots, and at least one for each person.")
+        let far = Dictionary(grouping: farBots, by: \.linkID).mapValues(\.count)
+        guard GroupCreateLimits.canCreate(bots: bots.count, far: far, people: links.count) else {
+            errorMessage = far.isEmpty
+                ? AppLocalization.string("A room holds up to 6 agents: your bots, and at least one for each person.", table: .rooms)
+                : GroupCreateLimits.farText
             return .refused
         }
         guard !trimmedName.isEmpty else { return .refused }
@@ -481,7 +571,10 @@ extension AppState {
         }
         let client = roomDraftsClient
         do {
-            let draft = try await client.create(name: trimmedName, agents: agents, links: links, profile: activeProfile)
+            let bring = Dictionary(grouping: farBots, by: \.linkID).mapValues { $0.map(\.profile) }
+            let invited = links + bring.keys.sorted().filter { !links.contains($0) }
+            let draft = try await client.create(name: trimmedName, agents: agents, links: invited, bring: bring,
+                                                profile: activeProfile)
             adoptLinkedRoomDraft(draft, from: client.dashboardID)
             if linkedRoomDraft(draft.id) == nil {
                 await refreshLinkedRoomDrafts(readingPeople: false)

@@ -52,8 +52,9 @@ it compiles the app and runs a curated slice (`docs/CI.md`, CI v5) — and is
 workflow on the release branch** (Actions > Nightly > Run workflow, pick the
 branch, or `gh workflow run nightly.yml --ref <release-branch>`): the complete
 unit suite, the timing/dormancy repeats and the complete UI suite on the exact
-release head. Every job must pass. `nightly-rerun.yml` never reruns a
-dispatched run, so the result is the run you dispatched. A Nightly run on a different SHA certifies
+release head. Every job must pass. `nightly-rerun.yml` reruns only the
+cron's runs and the overnight timer's (which sets `nightly`; leave it off), so
+the result is the run you dispatched. A Nightly run on a different SHA certifies
 nothing, and neither does one from before a rebase. There is no separate
 release workflow.
 
@@ -136,6 +137,29 @@ If Apple rejects the build or QA finds a release-blocking issue after submission
 - Increment the build number, run the full tests, create a new tag, and upload a new candidate.
 
 Never modify an already-uploaded tag. Each uploaded candidate gets a distinct build number and tag.
+
+## Builds from a long-lived branch
+
+`all-live` holds the all-live rework (several chats, and later several Hermes
+instances, live at once). Its pull requests target `all-live`, never `main`,
+and it merges back into `main` after each stage Eric has tested (Eric,
+2026-11-13). Until then it has TestFlight builds of its own:
+
+- Archive from the tip of `origin/all-live`, never from a local checkout or a
+  PR branch, after its latest push has a green `CI Gate`.
+- Give it the next free build number, from the same sequence as `main`'s
+  builds: App Store Connect takes each number once per marketing version,
+  whichever branch it came from. Keep `main`'s marketing version.
+- Tag the archived commit `ios/all-live-v<marketing-version>-build-<build-number>`
+  and run `check-weak-imports.py` on the archive, as for any upload.
+- Send it to internal testers only, never the public beta group, with
+  "all-live" and the merged PRs since the last all-live build in What to Test.
+- Slices merge into `all-live` on a green CI Gate and clean reviews, without
+  a build each. The first all-live build Eric tests carries stage 1 and
+  stage 2 together, once two chats can stream at once (Eric, 2026-11-14).
+
+`main` is merged into `all-live` often (a merge commit, never a rebase), so
+its builds also carry what `main`'s have.
 
 ## Rules of thumb
 

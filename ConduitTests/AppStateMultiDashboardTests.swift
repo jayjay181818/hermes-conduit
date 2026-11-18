@@ -111,6 +111,37 @@ final class AppStateMultiDashboardTests: XCTestCase {
         XCTAssertEqual(appState.busyInputMode, .interrupt, "another server's cache is not this one's")
     }
 
+    /// Profile discovery can adopt a fallback before the busy-mode read
+    /// starts: a client still addressing the profile that went reads nothing
+    /// and caches nothing under the new profile's key (issue 1727, #2308).
+    func testABusyModeReadForAProfileTheConnectionLeftCommitsNothing() async {
+        let appState = makeAppState(registry: SavedDashboardRegistry())
+        defaults.set("server-a", forKey: AppState.chatResumeServerIdentityKey)
+        let workKey = "\(AppState.busyInputModeCachePrefix)server-a|work"
+        defaults.set(BusyInputMode.queue.rawValue, forKey: workKey)
+        appState.setActiveProfileForTesting("work")
+        appState.busyInputMode = .steer
+
+        let leftClient = HermesClient(
+            connection: HermesConnection(baseUrl: "https://hermes.example", ticket: "ticket"),
+            profile: "old"
+        )
+        await appState.loadBusyInputMode(using: leftClient)
+
+        XCTAssertEqual(appState.busyInputMode, .steer, "the read for the profile that went shows nothing")
+        XCTAssertEqual(defaults.string(forKey: workKey), BusyInputMode.queue.rawValue, "nor caches under the new profile's key")
+
+        // A client that names no profile addresses the default one, so it
+        // too is not the work profile's read.
+        let defaultClient = HermesClient(
+            connection: HermesConnection(baseUrl: "https://hermes.example", ticket: "ticket"),
+            profile: nil
+        )
+        await appState.loadBusyInputMode(using: defaultClient)
+        XCTAssertEqual(appState.busyInputMode, .steer, "a profile-less read is the default profile's")
+        XCTAssertEqual(defaults.string(forKey: workKey), BusyInputMode.queue.rawValue)
+    }
+
     // MARK: - Agent settings scope
 
     func testAgentSettingsScopeTellsApartDashboardsWhosePathsDifferInCase() {
@@ -256,6 +287,89 @@ final class AppStateMultiDashboardTests: XCTestCase {
         XCTAssertTrue(appState.prepareChatResumeForConnection(to: a.normalizedURL, dashboardID: a.id))
     }
 
+    func testEachDashboardKeepsTheChatYouLeftThereAcrossASwitch() {
+        let a = dashboard("Mac", "https://mac.tailnet.ts.net")
+        let b = dashboard("VPS", "https://hermes.example.com")
+        let appState = makeAppState(registry: SavedDashboardRegistry(activeDashboardID: a.id, dashboards: [a, b]))
+        let coordinator = appState.chatResumeCoordinator
+        XCTAssertFalse(appState.prepareChatResumeForConnection(to: a.normalizedURL, dashboardID: a.id))
+        coordinator.rememberSession(.dashboard(profile: "default", sessionID: "on-a"), for: "default")
+
+        XCTAssertTrue(appState.prepareChatResumeForConnection(to: b.normalizedURL, dashboardID: b.id))
+        // A's chat never reaches B, whose profile has the same name.
+        XCTAssertNil(coordinator.lastSessionID(for: "default"))
+        coordinator.rememberSession(.dashboard(profile: "default", sessionID: "on-b"), for: "default")
+
+        XCTAssertTrue(appState.prepareChatResumeForConnection(to: a.normalizedURL, dashboardID: a.id))
+        XCTAssertEqual(coordinator.lastSessionID(for: "default"), "on-a")
+        XCTAssertTrue(appState.prepareChatResumeForConnection(to: b.normalizedURL, dashboardID: b.id))
+        XCTAssertEqual(coordinator.lastSessionID(for: "default"), "on-b")
+
+        // Removing A takes the chat it kept with it.
+        appState.removeDashboard(a.id)
+        XCTAssertTrue(appState.prepareChatResumeForConnection(to: a.normalizedURL, dashboardID: a.id))
+        XCTAssertNil(coordinator.lastSessionID(for: "default"))
+    }
+
+    func testSigningOutOrMovingADashboardForgetsTheChatItKept() {
+        let a = dashboard("Mac", "https://mac.tailnet.ts.net")
+        let b = dashboard("VPS", "https://hermes.example.com")
+        let appState = makeAppState(registry: SavedDashboardRegistry(activeDashboardID: a.id, dashboards: [a, b]))
+        let coordinator = appState.chatResumeCoordinator
+        XCTAssertFalse(appState.prepareChatResumeForConnection(to: a.normalizedURL, dashboardID: a.id))
+        coordinator.rememberSession(.dashboard(profile: "default", sessionID: "on-a"), for: "default")
+        // A switch selects the target, then connects to it.
+        appState.selectDashboardTarget(b.id)
+        XCTAssertTrue(appState.prepareChatResumeForConnection(to: b.normalizedURL, dashboardID: b.id))
+
+        // Signing out of A, set aside, forgets its chat.
+        appState.signOutDashboard(a.id)
+        appState.selectDashboardTarget(a.id)
+        XCTAssertTrue(appState.prepareChatResumeForConnection(to: a.normalizedURL, dashboardID: a.id))
+        XCTAssertNil(coordinator.lastSessionID(for: "default"))
+
+        // A move of B, set aside, forgets its chat too.
+        coordinator.rememberSession(.dashboard(profile: "default", sessionID: "on-a-again"), for: "default")
+        appState.selectDashboardTarget(b.id)
+        XCTAssertTrue(appState.prepareChatResumeForConnection(to: b.normalizedURL, dashboardID: b.id))
+        coordinator.rememberSession(.dashboard(profile: "default", sessionID: "on-b"), for: "default")
+        appState.selectDashboardTarget(a.id)
+        XCTAssertTrue(appState.prepareChatResumeForConnection(to: a.normalizedURL, dashboardID: a.id))
+        appState.stageDashboardMove(b.id, toNormalizedURL: "https://moved.example.com")
+        appState.settlePendingDashboardMove(b.id)
+        appState.selectDashboardTarget(b.id)
+        XCTAssertTrue(appState.prepareChatResumeForConnection(to: "https://moved.example.com", dashboardID: b.id))
+        XCTAssertNil(coordinator.lastSessionID(for: "default"))
+
+        // And a move of the selected dashboard drops its live set.
+        coordinator.rememberSession(.dashboard(profile: "default", sessionID: "on-moved"), for: "default")
+        appState.stageDashboardMove(b.id, toNormalizedURL: "https://moved-again.example.com")
+        appState.settlePendingDashboardMove(b.id)
+        XCTAssertNil(coordinator.lastSessionID(for: "default"))
+    }
+
+    /// A switch from the Profiles sheet closes it once the switched-to
+    /// dashboard is connected, not when the whole switch (its chat list
+    /// included) ends; the row says Connecting… only until then.
+    func testASwitchsSheetClosesOnceItsDashboardIsConnected() {
+        let target = UUID()
+        XCTAssertTrue(ProfilePickerSheet.closesForConnectedSwitch(connected: true, alreadyClosed: false, switchingTo: target, active: target))
+        XCTAssertFalse(ProfilePickerSheet.closesForConnectedSwitch(connected: false, alreadyClosed: false, switchingTo: target, active: target),
+                       "not before the socket is up")
+        XCTAssertFalse(ProfilePickerSheet.closesForConnectedSwitch(connected: true, alreadyClosed: false, switchingTo: target, active: UUID()),
+                       "another dashboard connecting isn't this switch's")
+        XCTAssertFalse(ProfilePickerSheet.closesForConnectedSwitch(connected: true, alreadyClosed: false, switchingTo: nil, active: target),
+                       "no switch from this sheet")
+        XCTAssertFalse(ProfilePickerSheet.closesForConnectedSwitch(connected: true, alreadyClosed: true, switchingTo: target, active: target),
+                       "closes once")
+
+        XCTAssertTrue(SavedDashboardRowLabel.showsConnecting(isConnecting: false, isSwitching: true, isConnected: false))
+        XCTAssertFalse(SavedDashboardRowLabel.showsConnecting(isConnecting: false, isSwitching: true, isConnected: true),
+                       "connected while the switch still reads its chat list")
+        XCTAssertTrue(SavedDashboardRowLabel.showsConnecting(isConnecting: true, isSwitching: false, isConnected: false))
+        XCTAssertFalse(SavedDashboardRowLabel.showsConnecting(isConnecting: false, isSwitching: false, isConnected: true))
+    }
+
     func testDashboardIdentityNeverCollidesWithURLOfAnotherServer() {
         // A dashboard UUID and a URL-shaped identity are disjoint: switching
         // between dashboard-scoped and URL-scoped connections is a server
@@ -295,6 +409,31 @@ final class AppStateMultiDashboardTests: XCTestCase {
         XCTAssertNotNil(appState.savedDashboardRegistry.dashboard(with: mac.id))
         // The sign-in seeds the target's own address.
         XCTAssertEqual(appState.lastDashboardURL, vps.normalizedURL)
+    }
+
+    /// Issue 2566: a dashboard switch closes the pane and every chat
+    /// window; an idle followed chat there is let go, a running one stays
+    /// followed.
+    func testADashboardSwitchClosesThePaneAndChatWindows() async {
+        let mac = dashboard("Mac", "https://mac.tailnet.ts.net")
+        let vps = dashboard("VPS", "https://hermes.example.com")
+        let appState = makeAppState(registry: SavedDashboardRegistry(activeDashboardID: mac.id, dashboards: [mac, vps]))
+        func kept(_ id: String, running: Bool) -> BackgroundChat {
+            let state = ChatState()
+            state.messages = [ChatMessage(id: "r-\(id)", role: .assistant, content: "Hi", timestamp: "1")]
+            state.turnState = running ? .running : .idle
+            return BackgroundChat(sessionIDs: [id], durableSessionID: id, title: id, dashboardID: mac.id,
+                                  profile: appState.activeProfile, isBotChat: false, state: state)
+        }
+        appState.backgroundChats = [kept("pane", running: false), kept("idle", running: false), kept("busy", running: true)]
+        appState.besideChatIDs = ["pane"]
+        appState.windowChatIDs = [["idle"], ["busy"]]
+
+        await appState.switchDashboard(to: vps.id)
+
+        XCTAssertNil(appState.besideChatIDs)
+        XCTAssertTrue(appState.windowChatIDs.isEmpty)
+        XCTAssertEqual(appState.backgroundChats.map(\.sessionIDs), [["busy"]], "Only the reply still coming stays followed")
     }
 
     func testSwitchToUnknownDashboardIsInert() async {
@@ -428,6 +567,39 @@ final class AppStateMultiDashboardTests: XCTestCase {
         XCTAssertEqual(PluginUpdateAsk.managedBy, "Family farm")
         appState.selectDashboardTarget(home.id)
         XCTAssertNil(PluginUpdateAsk.managedBy)
+    }
+
+    func testSettingsListsTheSwitchedToDashboardsPluginPagesBeforeItsPluginAnswers() {
+        let home = dashboard("Home", "https://home.example.test")
+        let farm = dashboard("Farm", "https://farm.example.test")
+        NotifierPluginStatus.Remembered.remember(
+            .reported(version: "0.170.2", capabilities: [PulseClient.capability, "hermes-calls"]),
+            for: farm.id, in: defaults
+        )
+        let appState = makeAppState(registry: SavedDashboardRegistry(activeDashboardID: home.id, dashboards: [home, farm]))
+        // Home's plugin never said: nothing is listed ahead of its answer.
+        XCTAssertFalse(appState.settingsListsPluginPage(false, capability: PulseClient.capability))
+
+        appState.selectDashboardTarget(farm.id)
+        XCTAssertEqual(appState.notifierPlugin.state, .unknown)
+        XCTAssertTrue(appState.settingsListsPluginPage(appState.showsPulseSettings, capability: PulseClient.capability))
+        XCTAssertTrue(appState.settingsListsPluginPage(appState.supportsHermesCalls, capability: "hermes-calls"))
+        XCTAssertFalse(appState.settingsListsPluginPage(appState.canLinkRooms, capability: RoomLinksClient.capability))
+
+        // Its answer decides from then on, and is kept for next time.
+        appState.applyNotifierPluginReport(["ok": true, "version": "0.170.3", "capabilities": ["hermes-calls"]])
+        XCTAssertFalse(appState.settingsListsPluginPage(appState.showsPulseSettings, capability: PulseClient.capability))
+        XCTAssertTrue(appState.settingsListsPluginPage(appState.supportsHermesCalls, capability: "hermes-calls"))
+        XCTAssertEqual(NotifierPluginStatus.Remembered.capabilities(for: farm.id, in: defaults), ["hermes-calls"])
+
+        // A plugin without the route forgets what it served.
+        NotifierPluginStatus.Remembered.remember(.predatesCapabilities, for: farm.id, in: defaults)
+        XCTAssertEqual(NotifierPluginStatus.Remembered.capabilities(for: farm.id, in: defaults), [])
+
+        // A removed dashboard's goes with it.
+        NotifierPluginStatus.Remembered.remember(.reported(version: nil, capabilities: ["pulse"]), for: home.id, in: defaults)
+        appState.removeDashboard(home.id)
+        XCTAssertEqual(NotifierPluginStatus.Remembered.capabilities(for: home.id, in: defaults), [])
     }
 
     func testSwitchingBackMovesTheDashboardAndForgetsThePasswordForTheOldAddress() async {
@@ -2003,6 +2175,291 @@ extension AppStateMultiDashboardTests {
         }
         XCTAssertTrue(held.sent.contains { $0.path == NotifierPluginStatus.path })
         XCTAssertEqual(asking.rows().map { $0.entry.name }, ["src"], "The kept listing stays while it asks")
+    }
+
+    /// A profile with the plugin turned off (issue 1438): Hermes answers
+    /// the workspace routes "Plugin not found" though the dashboard's own
+    /// profile reports them. The folder browses through Hermes' own listing,
+    /// offers no changes, says how to turn the plugin on, and asks again on
+    /// a refresh.
+    func testAFolderOnAProfileWithThePluginOffBrowsesThroughHermes() async throws {
+        let (appState, held, _) = heldSwitchFixture()
+        appState.setNotifierPluginStateForTesting(.reported(version: "0.164.0", capabilities: [WorkspaceFilesClient.capability]))
+        let refused: [String: Any] = ["detail": "Plugin not found"]
+        let explorer = WorkspaceExplorer()
+        explorer.attach(appState)
+        let open = Task { await explorer.open(root: "/w/atlas", profile: "atlas") }
+        try await held.waitForRequests(2)
+        try await held.answer(refused, toPathEnding: "/workspace/list", status: 404)
+        try await held.answer(refused, toPathEnding: "/workspace/recent", status: 404)
+        try await held.answer(["entries": [["name": "src", "path": "/w/atlas/src", "isDirectory": true]]], toPathEnding: "/api/fs/list")
+        await open.value
+
+        XCTAssertNil(explorer.error, "the folder still opens")
+        XCTAssertEqual(explorer.rows().map { $0.entry.name }, ["src"])
+        XCTAssertFalse(explorer.canChange, "no search, Add menu or changes")
+        let remedy = try XCTUnwrap(explorer.pluginOff)
+        XCTAssertTrue(remedy.contains("atlas") && remedy.contains("plugins.enabled"), remedy)
+        XCTAssertEqual(held.sent.last(where: { $0.path == "/api/fs/list" })?.query?.contains("profile=atlas"), true)
+
+        // A folder in the tree reads Hermes' listing straight away.
+        let opened = Task { await explorer.toggle(WorkspaceEntry(name: "src", path: "/w/atlas/src", isDirectory: true)) }
+        try await held.answer(["entries": [["name": "main.py", "path": "/w/atlas/src/main.py"]]], toPathEnding: "/api/fs/list")
+        _ = await opened.value
+        XCTAssertEqual(explorer.rows().map { $0.entry.name }, ["src", "main.py"])
+        XCTAssertEqual(held.sent.filter { $0.path.hasSuffix("/workspace/list") }.count, 1)
+
+        // Turned on, a refresh finds the plugin answering again.
+        let refresh = Task { await explorer.refresh() }
+        try await held.answer(["ok": true, "entries": [["name": "src", "path": "/w/atlas/src", "isDirectory": true]]], toPathEnding: "/workspace/list")
+        try await held.answer(["ok": true, "entries": [["name": "main.py", "path": "/w/atlas/src/main.py"]]], toPathEnding: "/workspace/list")
+        try await held.answer(["ok": true, "entries": [["name": "notes.md", "path": "/w/atlas/notes.md"]]], toPathEnding: "/workspace/recent")
+        await refresh.value
+        XCTAssertNil(explorer.pluginOff)
+        XCTAssertTrue(explorer.canChange)
+        XCTAssertEqual(explorer.recent.map(\.name), ["notes.md"])
+    }
+
+    /// Hermes' own listing failing too still leaves the folder browse-only
+    /// with the remedy shown: the refusal is what says the plugin is off
+    /// (issue 2280).
+    func testAFolderOnAProfileWithThePluginOffSaysSoWhenHermesListingFailsToo() async throws {
+        let (appState, held, _) = heldSwitchFixture()
+        appState.setNotifierPluginStateForTesting(.reported(version: "0.164.0", capabilities: [WorkspaceFilesClient.capability]))
+        let refused: [String: Any] = ["detail": "Plugin not found"]
+        let explorer = WorkspaceExplorer()
+        explorer.attach(appState)
+        let open = Task { await explorer.open(root: "/w/atlas", profile: "atlas") }
+        try await held.waitForRequests(2)
+        try await held.answer(refused, toPathEnding: "/workspace/list", status: 404)
+        try await held.answer(refused, toPathEnding: "/workspace/recent", status: 404)
+        try await held.answer(["error": "No such directory"], toPathEnding: "/api/fs/list")
+        await open.value
+
+        XCTAssertNotNil(explorer.error, "the failure shows")
+        XCTAssertFalse(explorer.canChange, "no search, Add menu or changes")
+        XCTAssertNotNil(explorer.pluginOff, "the remedy shows")
+    }
+
+    /// A path a reply named splits as the rest of the Folder splits: a
+    /// POSIX name may hold a backslash, so the file's real folder opens and
+    /// the file keeps its listed date for Edit's save check (issue 2303).
+    func testRevealingAPOSIXNameWithABackslashOpensItsRealFolder() async throws {
+        let (appState, held, _) = heldSwitchFixture()
+        appState.setNotifierPluginStateForTesting(.reported(version: "0.164.0", capabilities: [WorkspaceFilesClient.capability]))
+        let explorer = WorkspaceExplorer()
+        explorer.attach(appState)
+        let profile = appState.workspaceProfile
+        let open = Task { await explorer.open(root: "/w", profile: profile) }
+        try await held.waitForRequests(2)
+        try await held.answer(["ok": true, "entries": [["name": "sub", "path": "/w/sub", "isDirectory": true]]], toPathEnding: "/workspace/list")
+        try await held.answer(["ok": true, "entries": [[String: Any]]()], toPathEnding: "/workspace/recent")
+        await open.value
+
+        let path = #"/w/sub/odd\name"#
+        let reveal = Task { await explorer.reveal(path) }
+        try await held.answer(["ok": true, "entries": [["name": #"odd\name"#, "path": path, "mtime": 1_700_000_000]]], toPathEnding: "/workspace/list")
+        let entry = await reveal.value
+
+        XCTAssertEqual(entry.name, #"odd\name"#)
+        XCTAssertEqual(entry.modified, Date(timeIntervalSince1970: 1_700_000_000))
+        XCTAssertEqual(explorer.listed(path)?.modified, entry.modified)
+        XCTAssertEqual(explorer.rows().map { $0.entry.path }, ["/w/sub", path])
+        XCTAssertEqual(held.sent.filter { $0.path.hasSuffix("/workspace/list") }.count, 2, "no read of a folder cut at the backslash")
+    }
+
+    /// Open Folder… (issue 1438): a folder opened is listed after the
+    /// chat's and the projects' folders, latest first, for its dashboard
+    /// and profile only, named by its last part (a Windows path's too),
+    /// and Remove from List takes it out.
+    func testAnOpenedFolderIsListedForItsDashboardAndProfile() async {
+        let (appState, _, vps) = heldSwitchFixture()
+        let mac = appState.activeDashboardID
+        let profile = appState.workspaceProfile
+        appState.rememberOpenedWorkspaceFolder("/srv/old", profile: profile)
+        appState.rememberOpenedWorkspaceFolder(#"C:\dev\Site"#, profile: profile)
+        appState.rememberOpenedWorkspaceFolder("/srv/old", profile: profile)
+        let opened = appState.workspaceRoots(includingChat: false).filter { $0.kind == .opened }
+        XCTAssertEqual(opened.map(\.path), ["/srv/old", #"C:\dev\Site"#], "latest first, once each")
+        XCTAssertEqual(opened.map(\.title), ["old", "Site"])
+        XCTAssertTrue(appState.openedWorkspaceFolders(profile: "someone-else").isEmpty)
+
+        appState.forgetOpenedWorkspaceFolder("/srv/old", profile: profile)
+        XCTAssertEqual(appState.openedWorkspaceFolders(profile: profile), [#"C:\dev\Site"#])
+
+        await appState.switchDashboard(to: vps.id)
+        XCTAssertTrue(appState.openedWorkspaceFolders(profile: profile).isEmpty, "another server lists its own")
+        appState.rememberOpenedWorkspaceFolder("/home/vps", profile: profile)
+        if let mac { await appState.switchDashboard(to: mac) }
+        XCTAssertEqual(appState.openedWorkspaceFolders(profile: profile), [#"C:\dev\Site"#])
+    }
+
+    /// Each file opened gets a tab (issue 1438), kept while the sheet
+    /// closes and opens again, the same file once; a closed tab goes, and
+    /// another folder starts with none.
+    func testOpenedFilesKeepTheirTabsUntilAnotherFolderOpens() async throws {
+        let (appState, held, _) = heldSwitchFixture()
+        let explorer = WorkspaceExplorer()
+        explorer.attach(appState)
+        let a = WorkspaceEntry(name: "a.swift", path: "/w/a.swift", isDirectory: false)
+        let b = WorkspaceEntry(name: "b.md", path: "/w/b.md", isDirectory: false)
+        let text: [String: Any] = ["text": "let x = 1", "language": "swift"]
+        for file in [a, b, a] {
+            let viewing = Task { await explorer.view(file) }
+            try await held.answer(text, toPathEnding: "/api/fs/read-text")
+            await viewing.value
+        }
+        XCTAssertEqual(explorer.openFiles.map(\.name), ["a.swift", "b.md"])
+        explorer.closeFile()
+        XCTAssertEqual(explorer.openFiles.count, 2, "closing the sheet keeps the tabs")
+        explorer.closeTab(a.path)
+        XCTAssertEqual(explorer.openFiles.map(\.name), ["b.md"])
+
+        // Past the limit the oldest tab goes, never one with unsaved changes.
+        explorer.keepsOpen = [b.path]
+        for index in 1...WorkspaceExplorer.openFilesLimit {
+            let file = WorkspaceEntry(name: "f\(index).txt", path: "/w/f\(index).txt", isDirectory: false)
+            let viewing = Task { await explorer.view(file) }
+            try await held.answer(text, toPathEnding: "/api/fs/read-text")
+            await viewing.value
+        }
+        XCTAssertEqual(explorer.openFiles.count, WorkspaceExplorer.openFilesLimit)
+        XCTAssertEqual(explorer.openFiles.first?.path, b.path, "a tab with changes stays")
+        XCTAssertFalse(explorer.openFiles.contains { $0.path == "/w/f1.txt" }, "the oldest unchanged tab went")
+
+        // Another folder starts with none.
+        let opening = Task { await explorer.open(root: "/w/other", profile: "default") }
+        for _ in 0..<100 where !explorer.openFiles.isEmpty { await Task.yield() }
+        XCTAssertTrue(explorer.openFiles.isEmpty)
+        XCTAssertTrue(explorer.keepsOpen.isEmpty)
+        opening.cancel()
+        explorer.close()
+        XCTAssertTrue(explorer.openFiles.isEmpty)
+    }
+
+    /// After a refresh (issue 1438): a tab whose file the folder's fresh
+    /// full listing no longer shows goes, and so does the copied entry; a
+    /// tab with changes stays, and the reader moves to another tab, or
+    /// closes when none is left.
+    func testATabWhoseFileIsGoneGoesOnTheNextRefresh() async throws {
+        let (appState, held, _) = heldSwitchFixture()
+        appState.setNotifierPluginStateForTesting(.reported(version: "0.164.0", capabilities: []))
+        let explorer = WorkspaceExplorer()
+        explorer.attach(appState)
+        func listing(_ names: [String]) -> [String: Any] {
+            ["entries": names.map { ["name": $0, "path": "/w/\($0)", "isDirectory": false] }]
+        }
+        let open = Task { await explorer.open(root: "/w", profile: appState.workspaceProfile) }
+        try await held.answer(listing(["a.md", "b.md", "c.md"]), toPathEnding: "/api/fs/list")
+        await open.value
+        let files = explorer.rows().map(\.entry)
+        XCTAssertEqual(files.map(\.name), ["a.md", "b.md", "c.md"])
+        let text: [String: Any] = ["text": "notes", "language": "markdown"]
+        for file in files {
+            let viewing = Task { await explorer.view(file) }
+            try await held.answer(text, toPathEnding: "/api/fs/read-text")
+            await viewing.value
+        }
+        explorer.copied = files[0]
+        explorer.keepsOpen = [files[1].path]
+
+        // All three gone: b.md has changes and stays, the reader moves to it.
+        let refresh = Task { await explorer.refresh() }
+        try await held.answer(listing([]), toPathEnding: "/api/fs/list")
+        await refresh.value
+        XCTAssertEqual(explorer.openFiles.map(\.name), ["b.md"])
+        XCTAssertNil(explorer.copied, "the copied entry is gone too")
+        for _ in 0..<100 where explorer.viewed?.path != files[1].path { await Task.yield() }
+        XCTAssertEqual(explorer.viewed?.path, files[1].path)
+        try await held.answer(text, toPathEnding: "/api/fs/read-text")
+        XCTAssertEqual(explorer.viewedGone, 0)
+
+        // Its changes discarded, the next refresh takes it and the reader closes.
+        explorer.keepsOpen = []
+        let again = Task { await explorer.refresh() }
+        try await held.answer(listing([]), toPathEnding: "/api/fs/list")
+        await again.value
+        XCTAssertTrue(explorer.openFiles.isEmpty)
+        XCTAssertEqual(explorer.viewedGone, 1)
+        explorer.close()
+    }
+
+    /// Going back to an open tab shows the text read for it (issue 2355),
+    /// without reading the file again; a refresh that can't vouch for the
+    /// file's date, or the tab closing, has it read again.
+    func testGoingBackToATabShowsItsTextWithoutReadingItAgain() async throws {
+        let (appState, held, _) = heldSwitchFixture()
+        let explorer = WorkspaceExplorer()
+        explorer.attach(appState)
+        let open = Task { await explorer.open(root: "/w", profile: appState.workspaceProfile) }
+        try await held.answer(["entries": [
+            ["name": "a.swift", "path": "/w/a.swift", "isDirectory": false],
+            ["name": "b.md", "path": "/w/b.md", "isDirectory": false],
+        ]], toPathEnding: "/api/fs/list")
+        await open.value
+        let files = explorer.rows().map(\.entry)
+        XCTAssertEqual(files.map(\.name), ["a.swift", "b.md"])
+        func reads() -> Int { held.sent.filter { $0.path.hasSuffix("/api/fs/read-text") }.count }
+        for (file, words) in zip(files, ["let a = 1", "notes"]) {
+            let viewing = Task { await explorer.view(file) }
+            try await held.answer(["text": words, "language": "swift"], toPathEnding: "/api/fs/read-text")
+            await viewing.value
+        }
+        XCTAssertEqual(reads(), 2)
+
+        // A reply link's read of an open tab is dropped when the kept text
+        // shows instead, so no later open takes it under a newer date.
+        explorer.prefetchText(files[0].path, profile: appState.workspaceProfile)
+        try await held.answer(["text": "let a = 1", "language": "swift"], toPathEnding: "/api/fs/read-text")
+        XCTAssertTrue(explorer.keepsPrefetchedText)
+        await explorer.view(files[0])
+        XCTAssertFalse(explorer.keepsPrefetchedText, "the link's read goes with the kept text shown")
+        XCTAssertEqual(reads(), 3, "an open tab's text isn't read again")
+        XCTAssertEqual(explorer.preview?.text, "let a = 1")
+        XCTAssertFalse(explorer.previewLoading)
+
+        // Hermes' own listing has no dates: a refresh can't say the file is
+        // unchanged, so it's read again.
+        // A link's read from before the refresh goes with it: it may hold
+        // text from before the change the refresh follows.
+        explorer.prefetchText(files[1].path, profile: appState.workspaceProfile)
+        try await held.answer(["text": "notes", "language": "markdown"], toPathEnding: "/api/fs/read-text")
+        let refresh = Task { await explorer.refresh() }
+        try await held.answer(["entries": files.map { ["name": $0.name, "path": $0.path, "isDirectory": false] }],
+                              toPathEnding: "/api/fs/list")
+        await refresh.value
+        XCTAssertFalse(explorer.keepsPrefetchedText, "a link's read from before a refresh isn't taken up")
+        XCTAssertFalse(explorer.keepsPreview(of: files[1].path))
+        let viewing = Task { await explorer.view(files[1]) }
+        try await held.answer(["text": "notes again", "language": "markdown"], toPathEnding: "/api/fs/read-text")
+        await viewing.value
+        XCTAssertEqual(reads(), 5)
+        XCTAssertEqual(explorer.preview?.text, "notes again")
+
+        // An upload of several files changes with no refresh each, then
+        // refreshes once (issue 2355).
+        func listings() -> Int { held.sent.filter { $0.path.hasSuffix("/api/fs/list") }.count }
+        let listedBefore = listings()
+        for _ in 0..<3 { _ = await explorer.change(refreshing: false) { _, _ in } }
+        XCTAssertEqual(listings(), listedBefore, "no refresh per file")
+
+        // A change the host stopped waiting on (504) may still land there,
+        // so the folder is read again; a refusal changed nothing
+        // (notifier issue 834).
+        let givenUp = Task {
+            await explorer.change { _, _ in throw DashboardTicketBridgeError.http(status: 504, detail: "") }
+        }
+        try await held.answer(["entries": files.map { ["name": $0.name, "path": $0.path, "isDirectory": false] }],
+                              toPathEnding: "/api/fs/list")
+        let unknown = await givenUp.value
+        XCTAssertNotNil(unknown, "the failure is still shown")
+        XCTAssertEqual(listings(), listedBefore + 1, "the folder is read again after a change nobody saw end")
+        _ = await explorer.change { _, _ in throw DashboardTicketBridgeError.http(status: 409, detail: "") }
+        XCTAssertEqual(listings(), listedBefore + 1, "a refusal reads nothing again")
+
+        explorer.closeTab(files[1].path)
+        XCTAssertFalse(explorer.keepsPreview(of: files[1].path), "a closed tab's text goes")
+        explorer.close()
     }
 
     func testATappedFileNameAsksThePluginAndALaterTapWins() async throws {

@@ -16,9 +16,9 @@ per account, waiting for a runner had become the main cost.
 
 | Workflow | When | What runs | Gates a merge? |
 |---|---|---|---|
-| `.github/workflows/ci.yml` | every PR and every push to `main` or `linked-rooms` (each of those branches runs its own copy) | the Linux validation and CI-tooling self-test, and **one macOS job** (`Smoke`) that builds once and runs the pinned unit smoke tests on that build and simulator, and on a push the pinned UI smoke tests too | yes, through the single `CI Gate` check |
-| `.github/workflows/nightly.yml` | nightly on `main`, and on demand (Actions > Nightly > Run workflow) | **every unit class** except the timing families in `unit_shards` balanced jobs, the timing/performance/dormancy families repeated 3 times, and the **complete UI suite** in `nightly_ui_shards` jobs, no job retrying its own tests (`nightly-rerun.yml` reruns only a scheduled run's jobs that never got a runner) | no; a failed scheduled run emails the owner |
-| `.github/workflows/nightly-rerun.yml` | a scheduled Nightly run that failed (never a dispatched one, so a release candidate's run keeps its result) | reruns the run's failed jobs when every one of them was cancelled without ever getting a runner (macOS capacity), at most twice; a run with a job that ran and failed is left alone | no |
+| `.github/workflows/ci.yml` | every PR and every push to `main`, `linked-rooms` or `all-live` (each of those branches runs its own copy) | the Linux validation and CI-tooling self-test, and **one macOS job** (`Smoke`, left out of a docs-only PR or one-commit docs-only push) that builds once and runs the pinned unit smoke tests on that build and simulator, and on a push the pinned UI smoke tests too | yes, through the single `CI Gate` check |
+| `.github/workflows/nightly.yml` | nightly on `main` at 3:17 AM ET, dispatched by a timer on the Hermes host ([scripts/nightly-timer/](../scripts/nightly-timer/README.md)) with its own cron as a backup that skips when that run happened, and on demand (Actions > Nightly > Run workflow) | **every unit class** except the timing families in `unit_shards` balanced jobs, the timing/performance/dormancy families repeated 3 times, and the **complete UI suite** in `nightly_ui_shards` jobs, no job retrying its own tests (`nightly-rerun.yml` reruns only a nightly run's jobs that never got a runner; an invocation whose simulator runtime was lost before any test ran runs once more after a reboot, `scripts/ci-recover-lost-runtime.sh`) | no; a failed nightly run emails the owner |
+| `.github/workflows/nightly-rerun.yml` | a nightly Nightly run that failed: the cron's or the timer's "Nightly (overnight)" (never another dispatched one, so a release candidate's run keeps its result) | reruns the run's failed jobs when every one of them was cancelled without ever getting a runner (macOS capacity), at most twice; a run with a job that ran and failed is left alone | no |
 | `.github/workflows/contributor-label.yml` | a push or PR comment by the author of a PR labeled `waiting on contributor`, and that label being added | swaps the label for `waiting on Eric` (and back); it only edits labels and checks nothing out | no |
 
 **Releases** have no workflow of their own: a release candidate is validated
@@ -32,8 +32,8 @@ exact code being shipped.
 `Class/testMethod` (70 unit, 4 UI), capped by `max_unit_tests` and
 `max_ui_tests`, and `plan-tests.py smoke` validates them against the
 discovered inventory on every run: a renamed test, a whole class or a list
-over its cap fails the plan job. The UI tests run on pushes to `main` and
-`linked-rooms` only, not on PRs (Eric, 2026-11-02, [UI smoke after the merge](#ui-smoke-after-the-merge)). `scripts/hosted-suite.json` owns the nightly shape: the shard counts and
+over its cap fails the plan job. The UI tests run on pushes to `main`,
+`linked-rooms` and `all-live` only, not on PRs (Eric, 2026-11-02, [UI smoke after the merge](#ui-smoke-after-the-merge)). `scripts/hosted-suite.json` owns the nightly shape: the shard counts and
 the `nightly_only_unit` list. `plan-tests.py hosted` puts every discovered
 unit class in exactly one nightly unit shard or the nightly-only list, and
 every UI class in one nightly UI shard. It runs in ci.yml's self-test job too, so a
@@ -48,9 +48,11 @@ touching them. The **change's own classes**: `plan-tests.py smoke
 `ConduitTests/` file, and `<Stem>Tests` for a changed app file `<Stem>.swift`,
 cheapest first within `changed_budget_s` of baseline time (a class with no
 baseline counts 3 s) and `changed_max_classes`. What budget is left goes to
-the stem's family, `<Stem><Topic>Tests` (a change to `AppState.swift` or
-`AppState+Composer.swift` reaches `AppStateChatResumeTests`), also cheapest
-first. The rest are named in a notice and the step summary. A changed class
+the stem's family, `<Stem><Topic>Tests`, also cheapest first: a change to
+`AppState.swift` or `AppState+Composer.swift` brings in about fifteen of the
+`AppState...Tests` (`AppStateMultiDashboardTests` among them), and a heavy
+member that no longer fits, such as the 35 s `AppStateChatResumeTests`, runs
+at night. The rest are named in a notice and the step summary. A changed class
 runs whole, in place of any tests pinned from it.
 Timing families are never added, and neither are changed UI classes: UI
 tests take 36-150 s each, so a UI test a PR adds or edits first runs at
@@ -76,7 +78,8 @@ What gets compiled (2026-10-15, when builds had grown to 9-17 minutes):
 
 - **The full app on every PR, from main's latest build.** The smoke job
   builds `project.yml`, the app as shipped with its Watch app and
-  extensions, on every PR and push. From 2026-10-15 to 10-29 a PR that
+  extensions, on every PR and push that builds (a docs-only one skips,
+  see CI Gate). From 2026-10-15 to 10-29 a PR that
   didn't touch those targets built `project-tests.yml` instead, an xcodegen
   overlay of `project.yml` whose only change is that the Conduit target no
   longer embeds the Watch app and the app extensions. But the only cache of
@@ -88,25 +91,43 @@ What gets compiled (2026-10-15, when builds had grown to 9-17 minutes):
   before merge. The nightly unit shards and timing repeats still build
   `project-tests.yml`.
 - **Incremental builds from an earlier build.** Builds on `main` save their
-  DerivedData to the Actions cache after the tests, keyed by project kind,
+  DerivedData to the Actions cache, keyed by project kind,
   Xcode build and runner image (`dd-v1-<kind>-<xcode>-<image>-<sha>`): the
-  smoke job of every push to `main` saves the full app, and nightly unit
+  smoke job of every push to `main` that builds saves the full app (right
+  after its build and weak-imports check, before its tests: its UI smoke runs
+  another 3-5 minutes, and a PR opened meanwhile restored an older build and
+  recompiled main's latest merge, 2026-11-16), and nightly unit
   shard 1 saves the app-only (slim) build when it runs on `main`. A push to
-  `linked-rooms` saves its full app as well, for that branch's
+  `linked-rooms` or `all-live` saves its full app as well, for that branch's
   later pushes and the PRs into it (GitHub gives a run its own branch's
-  entries, a PR's base branch's and main's). The smoke
-  job and the nightly unit shards restore the newest matching entry before
+  entries, a PR's base branch's and main's). A PR's Smoke run saves its
+  build too (since 2026-11-16), so the PR's next push, often a review fix,
+  restores the PR's own last build and recompiles only what changed since,
+  not the PR again on top of main's (or its base branch's) build; it costs about half a minute of upload
+  per run and more churn under the repository's cache limit, where main's
+  newest entry, which every run can fall back to, stays. A failed save only warns. The
+  smoke job and the nightly unit shards restore the newest matching entry before
   building (from the same runner
   image if there is one, otherwise from any image with the same Xcode build,
   which happens while GitHub rolls out a new image), so a PR recompiles only
-  what it changed since main's latest merge. Xcode trusts a restored build only when each input's file
+  what it changed since its own last build or, on its first run, main's latest merge. Xcode trusts a restored build only when each input's file
   info matches exactly, and a fresh checkout stamps every file with the clone
   time, so `ci-build-for-testing.sh` first gives every tracked file (and the
   generated project) a timestamp derived from its content
   (`ci-normalize-mtimes.py`) and sets XCBuild's
   `IgnoreFileSystemDeviceInodeChanges`. An incremental build that fails with
-  no error in a source file is retried once from scratch. A new Xcode build
-  misses the cache and builds clean. The nightly timing repeats build
+  no error in a source file is retried once from scratch. The build's notice
+  and log line name how many Swift files each target compiled, so a slow
+  incremental build shows what it rebuilt. A new Xcode build
+  misses the cache and builds clean, and a build that restored no cache (the
+  nightly UI shards' every build) gets 1800 s instead of 1200 s: the first
+  Xcode 27 build outran 1200 s (#2319). Every nightly build gets 1800 s: the unit
+  shards' and timing repeats' restored cache is the last Nightly's, and builds
+  from it still outran 1200 s beside the other nightly jobs (2026-11-13). Every macOS job selects the newest
+  released Xcode on its image (`ci-select-xcode.sh`), not the image's default
+  `Xcode.app`, which can lag it (27.1 beside 27.2 and its iOS 27.2 runtime). When the selected Xcode can't run `metal` (image 20261112.0361.1's
+  Xcode 27.3 shipped without the Metal toolchain component, and every build
+  failed at CompileMetalFile), the script downloads it first; every macOS job on such an image pays that fetch until GitHub updates the image. When the download fails too (Apple's catalog had no toolchain for that build, the 2026-11-16 Nightly), the script selects the next newest release and tries again, then the image's default `Xcode.app`. A candidate whose iOS simulator SDK lookup fails or returns no version is skipped before the Metal check. A fallback that needs runtime pins is also skipped when its watchOS simulator SDK lookup fails or returns no version. The step fails when no candidate has the required simulator SDKs and a working Metal toolchain. A job that falls back to an Xcode with an older simulator SDK than the first candidate with an SDK pins `SIMULATOR_OS` and `WATCH_SIMULATOR_OS` to its Xcode's simulator SDK versions through `GITHUB_ENV` (the Select Xcode steps run `sudo --preserve-env=GITHUB_ENV`). Versions are compared numerically: another copy of the same version (such as `Xcode_27.3.app` beside `Xcode_27.3.0.app`) or a newer default `Xcode.app` pins nothing. This keeps the device lookups' newest-runtime rule (`scripts/ci-lib.sh`, and the App Store screenshots jobs' own iPhone, iPad and Watch lookups) from picking a runtime that Xcode can't build for. The nightly timing repeats build
   `project-tests.yml` too and restore the slim cache without saving it
   (since 2026-11-11: their clean full builds ran 1162-1590 s beside the unit
   shards and outran the 1200 s budget on 11-09 and 11-11). A night with a
@@ -137,10 +158,31 @@ What gets compiled (2026-10-15, when builds had grown to 9-17 minutes):
 - **No whole-module Swift.** Tried in #629: the 3-core hosted runners built
   the full app in 20.5 minutes against 11-16 before, because the app is one
   large module type-checked on one core.
+- **No hand-written `==`.** What an incremental build recompiles depends
+  on the change, and one kind cost a near-full rebuild: adding any member,
+  stored or computed, to a type with a hand-written `static func ==`
+  recompiled 718 of the app's 766 files (measured on a Mac with CI's build
+  command, Xcode 27.2, 2026-11-17), as almost every file uses `==` and Swift
+  resolves the operator across all of them. With a synthesized `==` the
+  same change recompiled 3 (`TranscriptCellEnvironment`) to 46 files, 217
+  for `BackgroundChat`, a new AppState property about 280, a body edit 1. One such change (#2665, `ConversationAgentIdentity`)
+  sent the next PRs' Smoke builds to 1,500 s of compile from main's cache.
+  So types let Swift synthesize `==` and wrap a field that compares another
+  way in `Conduit/Services/EquatableWrappers.swift`'s `@EqualityIgnored`,
+  `@IdentityEquatable` or `@OptionalIdentityEquatable` (that file stays in
+  `Conduit/Services`: the same file in `Conduit/Models` brought the 719-file
+  rebuilds back for every type using a wrapper, for reasons the build log
+  doesn't show);
+  `check-hand-written-equality.py` fails a new hand-written `==` and lists
+  the files that still hold one. Two more full rebuilds are known and left:
+  a removed or renamed Swift file turns incremental compilation off for its
+  target ("inputs were used in the previous compilation but not in this
+  one"), and any change to the app's interface recompiles every test file,
+  since they `@testable import Conduit`.
 
 Each build posts two notices on its job: the slowest build phases from
-`-showBuildTimingSummary` (with the cache it restored and the seconds spent
-on the destination, waiting for the simulator and the packages before the
+`-showBuildTimingSummary` (with the cache it restored, how many Swift files
+each target compiled (`ci-build-compiled-counts.py`), and the seconds spent on the destination, waiting for the simulator and the packages before the
 build), and the longest
 stretches where the build log stopped growing, with the lines around each
 (`ci-build-quiet-stretches.py`). The second shows time the first cannot:
@@ -151,7 +193,9 @@ from storage some networks can't reach.
 
 The smoke job then runs its test steps on the one build and booted
 simulator. **Unit smoke** runs the pinned unit tests as one
-`test-without-building` invocation with no retry; a failure posts xcodebuild's
+`test-without-building` invocation with no retry of a test (an invocation
+that lost its simulator runtime before any test ran gets one more attempt
+after a reboot, `scripts/ci-recover-lost-runtime.sh`); a failure posts xcodebuild's
 list of failing tests and the first error lines as an annotation, and the
 invocation posts how long it took and how much of that ran tests. **UI smoke**
 runs the pinned UI tests as one invocation with one targeted retry (see
@@ -171,6 +215,15 @@ night, and whoever merged it fixes `main` forward, as for any unit test
 outside the smoke set. The same change started the smoke job beside the Linux
 checks instead of after them: `plan` holds only the smoke selection and the
 skip decision (about 20 seconds), and the checks moved to `self-test`.
+
+A push skips the smoke job as a PR does when it changes only docs and config
+(Markdown outside the app and test folders, docs/, LICENSE, review config,
+`.github/` other than ci.yml), read against the branch's tip before it. Only a
+one-commit push (main's squash merges, a merge commit into `linked-rooms` or
+`all-live`) is read that way; a push of several commits or a new branch builds.
+Nothing such a commit changes reaches the build or the smoke tests, and on
+2026-11-15 each feature-map merge to `main` still held a macOS runner for
+about half an hour (with UI smoke) while PRs queued behind it.
 
 Nightly unit shards run their classes as sequential `test-without-building`
 batches on the one booted simulator: the fewest batches of at most
@@ -209,20 +262,32 @@ them (Cancel this PR's older runs), and each run has a concurrency group of
 its own, so the new run starts at once instead of waiting the 3.5 minutes a
 cancelled Smoke job takes to wind down (2026-11-02). It cancels only runs
 whose one PR is this one (number and base), so a branch with PRs into both
-`main` and `linked-rooms` never cancels the other PR's run. A fork PR, whose
+`main` and `linked-rooms` (or `all-live`) never cancels the other PR's run. A fork PR, whose
 token can't cancel runs, keeps one group per PR with `cancel-in-progress`.
-A newer push to main never cancels an older one's run: each merge
-gets its own run, because branch protection does not require PRs to be up to
-date with main, and the main run is what catches two PRs that are green alone
-but break together (within the smoke set; the nightly run catches the rest).
-Whoever merged the breaking PR fixes main forward. Any run on main that
-overlaps another run adds one macOS job, so up to five PR or push runs can run
-side by side before anything queues. "Require branches to be up to date
+Pushes to a branch share one concurrency group without cancelling (Eric,
+2026-11-15): the run under way finishes, the newest push waits, and GitHub
+cancels a waiting push's run when a newer push arrives, so main has at most
+one run going and one waiting. A docs-only push after a cancelled one builds
+anyway (see CI Gate), so a merge whose run was cancelled is always built by the
+next run. The change's own unit classes come from the newest commit only; a
+cancelled merge's classes ran on its PR before it merged. Branch protection does not require PRs to be up
+to date with main, and main's run is what catches two PRs that are green alone
+but break together (within the smoke set; the nightly run catches the rest);
+the waiting run holds every merge since the last one, so a break shows there,
+named by a range of merges rather than one. Whoever merged the breaking PR
+fixes main forward. Before, every merge got its own run: on 2026-11-14 twenty
+merges in five hours held up to 6 of the 5 macOS runners, main's Smoke jobs
+queued 83-86 minutes with PRs behind them, and the build cache PRs restore fell
+14 merges behind. So up to five PR or push runs can run side by side before
+anything queues, and main takes at most one of them. "Require branches to be up to date
 before merging" is a repository setting (Settings > Branches > main) that this
 workflow assumes is off; if it is turned back on, PRs must update again. Grow
 the smoke set or add a macOS job to ci.yml only with that ceiling in mind.
-Pushes to `linked-rooms` run the same way, in that branch's
-copy of the workflow.
+Pushes to `linked-rooms` and `all-live` run the same way, in that branch's
+copy of the workflow. `all-live` holds the all-live rework (several chats
+and Hermes instances live at once) until Eric has tested each stage; its
+TestFlight builds are archived from that branch, see
+[RELEASE_WORKFLOW.md](RELEASE_WORKFLOW.md#builds-from-a-long-lived-branch).
 
 A nightly run schedules 8 macOS jobs (2 unit shards + 3 timing repeats + 3 UI
 shards), so three of them queue behind the ceiling, and a nightly that
@@ -230,17 +295,33 @@ overlaps a PR run slows both. That is accepted: nightly results are not
 time-critical. Each extra `unit_shards` or `nightly_ui_shards` shard adds one
 more build and one more queued job.
 
+They must not be in the day's way, though. GitHub created Nightly's cron
+events 7 to 10 hours late (2026-11-09..14: 15:07-18:50 UTC for a 08:17 UTC
+cron), so the run held the macOS runners through Eric's mornings and his PRs'
+Smoke jobs queued behind it. Nightly is now dispatched at 3:17 AM ET by a
+systemd timer on the Hermes host, with `nightly: true`, which titles the run
+"Nightly (overnight)" ([scripts/nightly-timer/](../scripts/nightly-timer/README.md)).
+The cron moved to 09:47 UTC, after the timer in EDT and EST alike, as a
+backup: its plan job skips the run when a dispatched Nightly ran on `main` in
+the last 20 hours (cron runs don't count, so yesterday's skipped backup can't
+hide a missed timer), and otherwise runs with a warning: that no dispatch
+reached GitHub (the timer's journal shows a refused or failed dispatch, such
+as an expired token; no entry for 03:17 means the service never started, so
+check that the host was up and `systemctl list-timers conduit-nightly.timer`),
+or, when the run lookup itself fails,
+that it's unknown whether the timer ran.
+
 When macOS arm64 capacity runs short, GitHub gives up on a queued job after
 about 40 minutes: it ends `cancelled` with no runner and no steps ("The job was
 not acquired by Runner of type hosted even after multiple attempts"). Nightly
 lost 2 jobs that way on 2026-10-28 and 3 on 2026-10-29. `nightly-rerun.yml`
-reruns a scheduled run's failed jobs, up to twice, but only when every failed job
+reruns a nightly run's failed jobs (the cron's or the timer's), up to twice, but only when every failed job
 is one of these; those jobs never ran a test, so the rerun hides no flake.
 
 ## Hosted gate architecture
 
 The CI v5 shape of `.github/workflows/ci.yml` (every PR, and every push to
-`main` or `linked-rooms`):
+`main`, `linked-rooms` or `all-live`):
 
 ```
         source scan (inventory)                     validate & self-test (ubuntu)
@@ -253,12 +334,12 @@ The CI v5 shape of `.github/workflows/ci.yml` (every PR, and every push to
                  |                                   the build
                  v
    smoke (ONE macOS job)
-     restore main's (or its base branch's) build cache
+     restore the PR's own last build, else main's (or its base branch's)
      build-for-testing  ||  simulator boot      (ci-hosted-build.sh)
-     unit smoke: 70 pinned tests, ONE invocation, no retry
+     check-weak-imports; save the full build cache
+     unit smoke: 70 pinned tests, ONE invocation, no test retry (a lost runtime: once more)
      UI smoke:   pushes only: 4 pinned tests, ONE invocation, one
                  targeted retry (runs even if unit smoke failed)
-     pushes only: save the full build cache
                  |
                  v
           ci-gate  ->  "CI Gate" (the single required status check)
@@ -273,9 +354,9 @@ nightly-only families, on the slim build and cache) and `ui` (one job per UI sha
 
 | Job | Runner | Purpose |
 |---|---|---|
-| `plan` | ubuntu | Only what `smoke` needs to start: the **smoke selection** (`plan-tests.py smoke`: `unit-csv`, `ui-csv`) and whether the PR needs the smoke job at all (`smoke`, below). About 20 seconds, so the macOS job starts almost at once. |
-| `self-test` (`Validate & self-test`) | ubuntu | Inventory/planner validation (`plan-tests.py validate`), localization coverage, the recommended plugin version, the feature map's paths and entry shape and, on a PR, that each entry it adds or edits names the PR on its Checked line (`check-feature-map.py`, given the base's map from `HEAD^1` and, on a PR into `linked-rooms` that merges main, main's maps where the PR and its base meet main, so the entries a merge of main brings in keep main's Checked lines (if GitHub can't say whether the PR merges main or give those maps, it warns and checks without them, so those entries fail as the PR's edits until a re-run); its notifier/ paths are looked up on the plugin's main, so a file removed there turns every PR red until the map follows, and a GitHub outage during that lookup only warns), the **nightly partition** check (`plan-tests.py hosted`) and the CI-tooling regression suites (planner tests, destination lookup, gate/contract tests, the bash wrapper tests included), concurrent with `smoke`. |
-| `smoke` (`Smoke`) | macos-26 | The only macOS job: restores main's build cache (on a PR into `linked-rooms`, that branch's when it has one), builds the app and every test target once while the simulator boots (the compile gate), then runs the pinned unit tests (one invocation, no retry) and, on a push, the pinned UI tests (one invocation, one targeted retry) on that build. Saves the full build cache on pushes to `main` or `linked-rooms`. |
+| `plan` | ubuntu | Only what `smoke` needs to start: the **smoke selection** (`plan-tests.py smoke`: `unit-csv`, `ui-csv`) and whether the PR or push needs the smoke job at all (`smoke`, below). About 20 seconds, so the macOS job starts almost at once. |
+| `self-test` (`Validate & self-test`) | ubuntu | Inventory/planner validation (`plan-tests.py validate`), localization coverage, the recommended plugin version, the feature map's paths and entry shape and, on a PR, that each entry it adds or edits names the PR on its Checked line (`check-feature-map.py`, given the base's map from `HEAD^1` and, on a PR into `linked-rooms` or `all-live` that merges main, main's maps where the PR and its base meet main, so the entries a merge of main brings in keep main's Checked lines (if GitHub can't say whether the PR merges main or give those maps, it warns and checks without them, so those entries fail as the PR's edits until a re-run); its notifier/ paths are looked up on the plugin's main, so a file removed there turns every PR red until the map follows, and a GitHub outage during that lookup only warns), the **nightly partition** check (`plan-tests.py hosted`) and the CI-tooling regression suites (planner tests, destination lookup, gate/contract tests, the bash wrapper tests included), concurrent with `smoke`. |
+| `smoke` (`Smoke`) | xcode-27 | The only macOS job: restores the PR's own last build, else main's build cache (on a PR into `linked-rooms` or `all-live`, that branch's when it has one), builds the app and every test target once while the simulator boots (the compile gate), then runs the pinned unit tests (one invocation, no test retried; an invocation that lost its simulator runtime before any test ran runs once more after a reboot, `scripts/ci-recover-lost-runtime.sh`) and, on a push, the pinned UI tests (one invocation, one targeted retry) on that build. Saves the full build cache after the build and its weak-imports check and before the tests: a push's for later PRs, a PR's for its own next push. |
 | `ci-gate` | ubuntu | The single stable branch-protection verdict (`CI Gate`), aggregating `plan`, `smoke` and `self-test` via `scripts/ci-gate.py`. |
 
 The self-test job's timeout layering holds: each synthetic hang in the suites
@@ -314,7 +395,8 @@ test.
 ### The smoke selection
 
 `scripts/smoke-suite.json` is the checked-in selection the `smoke` job runs on
-every PR (its unit tests) and every push to `main` or `linked-rooms` (CI v5), and
+every PR (its unit tests) and every push to `main`, `linked-rooms` or `all-live` (CI v5) that
+builds, and
 `plan-tests.py smoke` validates it
 against the discovered inventory on every run:
 
@@ -403,11 +485,14 @@ caught. `SmokeSelectionTests` asserts they never enter the smoke set, and
   main-only job that wrote it are gone; nothing produces the planner's
   `--history` input any more.
 * **No watchdogs or recovery plumbing.** A wedged hosted runner fails the job
-  and is re-run by a human, deliberately.
+  and is re-run by a human, deliberately. The one exception: a test invocation
+  whose simulator runtime was lost before any test ran reboots the device and
+  runs once more (`scripts/ci-recover-lost-runtime.sh`, the Nightly reruns
+  entry in docs/FEATURE_MAP.md).
 
 ### Cost
 
-CI v5: one macOS job per PR run or push run (one build, one boot, and the
+CI v5: one macOS job per PR run or push run, none for a docs-only one (one build, one boot, and the
 unit invocation; a push adds the UI invocation and its retry when needed), against CI v4's three (each with
 its own build and boot, ~18 minutes of wall clock per run). The full unit
 suite's macOS minutes moved to the nightly run, which spends them once a day
@@ -456,10 +541,19 @@ suites.
 
 ## Timing data
 
-* `scripts/test-timings.json` - checked-in **baseline fallback** (seconds per
-  class), seeded from a full-suite xcresult measured on local hardware.
-  Unseen classes get a conservative default (20 s) so a batch of new tests
-  cannot all pile into one lane.
+* `scripts/test-timings.json` - checked-in **baseline** (seconds per class).
+  Smoke charges each changed unit class its time against `changed_budget_s`
+  (a class missing from it is charged 3 s), and the nightly planner splits
+  the unit shards with it. The unit classes come from a green nightly's two
+  unit shards on the hosted runners: `scripts/refresh-test-timings.py
+  --baseline scripts/test-timings.json <shard logs>` reads each class's
+  `Test Suite ... passed|failed` and `Executed ... (S) seconds` lines and
+  replaces the classes it measured, keeping the rest (UI classes, the
+  nightly-only timing families). Rerun it when classes are added or grow:
+  the August seed had drifted until half the unit classes had no entry and
+  app-code PRs ran 4-6 minutes of changed classes against the 120 s budget
+  (refreshed 2026-11-17). Unseen classes get a conservative default (20 s)
+  in lane planning so a batch of new tests cannot all pile into one lane.
 * **Timing history** - there is none any more. The `timing-history-v1-*`
   Actions cache and the main-only job that wrote it were removed in CI v3: they
   existed to rebalance the hosted lane matrix, which no longer exists.
@@ -514,7 +608,7 @@ protection. It passes only when:
 * `plan`, `smoke` and `self-test` all succeed (CI v5). `smoke` fails when
   its build, its unit smoke step or (on a push) its UI smoke step failed. The one
   legitimate skip is the plan job's: its `smoke` output is `false` on a PR
-  that doesn't need the macOS build, and the gate passes a skipped `smoke`
+  or push that doesn't need the macOS build, and the gate passes a skipped `smoke`
   only then. Otherwise `plan-tests.py smoke` fails closed on an empty curated
   selection and both smoke test steps refuse to run unfiltered, so a
   `skipped` job means an upstream failure cascade — which fails the gate.
@@ -535,10 +629,15 @@ for any PR that wasn't up to date. The review plan in
 `opencode-review.yml` hashes the same way with an inline copy of the script,
 and `scripts/tests/test_pr_change_id.py` holds the two to the same ids. A
 passing Smoke counts whatever PR it ran for (GitHub can't say which PR a run
-belonged to), so a commit that passed in a PR into `linked-rooms`
+belonged to), so a commit that passed in a PR into `linked-rooms` or `all-live`
 counts for a PR into `main` from the same branch; Markdown under an app or
 test folder always builds, since the id counts Markdown only by its words.
-Pushes always build, and every lookup that fails builds too.
+A push builds unless it is one commit (main's squash merge, or a merge commit
+into `linked-rooms` or `all-live`) of only docs and config, read against the
+branch's tip before it, and that tip's own push run passed: a push whose run
+GitHub cancelled while it waited (see Budget) was never built, so the next
+push builds even if it is docs. The same-change skip is for PRs only, and every
+lookup that fails builds.
 
 Branch protection must require **CI Gate** (and nothing else from this
 workflow): the jobs behind it are implementation detail, and any job that can

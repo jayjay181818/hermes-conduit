@@ -52,12 +52,15 @@ extension AppState {
         return hermesCallsStatus
     }
 
-    /// Whether Hermes can call the user when a live call's work is done.
-    /// Settings not read yet count as on: the host refuses the watch if
-    /// they're off, and the call hears so.
+    /// Whether Hermes can call the user when a live call's work is done,
+    /// by the call's own profile's settings (a call kept across a switch
+    /// is on another profile than the screen's). Settings not read yet
+    /// count as on: the host refuses the watch if they're off, and the
+    /// call hears so.
     var hermesCallbackAvailability: VoiceCallbackAvailability {
         guard supportsHermesCalls else { return .unsupported }
-        return activeHermesCallsStatus?.callbackAvailability ?? .available
+        guard hermesCallsStatusKey == hermesCallsKey(profile: voiceCallProfile) else { return .available }
+        return hermesCallsStatus?.callbackAvailability ?? .available
     }
 
     private func hermesCallsKey(profile: String) -> String {
@@ -113,7 +116,7 @@ extension AppState {
             return true
         } catch {
             hermesCallsStateLogger.error("Call settings not saved: \(LogRedaction.message(error), privacy: .public)")
-            errorMessage = AppLocalization.string("Couldn't save Hermes' call settings. Check your connection and try again.")
+            errorMessage = AppLocalization.string("Couldn't save Hermes' call settings. Check your connection and try again.", table: .voice)
             return false
         }
     }
@@ -237,8 +240,9 @@ extension AppState {
     /// The Watch app says what to set up when its voice can't start, and
     /// that calls then ring only the iPhone.
     /// Also how a call ringing on the Watch names the main profile, the
-    /// accent the Watch app draws in, and whether the active dashboard's
-    /// notifications are end-to-end encrypted (the Watch's Settings).
+    /// accent the Watch app draws in, whether the active dashboard's
+    /// notifications are end-to-end encrypted (the Watch's Settings), and
+    /// the ringtones picked in Calls from Hermes.
     func shareWatchCallVoices() {
         shareMainProfileNamesWithNotifications()
         let notifications = PushNotificationService.shared
@@ -253,7 +257,9 @@ extension AppState {
             activeDashboardID: activeDashboardID?.uuidString,
             accent: UserDefaults.standard.string(forKey: ConduitAccent.storageKey) ?? ConduitAccent.defaultValue.rawValue,
             notificationsEncryption: Self.watchNotificationsEncryption(activeDashboardID.flatMap(notificationsEncryption(of:))),
-            pluginAsk: PluginUpdateAsk.managedAsk
+            pluginAsk: PluginUpdateAsk.managedAsk,
+            ringtone: HermesRingtoneStore().forAll.rawValue,
+            botRingtones: HermesRingtoneStore().bots
         ))
     }
 
@@ -334,26 +340,28 @@ extension AppState {
                 return try await self.hermesCallsClient.watch(
                     sessionIDs: target.sessionIDs,
                     title: target.title,
-                    profile: target.profile ?? self.activeProfile,
+                    profile: target.profile ?? self.voiceCallProfile,
                     holdSeconds: holdSeconds,
                     endedWithinSeconds: endedWithinSeconds
                 )
             },
             hold: { [weak self] watchID, profile, seconds in
                 guard let self else { throw DashboardTicketBridgeError.notReady }
-                return try await self.hermesCallsClient.hold(watchID: watchID, profile: profile ?? self.activeProfile, seconds: seconds)
+                return try await self.hermesCallsClient.hold(watchID: watchID, profile: profile ?? self.voiceCallProfile, seconds: seconds)
             },
             cancel: { [weak self] watchID, profile in
                 guard let self else { throw DashboardTicketBridgeError.notReady }
-                try await self.hermesCallsClient.cancel(watchID: watchID, profile: profile ?? self.activeProfile)
+                try await self.hermesCallsClient.cancel(watchID: watchID, profile: profile ?? self.voiceCallProfile)
             },
             notify: { [weak self] target, kind in
                 guard let self else { return }
+                let profile = target.profile ?? self.voiceCallProfile
                 await HermesCallNotifications.post(HermesCallNotifications.localRequest(
                     for: target,
                     kind: kind,
-                    profile: target.profile ?? self.activeProfile,
-                    dashboardID: self.activeDashboardID
+                    profile: profile,
+                    dashboardID: self.activeDashboardID,
+                    callerName: self.hermesCallContactName(profile)
                 ))
             }
         )
@@ -366,7 +374,7 @@ extension AppState {
         guard hermesCallbackEngine == engine else { return }
         hermesCallbackEngine = nil
         endHermesCallPresence()
-        guard let task = voiceBackgroundJobSupervisor.finishCallbacks() else { return }
+        guard let task = voiceBackgroundJobSupervisor.finishCallbacks(callProfile: voiceCallProfile) else { return }
         let end = beginVoiceTranscriptBackgroundTask(named: "conduit.hermesCalls.hangUp")
         Task {
             await task.value
@@ -385,6 +393,8 @@ extension AppState {
             HermesCallTrace.shared.note("Voice not opened (connected: \(isConnected), voice in use: \(isVoiceInUse))")
             return false
         }
+        // An ended call's jobs go back before this one notes anything.
+        handBackEndedCallJobsNow()
         // The call tells the user how the job went; no voice conversation
         // announces it again.
         voiceBackgroundJobSupervisor.noteCallAnswered(sessionIDs: call.sessionIDs)
@@ -427,7 +437,7 @@ extension AppState {
                 HermesCallTrace.shared.note("Opening classic voice")
                 // Classic voice says it at its first listening window, with
                 // the question's choices when its card is in the chat.
-                let brief = opening.spokenBrief(waiting: self.hermesCallWaiting(opening))
+                let brief = opening.spokenBrief(waiting: self.hermesCallWaiting(opening), name: self.hermesCallContactName(profile))
                 classicBrief = brief
                 self.voiceBackgroundJobSupervisor.queueCallOpening(brief)
                 opened = await self.openVoiceConversation(intent)
@@ -477,7 +487,9 @@ extension AppState {
     /// in use.
     func beginHermesCallPresence() {
         guard supportsHermesCallPresence else { return }
-        let profile = activeProfile
+        // The call's profile, read once as it starts: the renewals keep
+        // naming it across a profile switch the call goes on over.
+        let profile = voiceCallProfile
         // The same call reconnecting keeps the presence it has.
         if hermesCallPresenceTask != nil, hermesCallPresenceProfile == profile { return }
         endHermesCallPresence()

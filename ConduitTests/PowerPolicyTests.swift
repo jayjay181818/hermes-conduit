@@ -82,6 +82,18 @@ extension ChatSyncTests {
         XCTAssertEqual(waits, [4, 8, 15, 30, 60, 60, 60])
     }
 
+    /// A gateway that pushes `sessions.changed` wakes the list when it
+    /// moves, so a quiet list waits one step longer (issue 851).
+    func testPowerWithChangeEventsAnUnchangedListBacksOffToTwoMinutes() {
+        var pacer = ChatListPollPacer()
+        var quiet = observation(["a|rt|idle|4"])
+        quiet.followsChanges = true
+        let waits = (0..<7).map { _ in pacer.next(after: quiet, conditions: DeviceConditions(), random: 0) }
+        XCTAssertEqual(waits, [4, 8, 15, 30, 60, 120, 120])
+        XCTAssertEqual(pacer.interval(followingChanges: false), 60, "A gateway without them stops at a minute")
+        XCTAssertEqual(pacer.next(after: quiet, conditions: lowPower, random: 0), 180)
+    }
+
     func testPowerAChangedRegistryOrCatalogGoesBackToFourSeconds() {
         var pacer = ChatListPollPacer()
         for _ in 0..<5 { _ = pacer.next(after: observation(["a|rt|idle|4"]), conditions: DeviceConditions(), random: 0) }
@@ -100,6 +112,28 @@ extension ChatSyncTests {
         let running = observation(["a|rt|working|4"], running: true)
         let waits = (0..<5).map { _ in pacer.next(after: running, conditions: DeviceConditions(), random: 0) }
         XCTAssertEqual(waits, [4, 4, 4, 4, 4])
+    }
+
+    /// A Mac window behind other apps still counts as in view (issue
+    /// 2360): two minutes on, a running turn or a moving list no longer
+    /// keeps the 4 s pace, and a return (a reset) brings it back.
+    func testPowerAnInactiveWindowLeavesTheFourSecondPaceAfterTwoMinutes() {
+        var pacer = ChatListPollPacer()
+        var running = observation(["a|rt|working|4"], running: true)
+        running.inactiveFor = 60
+        XCTAssertEqual(pacer.next(after: running, conditions: DeviceConditions(), random: 0), 4, "a glance away")
+        let waits = (0..<4).map { step -> TimeInterval in
+            var moving = observation(["a|rt|working|\(5 + step)"], running: true)
+            moving.inactiveFor = PollCadence.chatListInactiveAfter + Double(step)
+            return pacer.next(after: moving, conditions: DeviceConditions(), random: 0)
+        }
+        XCTAssertEqual(waits, [30, 30, 30, 60])
+        pacer.reset()
+        XCTAssertEqual(pacer.next(after: observation(["a|rt|working|9"], running: true), conditions: DeviceConditions(), random: 0), 4)
+        // A failed read keeps the floor too.
+        var failed = observation(nil)
+        failed.inactiveFor = PollCadence.chatListInactiveAfter
+        XCTAssertEqual(pacer.next(after: failed, conditions: DeviceConditions(), random: 0), 30, "a failed read inactive")
     }
 
     func testPowerAResetGoesBackToFourSeconds() {

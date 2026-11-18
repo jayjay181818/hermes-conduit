@@ -337,6 +337,22 @@ extension HermesVoiceGatewayTimeoutTests {
         XCTAssertEqual(GPTLiveVoice.all.first { $0.name == "cove" }?.label.hasPrefix("Cove · "), true)
     }
 
+    func testGPTLiveOffersChatGPTsKoreanVoicesAndNamesAChosenVoiceWhenACallNeverStarts() {
+        // Issue 2388: Codex's endpoint started calls with these IDs (a made-up one never connected).
+        for name in ["haetsal", "hanul"] {
+            XCTAssertTrue(GPTLiveVoice.all.contains { $0.name == name }, "\(name) is pickable on the ChatGPT plan")
+            XCTAssertFalse(GPTLiveVoice.apiNames.contains(name), "\(name) isn't an API-key voice")
+        }
+        XCTAssertEqual(GPTLiveVoice.all.first { $0.name == "haetsal" }?.label.hasPrefix("Haetsal · "), true)
+        let plain = AppLocalization.string("GPT-Live didn't start the conversation. Try again.", table: .voice)
+        XCTAssertEqual(GPTLiveSession.notStartedMessage(voice: nil, billing: .subscription), plain)
+        XCTAssertEqual(GPTLiveSession.notStartedMessage(voice: "", billing: .subscription), plain)
+        XCTAssertEqual(GPTLiveSession.notStartedMessage(voice: "marin", billing: .api), plain, "The API key refuses a voice outright")
+        let named = GPTLiveSession.notStartedMessage(voice: "haetsal", billing: .subscription)
+        XCTAssertNotEqual(named, plain)
+        XCTAssertTrue(named.contains("Haetsal"), "The chosen voice is named")
+    }
+
     func testGPTLiveAPIVoicesIncludeTheOtherLanguageVoices() {
         XCTAssertEqual(Set(GPTLiveVoice.apiNames).count, GPTLiveVoice.apiNames.count)
         for name in ["marin", "cedar", "nuri", "juni", "flitz", "brise", "sillage", "nira", "harema", "shida", "noeul"] {
@@ -364,7 +380,7 @@ extension HermesVoiceGatewayTimeoutTests {
         for _ in 0..<50 where session.state == .ready {
             try await Task.sleep(for: .milliseconds(10))
         }
-        XCTAssertEqual(session.state, .failed(AppLocalization.string("The GPT-Live connection was lost.")))
+        XCTAssertEqual(session.state, .failed(AppLocalization.string("The GPT-Live connection was lost.", table: .voice)))
         XCTAssertTrue(peer.closed)
     }
 
@@ -712,17 +728,14 @@ extension HermesVoiceGatewayTimeoutTests {
         let center = NotificationCenter()
         let link = GPTLiveAudioLink(audio: audio, center: center)
         try? link.start()
-        center.post(name: AVAudioSession.interruptionNotification, object: nil,
-                    userInfo: [AVAudioSessionInterruptionTypeKey: AVAudioSession.InterruptionType.began.rawValue])
+        AudioSessionInterruption.began.post(on: center)
         await settle()
         XCTAssertTrue(link.isInterrupted)
-        center.post(name: AVAudioSession.interruptionNotification, object: nil,
-                    userInfo: [AVAudioSessionInterruptionTypeKey: AVAudioSession.InterruptionType.ended.rawValue])
+        AudioSessionInterruption.ended(shouldResume: true).post(on: center)
         await settle()
         XCTAssertFalse(link.isInterrupted)
         link.stop()
-        center.post(name: AVAudioSession.interruptionNotification, object: nil,
-                    userInfo: [AVAudioSessionInterruptionTypeKey: AVAudioSession.InterruptionType.began.rawValue])
+        AudioSessionInterruption.began.post(on: center)
         await settle()
         XCTAssertFalse(link.isInterrupted, "Observers are gone after stop")
     }
@@ -805,6 +818,32 @@ extension HermesVoiceGatewayTimeoutTests {
         }
         guard case .failed = silent.state else { return XCTFail("Expected failed, got \(silent.state)") }
         XCTAssertTrue(silentPeer.closed)
+
+        // Issue 2388: a ChatGPT-plan call with a chosen voice that never starts names that voice.
+        let voicedPeer = FakeGPTLivePeer()
+        let voiced = GPTLiveSession(client: FakeGPTLiveClient(), voice: "haetsal", makePeer: { voicedPeer },
+                                    startTimeout: .milliseconds(10), reconnectGrace: .seconds(60))
+        voiced.start()
+        for _ in 0..<50 where voiced.state == .connecting {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(voiced.state, .failed(GPTLiveSession.notStartedMessage(voice: "haetsal", billing: .subscription)))
+
+        // Lost after the host answered but before session.started: the voice is named.
+        let answeredPeer = FakeGPTLivePeer()
+        let answeredCall = GPTLiveSession(client: FakeGPTLiveClient(), voice: "haetsal", makePeer: { answeredPeer })
+        answeredCall.start()
+        await settle(until: { !answeredPeer.acceptedAnswers.isEmpty })
+        XCTAssertEqual(answeredCall.state, .connecting)
+        answeredPeer.onDisconnected?()
+        XCTAssertEqual(answeredCall.state, .failed(GPTLiveSession.notStartedMessage(voice: "haetsal", billing: .subscription)))
+
+        // Lost before the host answered: the billing is only the default, so no voice is named.
+        let earlyPeer = FakeGPTLivePeer()
+        let early = GPTLiveSession(client: FakeGPTLiveClient(), voice: "marin", makePeer: { earlyPeer })
+        early.start()
+        earlyPeer.onDisconnected?()
+        XCTAssertEqual(early.state, .failed(AppLocalization.string("The GPT-Live connection was lost.", table: .voice)))
     }
 }
 
@@ -1394,6 +1433,27 @@ extension VoiceConversationControllerTests {
         let tests = session.speakable.first { $0.delegationID == "del_2" }
         XCTAssertNotNil(tests)
         XCTAssertFalse(tests?.text.contains("kept talking") == true, "A late turn.done is the request, not more words")
+        controller.stop()
+    }
+
+    /// Issue 2292: a ChatGPT-plan delegation whose text is only the newest
+    /// of the user's lines hands Hermes everything they said since the last
+    /// delegation, not that last piece.
+    func testGPTLiveDelegationRepeatingTheNewestLineHandsHermesTheWholeRequest() async {
+        let (controller, session, _, fake) = makeGPTController(clock: { Date(timeIntervalSince1970: 1_000) })
+        await controller.start()
+        session.becomeReady()
+        session.onEvent?(.turnDone(role: "user", transcript: "Find me a ramen place near the office"))
+        session.onEvent?(.turnDone(role: "user", transcript: "that's open after nine, um, on Friday."))
+        session.onEvent?(.delegation(id: "del_1", text: "that's open after nine, um, on Friday."))
+        await settle(40)
+
+        XCTAssertEqual(fake.submissions.count, 1)
+        XCTAssertTrue(fake.submissions[0].1.contains("Find me a ramen place near the office that's open after nine, um, on Friday."))
+
+        // The model's own words still win when they say something new.
+        let parts = controller.delegationRequest(itemText: "Check the ramen place's Friday hours")
+        XCTAssertTrue(parts.request.hasPrefix("Check the ramen place's Friday hours"))
         controller.stop()
     }
 
@@ -2518,6 +2578,156 @@ extension AppStateVoiceCapabilityTests {
         XCTAssertEqual(appState.liveVoiceHostContextForTesting, ["geminiMemory", "geminiPersona"])
         appState.releaseCarPlayGeminiLive()
         XCTAssertEqual(appState.liveVoiceHostContextForTesting, [])
+    }
+
+    /// A job the ledger brings back on a bot's profile names that profile
+    /// on the client, so a cancel or submit about it after a switch still
+    /// reaches the bot (issue 2551).
+    func testARestoredJobsOwnProfileIsNamedOnTheClient() async throws {
+        let appState = makeGPTLiveAppState()
+        let client = HermesClient(connection: appState.connection!, profile: "default")
+        appState.client = client
+        var job = VoiceBackgroundJob(id: UUID(), title: "Mail", instructions: "check mail",
+                                     runtimeSessionID: "rt-bot", status: .running, startedAt: Date())
+        job.profile = "furina"
+        job.storedSessionID = "st-bot"
+        let own = VoiceBackgroundJob(id: UUID(), title: "Router", instructions: "check the router",
+                                     runtimeSessionID: "rt-own", status: .running, startedAt: Date())
+        let saved = [job, own].compactMap { SavedVoiceJob($0) }
+        XCTAssertEqual(saved.count, 2)
+        appState.defaults.set(try JSONEncoder().encode(saved), forKey: appState.voiceJobLedgerKey)
+
+        appState.scheduleVoiceJobLedgerRestore()
+        for _ in 0..<100 where appState.voiceBackgroundJobSupervisor.jobs.count < 2 { await Task.yield() }
+
+        XCTAssertEqual(appState.voiceBackgroundJobSupervisor.jobs.count, 2)
+        XCTAssertEqual(client.sessionProfile(for: "rt-bot"), "furina")
+        XCTAssertEqual(client.sessionProfile(for: "st-bot"), "furina")
+        XCTAssertNil(client.sessionProfile(for: "rt-own"), "a job on the client's own profile names none")
+        let next = HermesClient(connection: appState.connection!, profile: "work")
+        next.inheritSessionProfiles(from: client)
+        XCTAssertEqual(next.sessionProfile(for: "rt-bot"), "furina", "an ordinary switch's client inherits it")
+
+        // A restore that ran before any client existed: the client that
+        // comes later learns the profiles too (#2626's review).
+        appState.client = nil
+        let later = HermesClient(connection: try XCTUnwrap(appState.connection), profile: "default")
+        XCTAssertNil(later.sessionProfile(for: "rt-bot"))
+        appState.client = later
+        XCTAssertEqual(later.sessionProfile(for: "rt-bot"), "furina", "a client set after the restore is told")
+        XCTAssertEqual(later.sessionProfile(for: "st-bot"), "furina")
+    }
+
+    /// A live call keeps its profile once another one is on screen
+    /// (all-live stage 2): its chat, its jobs' ledger, its style and the
+    /// link to its chat stay the call's, and the bar names it. Ending it
+    /// hands voice jobs back to the profile on screen.
+    func testALiveCallKeepsItsProfileWhileAnotherIsOnScreen() {
+        let appState = makeGPTLiveAppState()
+        appState.setGPTLiveEnabled(true)
+        var homeStyle = LiveVoiceStyle()
+        homeStyle.answerLength = .concise
+        appState.setLiveVoiceStyle(homeStyle, profile: "default")
+        appState.liveCallProfile = "default"
+        appState.showGPTLiveSheet = true
+        appState.minimisedLiveVoice = .gptLive
+        let thread = VoiceThreadTarget(runtimeSessionID: "chat-1", storedSessionID: "stored-1", title: "Trip")
+        let homeLedger = appState.voiceJobLedgerKey
+        XCTAssertNil(appState.callProfileOffScreen, "Nothing to name while the call's profile is on screen")
+        XCTAssertNil(appState.callThreadProfile(thread))
+        XCTAssertEqual(appState.liveCallBarSubject(thread: "Trip"), "Trip")
+
+        appState.setActiveProfileForTesting("work")
+
+        XCTAssertEqual(appState.voiceCallProfile, "default")
+        XCTAssertEqual(appState.callProfileOffScreen, "default")
+        XCTAssertEqual(appState.callThreadProfile(thread), "default", "The call's chat is read and sent to on its profile")
+        var bot = thread
+        bot.profile = "furina"
+        XCTAssertEqual(appState.callThreadProfile(bot), "furina", "A Bot Chat stays its bot's")
+        XCTAssertEqual(appState.voiceJobLedgerKey, homeLedger, "Its jobs stay in its own profile's ledger")
+        XCTAssertEqual(appState.liveCallStyle.answerLength, .concise, "The call keeps its own style")
+        XCTAssertEqual(appState.callChatLink(.session(id: "stored-1")), .session(id: "stored-1", profile: "default"),
+                       "Opening its chat goes back to the call's profile")
+        XCTAssertEqual(appState.callChatLink(.bot(profile: "furina")), .bot(profile: "furina"))
+        let name = appState.profileDisplayName("default")
+        XCTAssertEqual(appState.liveCallBarSubject(thread: "Trip"), "\(name) · Trip", "The bar says which profile the call is on")
+        XCTAssertEqual(appState.liveCallBarSubject(thread: nil), name)
+
+        appState.closeGPTLiveConversation()
+
+        XCTAssertNil(appState.liveCallProfile)
+        XCTAssertEqual(appState.voiceCallProfile, "work", "Voice is the profile on screen's again")
+        XCTAssertNotEqual(appState.voiceJobLedgerKey, homeLedger)
+        XCTAssertNil(appState.callProfileOffScreen)
+    }
+
+    /// A call that ended off its profile while its hang-up's callback pass
+    /// is on the wire: its jobs stay its profile's until the pass ends, a
+    /// new voice start takes them back at once, and a boundary drops the
+    /// wait (all-live stage 2).
+    func testACallEndedOffItsProfileHandsItsJobsBackAfterTheHangUpsCallbackPass() async {
+        func endedOffProfile() -> (AppState, String, AsyncStream<Void>.Continuation, Task<Void, Never>) {
+            let appState = makeGPTLiveAppState()
+            appState.setGPTLiveEnabled(true)
+            appState.liveCallProfile = "default"
+            appState.showGPTLiveSheet = true
+            let homeLedger = appState.voiceJobLedgerKey
+            appState.setActiveProfileForTesting("work")
+            let (stream, release) = AsyncStream<Void>.makeStream()
+            let pass = Task { for await _ in stream { break } }
+            appState.voiceBackgroundJobSupervisor.holdCallbackSyncForTesting(pass)
+            appState.closeGPTLiveConversation()
+            XCTAssertNil(appState.liveCallProfile)
+            XCTAssertEqual(appState.callProfileHandingBack, "default")
+            XCTAssertEqual(appState.voiceCallProfile, "default", "Its jobs are still its profile's while the pass runs")
+            XCTAssertEqual(appState.voiceJobLedgerKey, homeLedger)
+            return (appState, homeLedger, release, pass)
+        }
+
+        // The pass ends: the jobs go back to the profile on screen.
+        let (waited, homeLedger, release, pass) = endedOffProfile()
+        release.yield()
+        await pass.value
+        for _ in 0..<50 where waited.callProfileHandingBack != nil { await Task.yield() }
+        XCTAssertNil(waited.callProfileHandingBack)
+        XCTAssertNil(waited.callEndedOffProfileHandBack)
+        XCTAssertEqual(waited.voiceCallProfile, "work")
+        XCTAssertNotEqual(waited.voiceJobLedgerKey, homeLedger)
+        XCTAssertNil(waited.voiceBackgroundJobSupervisor.callbackSyncInFlight)
+
+        // A new voice start doesn't wait for the pass.
+        let (started, _, releaseStarted, _) = endedOffProfile()
+        started.handBackEndedCallJobsNow()
+        XCTAssertNil(started.callProfileHandingBack)
+        XCTAssertNil(started.callEndedOffProfileHandBack, "Nothing is left to reset the new call's jobs later")
+        XCTAssertEqual(started.voiceCallProfile, "work")
+        releaseStarted.yield()
+
+        // The hand-back saves the call's ledger, with its jobs, under the
+        // call's key and not the profile on screen's (issue 2551).
+        let (seeded, seededLedger, releaseSeeded, _) = endedOffProfile()
+        let job = VoiceBackgroundJob(id: UUID(), title: "Router", instructions: "check the router",
+                                     runtimeSessionID: "rt-seed", status: .running, startedAt: Date())
+        if let saved = SavedVoiceJob(job) { seeded.voiceBackgroundJobSupervisor.restore([saved]) }
+        seeded.voiceJobLedgerRestoredKey = seededLedger
+        seeded.handBackEndedCallJobsNow()
+        XCTAssertEqual(SavedVoiceJob.decode(seeded.defaults.data(forKey: seededLedger)).map(\.runtimeSessionID), ["rt-seed"])
+        XCTAssertNotEqual(seeded.voiceJobLedgerKey, seededLedger)
+        XCTAssertTrue(SavedVoiceJob.decode(seeded.defaults.data(forKey: seeded.voiceJobLedgerKey)).isEmpty,
+                      "nothing of the call's lands in the profile on screen's ledger")
+        releaseSeeded.yield()
+
+        // A boundary drops the wait with the jobs.
+        let (retired, _, releaseRetired, retiredPass) = endedOffProfile()
+        retired.retireVoiceBackgroundJobs()
+        XCTAssertNil(retired.callProfileHandingBack)
+        XCTAssertNil(retired.callEndedOffProfileHandBack)
+        XCTAssertEqual(retired.voiceCallProfile, "work")
+        releaseRetired.yield()
+        await retiredPass.value
+        await Task.yield()
+        XCTAssertNil(retired.callProfileHandingBack)
     }
 
     func testDisconnectDropsTheHostTextOfALiveCallThatAlreadyFailed() {

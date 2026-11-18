@@ -93,8 +93,8 @@ def _job_keys(path):
 
 def _assert_cache_round_trip(tc, text, saver, label):
     """A job restores the newest DerivedData it can reach before building and
-    saves its own after the tests, never a PR's and only after a successful
-    build, with the same path list (a different list is a different cache)."""
+    saves its own only after a successful build, with the same path list (a
+    different list is a different cache)."""
     tc.assertIn("uses: actions/cache/restore@v5", text, label)
     tc.assertIn("uses: actions/cache/save@v5", text, label)
     tc.assertEqual(2, text.count(CACHE_PATH), label)
@@ -105,7 +105,7 @@ def _assert_cache_round_trip(tc, text, saver, label):
     tc.assertIn("id: build", text, label)
     tc.assertIn("steps.build.outcome == 'success'", text, label)
     tc.assertIn("steps.cache.outputs.cache-hit != 'true'", text, label)
-    tc.assertNotIn("head_ref", text, f"{label}: a PR's build must never be saved")
+    tc.assertNotIn("head_ref", text, f"{label}: the cache must not be keyed or gated by head_ref (it is empty on push events)")
     tc.assertIn(saver, text, label)
     tc.assertIn("dd-v1-$kind-$xcode-${ImageVersion:-image}", text, label)
     # The key still names the image, and the image-specific prefix is tried
@@ -132,43 +132,318 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("CI Gate", text)
         self.assertNotIn("Build & Test", text)
 
-    def test_ci_runs_for_main_and_linked_rooms(self):
-        """linked-rooms' copy runs on that branch's pushes and the PRs into
-        it as on main's, as pulse's copy does for pulse (docs/CI.md). Only
-        this branch has the test: main's copy runs for main alone and never
-        gets it, so neither does pulse."""
+    def test_ci_runs_for_main_and_long_lived_branches(self):
+        """linked-rooms' and all-live's copies run on those branches' pushes
+        and the PRs into them as on main's, as pulse's copy does for pulse
+        (docs/CI.md)."""
         text = self._workflow_text()
         triggers = text[text.index("\non:\n"):text.index("\nconcurrency:")]
-        self.assertIn("\n  push:\n    branches: [main, linked-rooms]\n  pull_request:\n", triggers)
+        self.assertIn("\n  push:\n    branches: [main, linked-rooms, all-live]\n  pull_request:\n", triggers)
         self.assertRegex(triggers.split("\n  pull_request:\n", 1)[1],
-                         r"\A(    #.*\n)*    branches: \[main, linked-rooms\]\n")
+                         r"\A(    #.*\n)*    branches: \[main, linked-rooms, all-live\]\n")
 
     def test_one_macos_job_per_run(self):
         """Runner queueing (5 concurrent macOS jobs per account) was CI v4's
         bottleneck: a PR or push run gets exactly one macOS job."""
         jobs = _job_keys(WORKFLOW)
         self.assertEqual(jobs, ["plan", "self-test", "smoke", "ci-gate"], jobs)
-        self.assertEqual(self._workflow_text().count("runs-on: macos-"), 1)
-        self.assertIn("runs-on: macos-26", self._job_text("smoke"))
+        self.assertEqual(len(re.findall(r"runs-on: (?:macos|xcode)-", self._workflow_text())), 1)
+        self.assertIn("runs-on: xcode-27", self._job_text("smoke"))
         self.assertIn("check-weak-imports.py binaries", self._job_text("smoke"))
         self.assertNotIn("matrix", self._job_text("smoke"),
                          "the smoke job must not fan out into several macOS jobs")
         self.assertNotIn("unit-shards", self._workflow_text(),
                          "the unit shards run in nightly.yml, not on every PR")
 
+    def test_every_macos_job_runs_on_the_same_image(self):
+        """Smoke, the Nightly jobs and the screenshot jobs share one runner
+        image, so an image move is one label everywhere and none is left on
+        the old Xcode (the iOS 27 SDK, issue 826)."""
+        screenshots = os.path.join(REPO_ROOT, ".github", "workflows",
+                                   "app-store-screenshots.yml")
+        labels = {}
+        for path in (WORKFLOW, NIGHTLY, screenshots):
+            for label in re.findall(r"runs-on: ((?:macos|xcode)-\S+)", _read(path)):
+                labels.setdefault(label, []).append(os.path.basename(path))
+        self.assertEqual(list(labels), ["xcode-27"], labels)
+        for path in (WORKFLOW, NIGHTLY, screenshots):
+            text = _read(path)
+            self.assertEqual(text.count("run: sudo --preserve-env=GITHUB_ENV bash scripts/ci-select-xcode.sh"),
+                             len(re.findall(r"runs-on: xcode-", text)), path)
+            self.assertNotIn("xcode-select -s /Applications/Xcode.app", text, path)
+
+    def test_a_clean_build_gets_the_longer_budget(self):
+        """The first Xcode 27 build had no cache and outran 1200 s (#2319):
+        a build that restored no cache gets 1800 s, and the nightly UI shards,
+        which never restore one, always do. The unit shards and timing repeats
+        always do too: their restored cache is a day behind and still outran
+        1200 s on Xcode 27 (2026-11-13)."""
+        expr = "BUILD_TIMEOUT_SECS: ${{ steps.cache.outputs.cache-matched-key && '1200' || '1800' }}"
+        self.assertIn(expr, self._job_text("smoke"))
+        for job in ("unit", "timing", "ui"):
+            self.assertIn('BUILD_TIMEOUT_SECS: "1800"', _job_text(NIGHTLY, job), job)
+
+    def test_a_push_saves_its_build_before_the_tests(self):
+        """A push's UI smoke runs minutes after its build; PRs opened then
+        restored an older build and recompiled main's latest merge. The save
+        sits right after the build and before every test step, and PR runs
+        save too, so a PR's next push restores its own last build."""
+        text = self._job_text("smoke")
+        save = text.index("- name: Save the build cache")
+        self.assertLess(text.index("- name: No back-deployed Date comparisons"), save)
+        self.assertLess(save, text.index("- name: Run the curated unit smoke classes"))
+        self.assertLess(save, text.index("- name: Run the curated UI smoke suite"))
+        step = text[save:text.index("- name: Run the curated unit smoke classes")]
+        # PRs save too, for their own next push; an outage never skips tests.
+        self.assertNotIn("github.event_name", step)
+        self.assertIn("continue-on-error: true", step)
+
+    @staticmethod
+    def _select_xcode(names, no_metal=(), no_download=(), empty_download=(),
+                      no_sdk=(), empty_sdk=(), default_sdk="27.0",
+                      no_watch_sdk=(), empty_watch_sdk=()):
+        """Runs ci-select-xcode.sh against fake /Applications entries with stub
+        xcode-select, xcodebuild and xcrun. An Xcode named in no_metal can't
+        run metal until a download installs it; one in no_download fails the
+        download, and one in empty_download reports success but installs
+        nothing. Xcode_<v>.app's simulator SDK is <v> (27.3.0 reads as 27.3),
+        Xcode.app's is default_sdk. A no_sdk candidate fails the simulator SDK
+        lookup, while an empty_sdk candidate succeeds without a version,
+        and every watchOS simulator SDK is 13.2 unless no_watch_sdk or
+        empty_watch_sdk makes its lookup fail or return no version.
+        Returns (exit code, the Xcode left selected, stdout, what the script
+        wrote to GITHUB_ENV)."""
+        with tempfile.TemporaryDirectory() as root:
+            apps = os.path.join(root, "Applications")
+            stubs = os.path.join(root, "bin")
+            os.mkdir(apps)
+            os.mkdir(stubs)
+            for name in names:
+                os.mkdir(os.path.join(apps, name))
+            selected = os.path.join(root, "selected")
+            installed = os.path.join(root, "installed")
+            github_env = os.path.join(root, "github_env")
+            open(installed, "w").close()
+            open(github_env, "w").close()
+            stub_text = {
+                "xcode-select": 'echo "${2##*/}" > "$SELECTED"\n',
+                "xcrun": (
+                    'if [ "$2" = watchsimulator ]; then\n'
+                    '  grep -qxFf "$SELECTED" "$NO_WATCH_SDK" && exit 1\n'
+                    '  grep -qxFf "$SELECTED" "$EMPTY_WATCH_SDK" && exit 0\n'
+                    '  echo 13.2; exit 0\n'
+                    'fi\n'
+                    'if [ "$3" = --show-sdk-version ]; then\n'
+                    '  grep -qxFf "$SELECTED" "$NO_SDK" && exit 1\n'
+                    '  grep -qxFf "$SELECTED" "$EMPTY_SDK" && exit 0\n'
+                    '  if grep -qxF Xcode.app "$SELECTED"; then echo "$DEFAULT_SDK"; exit 0; fi\n'
+                    '  sed -E "s/^Xcode_(.*)\\.app$/\\1/; s/^([0-9]+\\.[0-9]+)\\.0$/\\1/" "$SELECTED"; exit 0\n'
+                    'fi\n'
+                    'grep -qxFf "$SELECTED" "$INSTALLED" && exit 0\n'
+                    'grep -qxFf "$SELECTED" "$NO_METAL" && exit 1; exit 0\n'),
+                "xcodebuild": (
+                    'if [ "$1" = -version ]; then echo "Xcode $(cat "$SELECTED")"; exit 0; fi\n'
+                    'grep -qxFf "$SELECTED" "$NO_DOWNLOAD" && exit 70\n'
+                    'grep -qxFf "$SELECTED" "$EMPTY_DOWNLOAD" && exit 0\n'
+                    'cat "$SELECTED" >> "$INSTALLED"; exit 0\n'),
+            }
+            for tool, body in stub_text.items():
+                path = os.path.join(stubs, tool)
+                with open(path, "w") as f:
+                    f.write("#!/usr/bin/env bash\n" + body)
+                os.chmod(path, 0o755)
+            lists = {}
+            for key, entries in (("NO_METAL", no_metal), ("NO_DOWNLOAD", no_download),
+                                 ("EMPTY_DOWNLOAD", empty_download), ("NO_SDK", no_sdk),
+                                 ("EMPTY_SDK", empty_sdk), ("NO_WATCH_SDK", no_watch_sdk),
+                                 ("EMPTY_WATCH_SDK", empty_watch_sdk)):
+                lists[key] = os.path.join(root, key)
+                with open(lists[key], "w") as f:
+                    f.write("".join(e + "\n" for e in entries) or "\n")
+            proc = subprocess.run(
+                ["bash", os.path.join(SCRIPTS_DIR, "ci-select-xcode.sh")],
+                env=dict(os.environ, APPLICATIONS_DIR=apps, SELECTED=selected,
+                         INSTALLED=installed, GITHUB_ENV=github_env,
+                         DEFAULT_SDK=default_sdk,
+                         PATH=stubs + os.pathsep + os.environ["PATH"], **lists),
+                capture_output=True, text=True)
+            chosen = None
+            if os.path.exists(selected):
+                with open(selected) as f:
+                    chosen = f.read().strip()
+            with open(github_env) as f:
+                env_lines = f.read()
+            return proc.returncode, chosen, proc.stdout, env_lines
+
+    def test_select_xcode_fetches_a_missing_metal_toolchain(self):
+        """Image 20261112.0361.1's Xcode 27.3 had no Metal toolchain and every
+        build failed at CompileMetalFile (2026-11-16): the script downloads it.
+        Apple's catalog had no toolchain for that build either (the 2026-11-16
+        Nightly's timing repeat 3, "Failed fetching catalog"), so a failed
+        download, or one that leaves metal still missing, moves on to the next
+        newest release and then the default Xcode.app; the job fails only
+        when none has one."""
+        names = ["Xcode.app", "Xcode_27.2.app", "Xcode_27.3.0.app"]
+        code, chosen, out, env = self._select_xcode(names, no_metal=["Xcode_27.3.0.app"])
+        self.assertEqual((code, chosen, env), (0, "Xcode_27.3.0.app", ""), out)
+        self.assertIn("Metal toolchain downloaded", out)
+        for broken in ({"no_download": ["Xcode_27.3.0.app"]},
+                       {"empty_download": ["Xcode_27.3.0.app"]}):
+            code, chosen, out, _ = self._select_xcode(
+                names, no_metal=["Xcode_27.3.0.app"], **broken)
+            self.assertEqual((code, chosen), (0, "Xcode_27.2.app"), (broken, out))
+            self.assertIn("Metal toolchain unavailable", out)
+        both = ["Xcode_27.3.0.app", "Xcode_27.2.app"]
+        code, chosen, out, env = self._select_xcode(names, no_metal=both, no_download=both)
+        self.assertEqual((code, chosen), (0, "Xcode.app"), out)
+        self.assertEqual(env, "SIMULATOR_OS=27.0\nWATCH_SIMULATOR_OS=13.2\n", out)
+        everything = both + ["Xcode.app"]
+        code, _, out, _ = self._select_xcode(names, no_metal=everything, no_download=everything)
+        self.assertEqual(code, 1, out)
+        self.assertIn("no usable Xcode on this image has the required simulator SDKs and a working Metal toolchain", out)
+
+    def test_select_xcode_pins_the_runtime_when_it_falls_back(self):
+        """The device lookup takes the newest iOS runtime, and an image with
+        Xcode 27.3 likely carries iOS 27.3, which Xcode 27.2 doesn't build
+        for: a fallback pins SIMULATOR_OS and WATCH_SIMULATOR_OS to the
+        selected Xcode's simulator SDKs through GITHUB_ENV, which every Select
+        Xcode step keeps across sudo. The newest release's own selection pins nothing."""
+        names = ["Xcode.app", "Xcode_27.2.app", "Xcode_27.3.0.app"]
+        code, chosen, out, env = self._select_xcode(
+            names, no_metal=["Xcode_27.3.0.app"], no_download=["Xcode_27.3.0.app"])
+        self.assertEqual((code, chosen, env), (0, "Xcode_27.2.app", "SIMULATOR_OS=27.2\nWATCH_SIMULATOR_OS=13.2\n"), out)
+        self.assertIn("Simulator runtime pinned", out)
+        code, chosen, out, env = self._select_xcode(["Xcode.app"])
+        self.assertEqual((code, chosen, env), (0, "Xcode.app", ""), out)
+        # Another copy of the same SDK isn't an older Xcode: an image carried
+        # Xcode_27.3.app without a toolchain beside Xcode_27.3.0.app, and a
+        # pin to iOS 27.3 left Smoke without a device (#2627).
+        same = ["Xcode.app", "Xcode_27.2.app", "Xcode_27.3.app", "Xcode_27.3.0.app"]
+        code, chosen, out, env = self._select_xcode(
+            same, no_metal=["Xcode_27.3.app"], no_download=["Xcode_27.3.app"])
+        self.assertEqual(code, 0, out)
+        self.assertEqual((chosen, env), ("Xcode_27.3.0.app", ""), out)
+        for path in (WORKFLOW, NIGHTLY):
+            self.assertNotIn("sudo bash scripts/ci-select-xcode.sh", _read(path), path)
+        # The App Store screenshots jobs pick their devices themselves; both
+        # lookups keep only the pinned runtime when there is one.
+        screenshots = _read(os.path.join(REPO_ROOT, ".github", "workflows",
+                                         "app-store-screenshots.yml"))
+        self.assertIn('os.environ.get("SIMULATOR_OS")', screenshots)
+        self.assertIn('r.endswith("iOS-" + pin.replace(".", "-"))', screenshots)
+        self.assertIn('os.environ.get("WATCH_SIMULATOR_OS")', screenshots)
+        self.assertIn('r.endswith("watchOS-" + pin.replace(".", "-"))', screenshots)
+        # Run both embedded lookups against a simctl inventory.
+        lookups = re.findall(r"python3 -c '\n(.*?)\n\s*' \"\$", screenshots, re.S)
+        self.assertEqual(len(lookups), 2)
+        rt = "com.apple.CoreSimulator.SimRuntime."
+        inventory = json.dumps({"devices": {
+            rt + "iOS-27-2": [{"name": "iPhone 18 Pro", "udid": "ios-27-2"}],
+            rt + "iOS-27-3": [{"name": "iPhone 18 Pro", "udid": "ios-27-3"}],
+            rt + "watchOS-13-2": [{"name": "Apple Watch Ultra 4 (49mm)", "udid": "watch-13-2"}],
+            rt + "watchOS-13-3": [{"name": "Apple Watch Ultra 4 (49mm)", "udid": "watch-13-3"}],
+        }})
+        def lookup(code, name, **pins):
+            env = {k: v for k, v in os.environ.items()
+                   if k not in ("SIMULATOR_OS", "WATCH_SIMULATOR_OS")}
+            return subprocess.run(
+                ["python3", "-c", textwrap.dedent(code), name], input=inventory,
+                env=dict(env, **pins), capture_output=True, text=True).stdout.strip()
+        ios, watch = lookups
+        self.assertEqual(lookup(ios, "iPhone 18 Pro"), "ios-27-3")
+        self.assertEqual(lookup(ios, "iPhone 18 Pro", SIMULATOR_OS="27.2"), "ios-27-2")
+        self.assertEqual(lookup(watch, "Apple Watch Ultra 4"), "watch-13-3")
+        self.assertEqual(lookup(watch, "Apple Watch Ultra 4", WATCH_SIMULATOR_OS="13.2"), "watch-13-2")
+
+    def test_select_xcode_only_pins_an_older_default_sdk(self):
+        # Xcode.app can be newer than the named releases. Compare each
+        # version component numerically, including double-digit minors and
+        # a missing patch component, rather than pinning every different SDK.
+        for first, default, pin in (("27.3", "27.10", False),
+                                    ("27.3", "27.3.0", False),
+                                    ("27.10", "27.3", True),
+                                    ("27.3.2", "27.3.1", True)):
+            with self.subTest(first=first, default=default):
+                named = "Xcode_" + first + ".app"
+                code, chosen, out, env = self._select_xcode(
+                    ["Xcode.app", named], no_metal=[named], no_download=[named],
+                    default_sdk=default)
+                expected = "SIMULATOR_OS=" + default + "\nWATCH_SIMULATOR_OS=13.2\n" if pin else ""
+                self.assertEqual((code, chosen, env), (0, "Xcode.app", expected), out)
+                self.assertEqual("Simulator runtime pinned" in out, pin, out)
+
+    def test_select_xcode_skips_a_candidate_without_a_simulator_sdk(self):
+        names = ["Xcode.app", "Xcode_27.2.app", "Xcode_27.3.app"]
+        for failure in ("no_sdk", "empty_sdk"):
+            with self.subTest(failure=failure):
+                code, chosen, out, env = self._select_xcode(
+                    names, no_metal=["Xcode_27.3.app"],
+                    **{failure: ["Xcode_27.3.app"]})
+                self.assertEqual((code, chosen, env), (0, "Xcode_27.2.app", ""), out)
+                self.assertIn("no iphonesimulator SDK", out)
+                self.assertNotIn("downloading it", out)
+            # A broken middle candidate must not replace the first valid SDK
+            # used to decide whether the eventual fallback needs a pin.
+            with self.subTest(failure=failure, middle=True):
+                code, chosen, out, env = self._select_xcode(
+                    names, no_metal=["Xcode_27.3.app"], no_download=["Xcode_27.3.app"],
+                    **{failure: ["Xcode_27.2.app"]})
+                self.assertEqual((code, chosen, env),
+                                 (0, "Xcode.app", "SIMULATOR_OS=27.0\nWATCH_SIMULATOR_OS=13.2\n"), out)
+                self.assertIn("no iphonesimulator SDK", out)
+            with self.subTest(failure=failure, all_candidates=True):
+                code, _, out, env = self._select_xcode(names, **{failure: names})
+                self.assertEqual((code, env), (1, ""), out)
+                self.assertIn("no usable Xcode on this image has the required simulator SDKs", out)
+
+    def test_select_xcode_skips_a_fallback_without_a_watch_simulator_sdk(self):
+        names = ["Xcode.app", "Xcode_27.2.app", "Xcode_27.3.app"]
+        for failure in ("no_watch_sdk", "empty_watch_sdk"):
+            with self.subTest(failure=failure):
+                code, chosen, out, env = self._select_xcode(
+                    names, no_metal=["Xcode_27.3.app"], no_download=["Xcode_27.3.app"],
+                    **{failure: ["Xcode_27.2.app"]})
+                self.assertEqual((code, chosen, env),
+                                 (0, "Xcode.app", "SIMULATOR_OS=27.0\nWATCH_SIMULATOR_OS=13.2\n"), out)
+                self.assertIn("no watchsimulator SDK", out)
+            with self.subTest(failure=failure, all_fallbacks=True):
+                code, _, out, env = self._select_xcode(
+                    names, no_metal=["Xcode_27.3.app"], no_download=["Xcode_27.3.app"],
+                    **{failure: ["Xcode_27.2.app", "Xcode.app"]})
+                self.assertEqual((code, env), (1, ""), out)
+                self.assertIn("no watchsimulator SDK", out)
+
+    def test_select_xcode_takes_the_newest_release(self):
+        """The image's default Xcode.app lagged its newest release (27.1
+        beside 27.2 and the iOS 27.2 runtime the device lookup picks); betas
+        and release candidates never count."""
+        def pick(names):
+            code, chosen, out, _ = self._select_xcode(names)
+            self.assertEqual(code, 0, out)
+            return chosen
+        self.assertEqual(pick(["Xcode.app", "Xcode_27.app", "Xcode_27.1.app",
+                               "Xcode_27.2.app", "Xcode_27.2_Release_Candidate.app",
+                               "Xcode_27.3_beta.app", "Xcode_27.10_beta.app"]),
+                         "Xcode_27.2.app")
+        self.assertEqual(pick(["Xcode.app", "Xcode_27.9.app", "Xcode_27.10.app"]),
+                         "Xcode_27.10.app")
+        self.assertEqual(pick(["Xcode.app", "Xcode_27.3_beta.app"]), "Xcode.app")
+
     def test_a_pr_run_never_waits_for_its_superseded_run(self):
         """A PR from this repository gets a concurrency group of its own run,
         and its plan job cancels the PR's older runs first, so the new run
         never waits for a cancelled Smoke job to wind down (Eric, 2026-11-02).
         A fork PR, whose token can't cancel, keeps cancel-in-progress per PR;
-        a push keeps a group per commit, so every merge gets a full run."""
+        a branch's pushes share a group by ref without cancelling, so one run
+        goes on and only the newest push waits (Eric, 2026-11-15)."""
         text = self._workflow_text()
         same_repo = ("github.event_name == 'pull_request' && "
                      "github.event.pull_request.head.repo.full_name == github.repository")
         self.assertIn(
             f"group: ci-${{{{ github.workflow }}}}-${{{{ ({same_repo}) && format('run-{{0}}', github.run_id)"
-            " || github.event.pull_request.number || github.sha }}", text)
-        self.assertIn("cancel-in-progress: true", text)
+            " || github.event.pull_request.number || github.ref }}", text)
+        self.assertIn("cancel-in-progress: ${{ github.event_name == 'pull_request' }}", text,
+                      "a fork PR cancels its older run; a push's run under way finishes")
         plan = self._job_text("plan")
         self.assertIn("actions: write", plan)
         first_step = plan.index("- name: Cancel this PR's older runs")
@@ -181,7 +456,7 @@ class WorkflowContractTests(unittest.TestCase):
                       "never a fork's run on a branch of the same name")
         self.assertIn('(.pull_requests | length) == 1 and .pull_requests[0].number == $PR_NUMBER'
                       ' and .pull_requests[0].base.ref == \\"$BASE_REF\\"', plan,
-                      "only this PR's runs: a branch with PRs into main and linked-rooms runs for each")
+                      "only this PR's runs: a branch with PRs into main and linked-rooms or all-live runs for each")
         self.assertIn('actions/runs/$id/cancel', plan)
 
     def _cancel_step_script(self):
@@ -270,6 +545,7 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("check-fixed-text-sizes.py", checks)
         self.assertIn("check-weak-imports.py targets", checks)
         self.assertIn("check-transcript-environment.py", checks)
+        self.assertIn("check-hand-written-equality.py", checks)
         self.assertIn("check-plugin-version.py", checks)
         self.assertIn("check-card-schema.py", checks)
         self.assertIn("check-feature-map.py", checks)
@@ -318,10 +594,133 @@ class WorkflowContractTests(unittest.TestCase):
         # A Swift file moved to docs/ lists its old name too, so it builds.
         self.assertFalse(skips("Conduit/X.swift", "docs/X.md"))
 
+    def _needs_build_script(self):
+        step = _step_text(self._job_text("plan"), "Does the change need the macOS build")
+        lines = step.splitlines()
+        run = next(i for i, l in enumerate(lines) if l.strip() == "run: |")
+        indent = len(lines[run]) - len(lines[run].lstrip())
+        body = []
+        for line in lines[run + 1:]:
+            if line.strip() and len(line) - len(line.lstrip()) <= indent:
+                break
+            body.append(line)
+        return textwrap.dedent("\n".join(body))
+
+    def test_a_one_commit_push_of_docs_skips_smoke(self):
+        """A push runs the step against the branch's tip before it: one commit
+        of only docs and config skips the macOS job, and anything else (code,
+        this workflow, several commits, a new branch) builds (2026-11-15: docs
+        merges to main each held a macOS runner for half an hour). A docs push
+        after a push whose run never passed (cancelled while it waited) builds,
+        since that push was never built."""
+        if not shutil.which("git"):
+            self.skipTest("git not installed")
+        script = self._needs_build_script()
+
+        if not shutil.which("jq"):
+            self.skipTest("jq not installed")
+
+        def smoke_for(paths, before="parent", event="push", before_runs=("success",), shape="squash"):
+            """before_runs: the conclusions of the push runs GitHub lists for
+            the previous commit (None: the lookup fails). shape: "squash" (one
+            commit), "two" (two commits pushed at once, PUSH_BEFORE the older
+            parent) or "merge" (a merge commit whose second parent holds paths)."""
+            with tempfile.TemporaryDirectory() as tmp:
+                # A stub gh logs its arguments and runs the step's own --jq on
+                # a runs listing, as the API would answer the query.
+                bindir = os.path.join(tmp, ".bin")
+                os.makedirs(bindir)
+                fixture = os.path.join(tmp, ".runs.json")
+                with open(fixture, "w") as f:
+                    json.dump({"workflow_runs": [{"conclusion": c} for c in (before_runs or ())]}, f)
+                calls = os.path.join(tmp, ".gh-calls")
+                with open(os.path.join(bindir, "gh"), "w") as f:
+                    f.write(textwrap.dedent(f"""\
+                        #!/usr/bin/env bash
+                        printf '%s\\n' "$*" >> {calls}
+                        {"exit 1" if before_runs is None else ""}
+                        while [ $# -gt 0 ]; do
+                          if [ "$1" = --jq ]; then jq -r "$2" {fixture}; exit; fi
+                          shift
+                        done
+                        exit 1
+                        """))
+                os.chmod(os.path.join(bindir, "gh"), 0o755)
+
+                def git(*args):
+                    return subprocess.run(["git", "-C", tmp, *args], check=True,
+                                          capture_output=True, text=True).stdout.strip()
+
+                def commit(files, message):
+                    for path in files:
+                        full = os.path.join(tmp, path)
+                        os.makedirs(os.path.dirname(full) or tmp, exist_ok=True)
+                        with open(full, "a") as f:
+                            f.write(message)
+                    git("add", "-A")
+                    git("commit", "-qm", message)
+                    return git("rev-parse", "HEAD")
+
+                git("init", "-q", "-b", "main")
+                git("config", "user.email", "ci@example.com")
+                git("config", "user.name", "ci")
+                parent = commit(["seed"], "seed")
+                if shape == "two":
+                    commit(["docs/first.md"], "first")
+                    commit(paths, "change")
+                elif shape == "merge":
+                    git("checkout", "-q", "-b", "topic")
+                    commit(paths, "change")
+                    git("checkout", "-q", "main")
+                    parent = commit(["docs/base.md"], "base")
+                    git("merge", "-q", "--no-ff", "-m", "merge", "topic")
+                else:
+                    commit(paths, "change")
+                output = os.path.join(tmp, ".out")
+                env = dict(os.environ, PATH=f"{bindir}:{os.environ['PATH']}", GITHUB_REPOSITORY="k/conduit",
+                           EVENT=event, PR_HEAD="", PR_NUMBER="", BASE_REF="",
+                           PUSH_BEFORE={"parent": parent, "other": "0" * 40, "none": ""}[before],
+                           GITHUB_OUTPUT=output, GITHUB_STEP_SUMMARY=os.path.join(tmp, ".summary"))
+                result = subprocess.run(["bash", "-c", script], cwd=tmp, env=env,
+                                        capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                if os.path.exists(calls):
+                    with open(calls) as f:
+                        for call in f.read().splitlines():
+                            self.assertIn("repos/k/conduit/actions/workflows/ci.yml/runs", call)
+                            self.assertIn("-f event=push", call)
+                            self.assertIn(f"-f head_sha={parent}", call, "the previous commit's runs")
+                with open(output) as f:
+                    return f.read().strip()
+
+        self.assertEqual(smoke_for(["docs/FEATURE_MAP.md", "README.md"]), "smoke=false")
+        self.assertEqual(smoke_for([".github/workflows/nightly.yml"]), "smoke=false")
+        # Any passing run of the previous commit counts, beside failed reruns.
+        self.assertEqual(smoke_for(["docs/x.md"], before_runs=("failure", "success")), "smoke=false")
+        for paths in (["Conduit/App.swift"], ["docs/x.md", "scripts/ci-gate.py"],
+                      [".github/workflows/ci.yml"], ["Conduit/Resources/Help.md"]):
+            self.assertEqual(smoke_for(paths), "smoke=true", paths)
+        # The previous commit's push run was cancelled while it waited (no
+        # passing run), failed, or GitHub can't say: that commit was never built.
+        self.assertEqual(smoke_for(["docs/x.md"], before_runs=("cancelled",)), "smoke=true")
+        self.assertEqual(smoke_for(["docs/x.md"], before_runs=("failure",)), "smoke=true")
+        self.assertEqual(smoke_for(["docs/x.md"], before_runs=()), "smoke=true")
+        self.assertEqual(smoke_for(["docs/x.md"], before_runs=None), "smoke=true")
+        # A merge commit into linked-rooms or all-live reads everything it
+        # brings in: docs only skips, code from the second parent builds.
+        self.assertEqual(smoke_for(["docs/x.md"], shape="merge"), "smoke=false")
+        self.assertEqual(smoke_for(["Conduit/App.swift"], shape="merge"), "smoke=true")
+        # Several commits pushed at once (even all docs), or a new branch, build.
+        self.assertEqual(smoke_for(["docs/x.md"], shape="two"), "smoke=true")
+        self.assertEqual(smoke_for(["docs/x.md"], before="other"), "smoke=true")
+        self.assertEqual(smoke_for(["docs/x.md"], before="none"), "smoke=true")
+        # A PR event with no merge commit of this PR builds.
+        self.assertEqual(smoke_for(["docs/x.md"], event="pull_request"), "smoke=true")
+
     def test_the_feature_map_check_knows_the_pr_and_its_base(self):
         """On a PR, an entry it edits names it on its Checked line: the step
         passes the PR's number and the base's map (HEAD^1 of the merge commit),
-        and for a PR into pulse or linked-rooms, main's maps where the PR and
+        and for a PR into pulse, linked-rooms or all-live, main's maps where the PR and
         its base meet main, so the entries a merge of main brings in keep
         main's Checked lines."""
         step = _step_text(self._job_text("self-test"), "Feature map paths exist")
@@ -385,10 +784,14 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("if: ${{ !cancelled() && steps.build.outcome == 'success' && github.event_name == 'push' }}", remove)
         unit = _step_text(self._job_text("smoke"), "Run the curated unit smoke classes")
         self.assertNotIn("if:", unit, "the unit step runs only after a good build")
-        self.assertNotIn("continue-on-error", self._job_text("smoke"),
+        # A failed step fails the job; only the cache save may fail quietly
+        # (an Actions cache outage is no verdict on the change).
+        job = self._job_text("smoke")
+        save = _step_text(job, "Save the build cache")
+        self.assertEqual(job.count("continue-on-error"), save.count("continue-on-error"),
                          "a failed step must fail the job")
 
-    def test_unit_smoke_step_runs_the_curated_classes_once_without_retry(self):
+    def test_unit_smoke_step_runs_the_curated_classes_once_and_retries_no_test(self):
         unit = _step_text(self._job_text("smoke"), "Run the curated unit smoke classes")
         self.assertIn('UNIT_CLASSES: "${{ needs.plan.outputs.unit-csv }}"', unit)
         self.assertIn("-only-testing:ConduitTests/", unit)
@@ -401,7 +804,10 @@ class WorkflowContractTests(unittest.TestCase):
             self.assertIn(flag, unit)
         self.assertIn('UNIT_TEST_ALLOWANCE_S: "180"', unit)
         # A genuine assertion must FAIL the run: no Xcode-native retry, and no
-        # job-level retry either.
+        # job-level retry either. The one second invocation is for a
+        # simulator runtime lost before any test ran, and only the recovery
+        # script decides that.
+        self.assertIn('bash scripts/ci-recover-lost-runtime.sh "$UNIT_SMOKE_LOG"', unit)
         self.assertNotIn("-test-iterations", unit)
         self.assertNotIn("-retry-tests-on-failure", unit)
         self.assertNotIn("smoke-retry-classes.py", unit)
@@ -427,14 +833,12 @@ class WorkflowContractTests(unittest.TestCase):
 
     def test_smoke_job_builds_incrementally_and_pushes_save_the_full_build(self):
         """The smoke job restores the newest DerivedData it can reach (main's,
-        and on a PR into pulse or linked-rooms that branch's) before
-        building, and saves its own only on pushes (to main, and in pulse's
-        and linked-rooms' copies to that branch; always the full app there),
-        after a successful build, with the same path list (a different list
-        is a different cache)."""
+        and on a PR into pulse, linked-rooms or all-live that branch's) before
+        building, and saves its own on every run (a push for later PRs, a PR
+        for its own next push; always the full app), after a successful build,
+        with the same path list (a different list is a different cache)."""
         text = self._job_text("smoke")
-        _assert_cache_round_trip(self, text, "github.event_name == 'push'", "smoke")
-        self.assertIn("&& github.event_name == 'push'\n", text)
+        _assert_cache_round_trip(self, text, "continue-on-error: true", "smoke")
         build = _read(os.path.join(SCRIPTS_DIR, "ci-build-for-testing.sh"))
         self.assertIn("ci-normalize-mtimes.py", build)
         self.assertIn("IgnoreFileSystemDeviceInodeChanges", build)
@@ -1087,12 +1491,21 @@ class SmokeSelectionTests(unittest.TestCase):
         proc, doc = self._changed_selection(
             ["Conduit/Services/AppState+PendingSend.swift"])
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        # #1154 changed AppState.swift and broke this class, which then
-        # failed only at night.
-        self.assertIn("AppStateChatResumeTests", doc["changed_unit"])
+        # #1154 changed AppState.swift and broke an AppState class, which
+        # then failed only at night: an AppState extension brings in its
+        # family, cheapest first, as far as the budget reaches. With the
+        # baseline measured (#2666) the 35 s AppStateChatResumeTests no
+        # longer fits beside its cheaper siblings and runs at night.
         self.assertIn("AppStateMultiDashboardTests", doc["changed_unit"])
+        self.assertIn("AppStateChatResumeTests", doc["changed_skipped"])
+        self.assertGreaterEqual(len(doc["changed_unit"]), 5)
         for name in doc["changed_unit"]:
             self.assertTrue(name.startswith("AppState"), name)
+        with open(os.path.join(SCRIPTS_DIR, "test-timings.json"), encoding="utf-8") as fh:
+            baseline = json.load(fh)["classes"]
+        with open(os.path.join(SCRIPTS_DIR, "smoke-suite.json"), encoding="utf-8") as fh:
+            budget = json.load(fh)["changed_budget_s"]
+        self.assertLessEqual(sum(baseline.get(n, 3.0) for n in doc["changed_unit"]), budget)
 
     def test_a_family_member_does_not_crowd_out_the_changes_own_class(self):
         def mutate(suite):

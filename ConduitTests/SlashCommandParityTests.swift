@@ -39,8 +39,8 @@ extension ComposerDraftStoreTests {
 
     func testCatalogLeavesOutCommandsHermesRefusesForConduit() {
         let names = Set(AppState.normalizedSlashCatalog(Self.catalog).map(\.name))
-        XCTAssertTrue(names.isSuperset(of: ["steer", "goal", "fast", "stop", "queue", "undo"]))
-        XCTAssertTrue(names.isDisjoint(with: ["save", "skin", "agents", "rollback", "tools"]))
+        XCTAssertTrue(names.isSuperset(of: ["steer", "goal", "fast", "stop", "queue", "undo", "agents"]))
+        XCTAssertTrue(names.isDisjoint(with: ["save", "skin", "tools"]))
         XCTAssertEqual(
             AppState.normalizedSlashCatalog(Self.catalog).first { $0.name == "steer" }?.aliases,
             ["s"]
@@ -192,12 +192,28 @@ extension ComposerDraftStoreTests {
                     .object(["type": .string("text"), "text": .string("look")]),
                     .object(["type": .string("image_url"), "image_url": .object([:])])
                 ])]),
-                .object(["role": .string("user"), "row_id": .number(7), "content": .string("summary"), "_compressed_summary": .bool(true)])
+                .object(["role": .string("user"), "row_id": .number(7), "content": .string("summary"), "_compressed_summary": .bool(true)]),
+                // Notes a compaction's projection handed back untyped
+                // (their row carried the summary): nobody typed them.
+                .object(["role": .string("user"), "row_id": .number(8),
+                         "content": .string("[Cron job \"Backups\" report: shown in the chat, no reply asked for]\n\nAll green"),
+                         "display_metadata": .object(["completion_note": .array([.string("cron:1")])])]),
+                .object(["role": .string("user"), "row_id": .number(9), "content": .string("Agent finished"),
+                         "display_metadata": .object(["completion_admission": .string("a1")])]),
+                // A null admission is no stamp, and a report the user
+                // pasted as their own message is their turn.
+                .object(["role": .string("user"), "row_id": .number(10), "content": .string("mine"),
+                         "display_metadata": .object(["completion_admission": .null])]),
+                .object(["role": .string("user"), "row_id": .number(11),
+                         "content": .string("[Cron job \"Backups\" report: shown in the chat, no reply asked for]\n\nlook at this")])
             ])
         ]
         let snapshot = SessionRewindSnapshot(resume: resume)
-        XCTAssertEqual(snapshot.turns.map(\.rowID), [1, 5, 6])
-        XCTAssertEqual(snapshot.turns.map(\.text), ["hello", "go left", nil])
+        XCTAssertEqual(snapshot.turns.map(\.rowID), [1, 5, 6, 10, 11])
+        XCTAssertEqual(snapshot.turns.map(\.text), [
+            "hello", "go left", nil, "mine",
+            "[Cron job \"Backups\" report: shown in the chat, no reply asked for]\n\nlook at this"
+        ])
         XCTAssertEqual(snapshot.revision, 9)
         XCTAssertEqual(snapshot.generation, 3)
     }
@@ -227,6 +243,26 @@ extension ComposerDraftStoreTests {
         XCTAssertEqual(
             SessionRewindSnapshot.text(of: .string("redo this\n\n<memory-context>\nrecalled\n</memory-context>")),
             "redo this"
+        )
+    }
+
+    func testDashboardUndoAnswerReadsAsARewindOnlyWhenItIsAPrefill() {
+        XCTAssertEqual(
+            SessionRewindReceipt(undoPrefill: .object([
+                "type": .string("prefill"),
+                "message": .string("two"),
+                "notice": .string("↶ Undid 2 turns (4 message(s)). Edit and resubmit, or send a new message.")
+            ])),
+            SessionRewindReceipt(rewoundCount: 4, text: "two")
+        )
+        XCTAssertEqual(
+            SessionRewindReceipt(undoPrefill: .object(["type": .string("exec"), "output": .string("done")])),
+            SessionRewindReceipt(rewoundCount: 0, text: nil),
+            "an answer that isn't /undo's prefill took nothing back Conduit can tell"
+        )
+        XCTAssertEqual(
+            SessionRewindSnapshot(resume: ["session_id": .string("4c124a08"), "messages": .array([])]).runtimeSessionID,
+            "4c124a08"
         )
     }
 

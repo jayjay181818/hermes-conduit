@@ -178,6 +178,26 @@ extension GroupChatModelsTests {
         list.adopt(other)
         XCTAssertEqual(list.invites.first?.id, "lk9z8y7x6w5v/conduit-1", "the same room over another Link is another invite")
         XCTAssertEqual(list.invites.count, invites.count + 1)
+
+        // Just me: offered where the host's plugin takes it, and kept once joined that way.
+        XCTAssertFalse(joined.justMe)
+        XCTAssertFalse(joined.justMeOffered, "an older plugin says nothing")
+        var alone = invitesInvite("conduit-1", status: "joined")
+        alone["just_me"] = true
+        alone["just_me_offered"] = true
+        let justMe = try XCTUnwrap(RoomInvitesClient.invite(alone))
+        XCTAssertTrue(justMe.justMe)
+        XCTAssertTrue(justMe.justMeOffered)
+        XCTAssertTrue(justMe.joined.isEmpty)
+
+        // Removed on the Hermes (plugin 0.177.23): no row on any phone,
+        // whatever this one dismissed; an older plugin says nothing.
+        XCTAssertFalse(try XCTUnwrap(RoomInvitesClient.invite(invitesInvite("conduit-4", status: "cancelled"))).removed)
+        var gone = invitesInvite("conduit-4", status: "cancelled", reason: "withdrawn")
+        gone["removed"] = true
+        let removedHere = try XCTUnwrap(RoomInvitesClient.invite(gone))
+        XCTAssertTrue(removedHere.removed)
+        XCTAssertTrue(RoomInviteRows.rows([removedHere], dismissed: []).isEmpty)
     }
 
     // MARK: - Answering
@@ -278,17 +298,17 @@ extension GroupChatModelsTests {
         XCTAssertEqual(RoomInvitesClient.message(for: DashboardTicketBridgeError.http(status: 404, detail: notLinked)), notLinked)
         let answered = "This invite has been answered"
         XCTAssertEqual(RoomInvitesClient.answerRefusal(for: DashboardTicketBridgeError.http(status: 409, detail: answered), joining: true),
-                       AppLocalization.string("Could not join: \(answered)"))
+                       AppLocalization.string("Could not join: \(answered)", table: .rooms))
         let lapsed = "This invite ran out"
         XCTAssertEqual(RoomInvitesClient.answerRefusal(for: DashboardTicketBridgeError.http(status: 410, detail: lapsed), joining: false),
-                       AppLocalization.string("Could not decline: \(lapsed)"))
+                       AppLocalization.string("Could not decline: \(lapsed)", table: .rooms))
         // A 504: the answer is still on its way over the mailbox.
         let timedOut = DashboardTicketBridgeError.http(
             status: 504, detail: "The rooms mailbox didn't answer in time; look at the room again in a minute")
         XCTAssertEqual(RoomInvitesClient.answerRefusal(for: timedOut, joining: true),
-                       AppLocalization.string("Your Hermes is still sending your answer. The invite shows it once it has."))
+                       AppLocalization.string("Your Hermes is still sending your answer. The invite shows it once it has.", table: .rooms))
         XCTAssertEqual(RoomInvitesClient.answerRefusal(for: timedOut, joining: false),
-                       AppLocalization.string("Your Hermes is still sending your answer. The invite shows it once it has."))
+                       AppLocalization.string("Your Hermes is still sending your answer. The invite shows it once it has.", table: .rooms))
     }
 
     // MARK: - What it says
@@ -300,28 +320,35 @@ extension GroupChatModelsTests {
             )))
         }
         let furina = "Furina"
-        let someone = AppLocalization.string("Someone you've linked with")
-        XCTAssertEqual(try line("waiting"), AppLocalization.string("\(furina) invited you"))
-        XCTAssertEqual(try line("waiting", from: ""), AppLocalization.string("\(someone) invited you"))
-        XCTAssertEqual(try line("joined"), AppLocalization.string("You joined, waiting for the room to start"))
-        XCTAssertEqual(try line("started"), AppLocalization.string("Started with your agents in it"))
-        XCTAssertEqual(try line("lapsed"), AppLocalization.string("The invite ran out"))
+        let someone = AppLocalization.string("Someone you've linked with", table: .rooms)
+        XCTAssertEqual(try line("waiting"), AppLocalization.string("\(furina) invited you", table: .rooms))
+        XCTAssertEqual(try line("waiting", from: ""), AppLocalization.string("\(someone) invited you", table: .rooms))
+        XCTAssertEqual(try line("joined"), AppLocalization.string("You joined, waiting for the room to start", table: .rooms))
+        XCTAssertEqual(try line("started"), AppLocalization.string("Started with your agents in it", table: .rooms))
+        var alone = try XCTUnwrap(RoomInvitesClient.invite(invitesInvite("conduit-1", from: furina, status: "started", reason: nil)))
+        alone.justMe = true
+        XCTAssertEqual(RoomInviteText.line(for: alone),
+                       AppLocalization.string("Started, and you're in it without your agents", table: .rooms))
+        var leftAlone = try XCTUnwrap(RoomInvitesClient.invite(invitesInvite("conduit-1", from: furina, status: "left", reason: "left")))
+        leftAlone.justMe = true
+        XCTAssertEqual(RoomInviteText.line(for: leftAlone), AppLocalization.string("You left", table: .rooms))
+        XCTAssertEqual(try line("lapsed"), AppLocalization.string("The invite ran out", table: .rooms))
         XCTAssertEqual(try line("declined"), AppLocalization.string("You declined"))
-        XCTAssertEqual(try line("left", reason: "left"), AppLocalization.string("Your agents left"))
+        XCTAssertEqual(try line("left", reason: "left"), AppLocalization.string("Your agents left", table: .rooms))
         // Why it was called off, before it started.
-        XCTAssertEqual(try line("cancelled", reason: "withdrawn"), AppLocalization.string("\(furina) took it back"))
-        XCTAssertEqual(try line("cancelled", reason: "withdrawn", from: ""), AppLocalization.string("\(someone) took it back"))
-        XCTAssertEqual(try line("cancelled", reason: "lapsed"), AppLocalization.string("It ran out before the room started"))
-        XCTAssertEqual(try line("cancelled", reason: "too_few"), AppLocalization.string("Too few joined, so it didn't start"))
-        XCTAssertEqual(try line("cancelled", reason: "start_failed"), AppLocalization.string("Their Hermes couldn't start it"))
+        XCTAssertEqual(try line("cancelled", reason: "withdrawn"), AppLocalization.string("\(furina) took it back", table: .rooms))
+        XCTAssertEqual(try line("cancelled", reason: "withdrawn", from: ""), AppLocalization.string("\(someone) took it back", table: .rooms))
+        XCTAssertEqual(try line("cancelled", reason: "lapsed"), AppLocalization.string("It ran out before the room started", table: .rooms))
+        XCTAssertEqual(try line("cancelled", reason: "too_few"), AppLocalization.string("Too few joined, so it didn't start", table: .rooms))
+        XCTAssertEqual(try line("cancelled", reason: "start_failed"), AppLocalization.string("Their Hermes couldn't start it", table: .rooms))
         XCTAssertEqual(try line("cancelled", reason: "refused"),
-                       AppLocalization.string("It started, but your agents couldn't be added"))
-        XCTAssertEqual(try line("cancelled", reason: "started_without_you"), AppLocalization.string("It started without you"))
-        XCTAssertEqual(try line("cancelled", reason: "later"), AppLocalization.string("It was called off"))
+                       AppLocalization.string("It started, but your agents couldn't be added", table: .rooms))
+        XCTAssertEqual(try line("cancelled", reason: "started_without_you"), AppLocalization.string("It started without you", table: .rooms))
+        XCTAssertEqual(try line("cancelled", reason: "later"), AppLocalization.string("It was called off", table: .rooms))
         // Why it ended, once it had started.
-        XCTAssertEqual(try line("ended", reason: "removed"), AppLocalization.string("\(furina) took your agents out"))
-        XCTAssertEqual(try line("ended", reason: "disbanded"), AppLocalization.string("\(furina) ended the room"))
-        XCTAssertEqual(try line("ended", reason: "later"), AppLocalization.string("It ended"))
+        XCTAssertEqual(try line("ended", reason: "removed"), AppLocalization.string("\(furina) took your agents out", table: .rooms))
+        XCTAssertEqual(try line("ended", reason: "disbanded"), AppLocalization.string("\(furina) ended the room", table: .rooms))
+        XCTAssertEqual(try line("ended", reason: "later"), AppLocalization.string("It ended", table: .rooms))
     }
 
     func testRoomChoicesReadTakesPartAndTurnsADay() throws {
@@ -443,6 +470,40 @@ extension GroupChatModelsTests {
         XCTAssertEqual(appState.linkedRoomInviteRows, [], "the read from before the sign-out is dropped")
     }
 
+    /// Removing a finished invite removes it on the Hermes too, where the
+    /// plugin takes that, so every phone stops listing it; one waiting on
+    /// you stays, and an older plugin is only asked nothing.
+    @MainActor
+    func testRemovingAFinishedInviteRemovesItOnTheHermes() async {
+        let routes = InvitesRoutes(invites: [
+            invitesInvite("conduit-1", status: "cancelled", reason: "withdrawn"),
+            invitesInvite("conduit-2"),
+        ])
+        let appState = invitesAppState(routes)
+        invitesConnect(appState)
+        await appState.refreshGroupChatSupport()
+        appState.applyNotifierPluginReport(invitesPluginReport)
+        await invitesWait("the invites read", until: { appState.linkedRoomInviteRows.count == 2 })
+        let finished = "lk1a2b3c4d5e6f/conduit-1"
+
+        // An older plugin: hidden on this phone only.
+        appState.dismissRoomInvite(finished)
+        XCTAssertEqual(appState.linkedRoomInviteRows.map(\.roomID), ["conduit-2"])
+        try? await Task.sleep(for: .milliseconds(50))
+        XCTAssertEqual(routes.removes, [])
+
+        var report = invitesPluginReport
+        report["capabilities"] = [RoomInvitesClient.capability, RoomInvitesClient.removeCapability]
+        appState.applyNotifierPluginReport(report)
+        appState.dismissRoomInvite(finished)
+        await invitesWait("the remove", until: { appState.linkedRoomInvite(finished)?.removed == true })
+        XCTAssertEqual(routes.removes, ["conduit-1"])
+        // One waiting on you isn't removed anywhere.
+        appState.dismissRoomInvite("lk1a2b3c4d5e6f/conduit-2")
+        try? await Task.sleep(for: .milliseconds(50))
+        XCTAssertEqual(routes.removes, ["conduit-1"])
+    }
+
     /// A room on its way when Conduit connects (an invite you joined, read
     /// by the connection's own reads) is followed, though no foreground
     /// read or answer started a follow.
@@ -540,6 +601,63 @@ extension GroupChatModelsTests {
         XCTAssertNil(appState.linkedRoomInviteFollow, "no follow for a list a disconnect cleared mid-refresh")
     }
 
+    /// An invites read, or a tapped invite's, made before a Block that
+    /// answers after it brings back nothing the Block took away: the list
+    /// is dropped, and the tapped one is read again (issue 2347).
+    @MainActor
+    func testAnInvitesReadABlockOvertookIsDropped() async throws {
+        let backend = InMemoryKeychainBackend()
+        KeychainHelper.useBackendForTesting(backend)
+        defer { KeychainHelper.useBackendForTesting(KeychainHelper.SystemKeychainBackend()) }
+        let routes = InvitesRoutes(invites: [invitesInvite("conduit-1")])
+        let appState = invitesAppState(routes)
+        invitesConnect(appState)
+        await appState.refreshGroupChatSupport()
+        appState.applyNotifierPluginReport(invitesPluginReport)
+        await invitesWait("the first read", until: { appState.linkedRoomInviteRows.map(\.roomID) == ["conduit-1"] })
+
+        routes.holdsNextRead = true
+        let before = Task { @MainActor in await appState.readLinkedRoomInvites() }
+        await invitesWait("the held read", until: { routes.holding })
+        // The Block takes the host's invite away: the plugin lists it no more.
+        routes.invites = []
+        let reads = routes.invitesReads
+        let removed = try await appState.block(RoomBlockTarget(id: "lk-mona", name: "Mona"))
+        XCTAssertTrue(removed)
+        XCTAssertEqual(routes.unlinks, 1)
+        XCTAssertGreaterThan(routes.invitesReads, reads, "Block reads the invites again itself")
+        XCTAssertEqual(appState.linkedRoomInviteRows, [])
+        routes.answerHeldRead()
+        let kept = await before.value
+        XCTAssertFalse(kept, "the read from before the Block is dropped")
+        XCTAssertEqual(appState.linkedRoomInviteRows, [], "the blocked host's invite stays gone")
+    }
+
+    @MainActor
+    func testATappedInviteReadABlockOvertookOpensNothing() async throws {
+        let backend = InMemoryKeychainBackend()
+        KeychainHelper.useBackendForTesting(backend)
+        defer { KeychainHelper.useBackendForTesting(KeychainHelper.SystemKeychainBackend()) }
+        let routes = InvitesRoutes(invites: [invitesInvite("conduit-1")])
+        let appState = invitesAppState(routes)
+        invitesConnect(appState)
+        await appState.refreshGroupChatSupport()
+        appState.applyNotifierPluginReport(invitesPluginReport)
+        await invitesWait("the first read", until: { appState.linkedRoomInviteRows.map(\.roomID) == ["conduit-1"] })
+
+        routes.holdsNextRead = true
+        let tapped = RoomInviteTarget(link: "lk1a2b3c4d5e6f", roomID: "conduit-1", dashboardID: appState.activeDashboardID)
+        let opening = Task { @MainActor in await appState.openRoomInvite(tapped) }
+        await invitesWait("the held read", until: { routes.holding })
+        routes.invites = []
+        _ = try await appState.block(RoomBlockTarget(id: "lk-mona", name: "Mona"))
+        routes.answerHeldRead()
+        let outcome = await opening.value
+        XCTAssertEqual(outcome, .retry, "read again, on what the plugin lists now")
+        XCTAssertNil(appState.presentedRoomInvite, "the blocked host's card doesn't open")
+        XCTAssertEqual(appState.linkedRoomInviteRows, [], "nor does its row come back")
+    }
+
     /// An invite's notification opens its card once the plugin's status
     /// is in; one the plugin no longer lists says so, and one from a
     /// dashboard this device doesn't know opens nothing.
@@ -572,7 +690,7 @@ extension GroupChatModelsTests {
         let gone = await appState.openRoomInvite(RoomInviteTarget(link: "lk1a2b3c4d5e6f", roomID: "conduit-9", dashboardID: dashboard))
         XCTAssertEqual(gone, .failed)
         XCTAssertNil(appState.presentedRoomInvite)
-        XCTAssertEqual(appState.errorMessage, AppLocalization.string("This invite isn't on your Hermes any more."))
+        XCTAssertEqual(appState.errorMessage, AppLocalization.string("This invite isn't on your Hermes any more.", table: .rooms))
 
         let unknown = await appState.openRoomInvite(RoomInviteTarget(link: "lk1a2b3c4d5e6f", roomID: "conduit-1", dashboardID: UUID()))
         XCTAssertEqual(unknown, .failed)
@@ -588,7 +706,12 @@ extension GroupChatModelsTests {
 /// answers it, and Links reads fail.
 @MainActor
 private final class InvitesRoutes {
-    let invites: [[String: Any]]
+    /// What the plugin lists; a held read answers with what was listed when
+    /// it was made.
+    var invites: [[String: Any]]
+    private(set) var unlinks = 0
+    /// The rooms whose invites a remove named.
+    private(set) var removes: [String] = []
     /// The next invites read waits until `answerHeldRead()`.
     var holdsNextRead = false
     /// Invites reads fail from now on.
@@ -623,8 +746,19 @@ private final class InvitesRoutes {
             if answerTimesOut { throw DashboardTicketBridgeError.http(status: 504, detail: "") }
             return ["ok": true, "invite": answered ?? [:]]
         }
+        if path == "\(RoomInvitesClient.path)/remove", method == "POST" {
+            removes.append(body?["room_id"] as? String ?? "")
+            var removed = invites.first { $0["room_id"] as? String == body?["room_id"] as? String } ?? [:]
+            removed["removed"] = true
+            return ["ok": true, "invite": removed]
+        }
+        if path == "\(RoomLinksClient.path)/links?link_id=lk-mona", method == "DELETE" {
+            unlinks += 1
+            return ["ok": true, "removed": true]
+        }
         guard path == RoomInvitesClient.path, method == "GET" else { throw URLError(.fileDoesNotExist) }
         invitesReads += 1
+        let listed = invites
         if holdsNextRead {
             holdsNextRead = false
             holding = true
@@ -635,7 +769,7 @@ private final class InvitesRoutes {
         } else if readsFail {
             throw URLError(.timedOut)
         }
-        return ["ok": true, "invites": invites]
+        return ["ok": true, "invites": listed]
     }
 
     func answerHeldRead() {

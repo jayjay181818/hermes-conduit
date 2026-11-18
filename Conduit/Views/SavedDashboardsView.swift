@@ -22,6 +22,8 @@ struct SavedDashboardsSettingsDetail: View {
     @State private var isSwitchingTo: UUID?
     @State private var pendingRemoval: SavedDashboardRowModel?
     @State private var showsAddDashboard = false
+    /// A switch picked during a call, waiting on the user's answer (issue 2390).
+    @State private var pendingCallEndingSwitch: CallEndingSwitch?
     /// Ask Which Dashboard at Launch (#1908): AppState reads it as Conduit
     /// opens.
     @AppStorage(AppState.asksWhichDashboardAtLaunchKey) private var asksWhichDashboardAtLaunch = false
@@ -43,7 +45,7 @@ struct SavedDashboardsSettingsDetail: View {
                     Haptics.selection()
                     addDashboard()
                 } label: {
-                    Label(AppLocalization.string("Add Dashboard"), systemImage: "plus")
+                    Label(AppLocalization.string("Add Dashboard", table: .connection), systemImage: "plus")
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 6).frame(minHeight: 44)
                 }
@@ -58,6 +60,7 @@ struct SavedDashboardsSettingsDetail: View {
                     Text("When Conduit opens, your dashboards stay listed until you tap one, instead of signing in to the last one you used. A notification, a link, Siri, CarPlay, the Apple Watch or a call from Hermes still signs in on its own.")
                         .scaledFont(.caption)
                         .foregroundStyle(.secondary)
+                    combineDashboards
                 }
             }
         }
@@ -67,14 +70,14 @@ struct SavedDashboardsSettingsDetail: View {
         .onChange(of: appState.isConnected) { _, _ in rebuildRows() }
         .onChange(of: appState.isConnecting) { _, _ in rebuildRows() }
         .confirmationDialog(
-            AppLocalization.string("Remove Dashboard?"),
+            AppLocalization.string("Remove Dashboard?", table: .connection),
             isPresented: Binding(
                 get: { pendingRemoval != nil },
                 set: { if !$0 { pendingRemoval = nil } }
             ),
             titleVisibility: Visibility.visible
         ) {
-            Button(AppLocalization.string("Remove Dashboard"), role: .destructive) {
+            Button(AppLocalization.string("Remove Dashboard", table: .connection), role: .destructive) {
                 if let row = pendingRemoval {
                     removeDashboard(row)
                 }
@@ -86,11 +89,37 @@ struct SavedDashboardsSettingsDetail: View {
         } message: {
             Text("This dashboard's saved sign-in and cookies will be deleted from this device, and location, health and phone sharing with it stops. Other dashboards are not affected.")
         }
+        .callEndingSwitchConfirmation($pendingCallEndingSwitch)
         // Adding a dashboard is a sheet over this page: Cancel leaves the
         // current dashboard and chat as they were.
         .sheet(isPresented: $showsAddDashboard) {
             AddDashboardSheet(onSignedIn: { close() })
                 .environmentObject(appState)
+        }
+    }
+
+    // MARK: - Combine Dashboards
+
+    /// The combined group (multi-instance stage 3): a switch per saved
+    /// dashboard. Two or more switched on stay connected while another is
+    /// in use.
+    private var combineDashboards: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Label("Combine Dashboards", systemImage: "square.stack.3d.up")
+                .scaledFont(.subheadline.weight(.semibold))
+                .padding(.top, 6)
+            ForEach(rows) { row in
+                Toggle(isOn: Binding(
+                    get: { row.dashboard.isCombined },
+                    set: { appState.setDashboardCombined(row.dashboard.id, $0) }
+                )) {
+                    Text(verbatim: row.dashboard.label)
+                }
+                .accessibilityIdentifier("settings.combine-dashboard")
+            }
+            Text("Combined dashboards connect when Conduit opens, up to four at a time, and stay connected while you use another one, so switching between them is quick. One that needs you to sign in waits until you open it. Switch on two or more.")
+                .scaledFont(.caption)
+                .foregroundStyle(.secondary)
         }
     }
 
@@ -120,7 +149,7 @@ struct SavedDashboardsSettingsDetail: View {
             Button(role: .destructive) {
                 pendingRemoval = row
             } label: {
-                Label(AppLocalization.string("Remove Dashboard"), systemImage: "trash")
+                Label(AppLocalization.string("Remove Dashboard", table: .connection), systemImage: "trash")
             }
         }
     }
@@ -135,6 +164,12 @@ struct SavedDashboardsSettingsDetail: View {
     }
 
     private func switchTo(_ row: SavedDashboardRowModel) {
+        appState.switchEndingCall(to: row.dashboard.label, pending: &pendingCallEndingSwitch) {
+            startSwitch(to: row)
+        }
+    }
+
+    private func startSwitch(to row: SavedDashboardRowModel) {
         let id = row.dashboard.id
         isSwitchingTo = id
         Task {
@@ -216,8 +251,8 @@ struct SavedDashboardRowLabel: View {
                             .scaledFont(.caption2)
                             .foregroundStyle(.secondary)
                             .accessibilityLabel(quantumSafe
-                                ? AppLocalization.string("Notifications end-to-end encrypted and quantum-safe")
-                                : AppLocalization.string("Notifications end-to-end encrypted"))
+                                ? AppLocalization.string("Notifications end-to-end encrypted and quantum-safe", table: .connection)
+                                : AppLocalization.string("Notifications end-to-end encrypted", table: .connection))
                     }
                 }
                 Text(verbatim: row.dashboard.normalizedURL)
@@ -232,7 +267,7 @@ struct SavedDashboardRowLabel: View {
             if row.isActive {
                 Image(systemName: "checkmark.circle.fill")
                     .foregroundStyle(.conduitAccent)
-                    .accessibilityLabel(AppLocalization.string("Active dashboard"))
+                    .accessibilityLabel(AppLocalization.string("Active dashboard", table: .connection))
             } else if isSwitching {
                 ProgressView()
             } else {
@@ -243,16 +278,28 @@ struct SavedDashboardRowLabel: View {
         }
     }
 
+    /// The active row says Connecting… until the socket is up, not until
+    /// the switch ends: the switch still reads the chat list after that.
+    static func showsConnecting(isConnecting: Bool, isSwitching: Bool, isConnected: Bool) -> Bool {
+        isConnecting || (isSwitching && !isConnected)
+    }
+
     private var statusText: String {
         if row.isActive {
-            if isSwitching || appState.isConnecting { return AppLocalization.string("Connecting…") }
+            // Connected once the socket is up: the switch itself still
+            // reads the chat list after that.
+            if Self.showsConnecting(isConnecting: appState.isConnecting, isSwitching: isSwitching, isConnected: appState.isConnected) {
+                return AppLocalization.string("Connecting…")
+            }
             return appState.isConnected
                 ? AppLocalization.string("Connected")
                 : AppLocalization.string("Disconnected")
         }
+        // A combined dashboard beside the one on screen (stage 3c).
+        if let status = appState.combinedDashboardStatus(row.dashboard.id) { return status.label }
         return row.hasReusableAuth
             ? AppLocalization.string("Saved")
-            : AppLocalization.string("Sign In required")
+            : AppLocalization.string("Sign In required", table: .connection)
     }
 
     /// Nil unless this dashboard's notifications are end-to-end encrypted;
@@ -270,8 +317,16 @@ struct SavedDashboardRowLabel: View {
 
     private var statusColor: Color {
         if row.isActive {
-            if isSwitching || appState.isConnecting { return .orange }
+            if Self.showsConnecting(isConnecting: appState.isConnecting, isSwitching: isSwitching, isConnected: appState.isConnected) {
+                return .orange
+            }
             return appState.isConnected ? .green : .red
+        }
+        switch appState.combinedDashboardStatus(row.dashboard.id) {
+        case .live: return .green
+        case .connecting, .signInNeeded: return .orange
+        case .down: return .red
+        case nil: break
         }
         return row.hasReusableAuth ? .secondary : .orange
     }

@@ -58,6 +58,9 @@ struct RoomLooks: Equatable, Sendable {
     /// The host's name as your Link gives it, in a room someone else hosts
     /// (`GET /rooms/people`'s `home`), which finds `home` by name.
     var hostName: String?
+    /// Every Hermes in the open room is yours (`GET /rooms/people`'s
+    /// `own_hermes`): its bots are drawn as yours, with no owner chip.
+    var ownHermes = false
 
     static let empty = RoomLooks()
 
@@ -191,6 +194,7 @@ extension AppState {
     var activeRoomLooksShown: RoomLooks {
         var looks = activeRoomLooks
         looks.hostName = activeRoomHomeName
+        looks.ownHermes = activeRoomOwnHermes == true
         return looks
     }
 
@@ -290,7 +294,10 @@ extension AppState {
         let glows = profileGlowColors()
         var agents: [String: RoomLook] = [:]
         for bot in bots.prefix(32) {
-            let picture = botAvatarImage(for: bot).flatMap { roomLookPicture(for: bot.name, image: $0) }
+            // A bot with no picture sends its starter face, so the others
+            // see the face it wears here rather than an initial.
+            let image = botAvatarImage(for: bot) ?? bot.faceLook.flatMap { StarterFaces.image($0, color: bot.shownColor) }
+            let picture = image.flatMap { roomLookPicture(for: bot.name, image: $0) }
             let color = ProfileGlowRGB(UIColor(Self.botColor(bot, glow: glows[bot.name])))?.hex.uppercased()
             agents[bot.name] = RoomLook(picture: picture, color: color)
         }

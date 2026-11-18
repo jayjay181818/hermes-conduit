@@ -79,7 +79,7 @@ extension AppState {
                 let response = try await bridge.requestJSON(path: path)
                 guard isCurrent() else { return }
                 guard let values = SyncedPreferencesEngine.hostValues(response) else {
-                    controller.status = .failed(AppLocalization.string("The host's answer wasn't readable."))
+                    controller.status = .failed(AppLocalization.string("The host's answer wasn't readable.", table: .settings))
                     return
                 }
                 host = values
@@ -99,7 +99,7 @@ extension AppState {
             ])
             guard isCurrent() else { return }
             guard let values = SyncedPreferencesEngine.hostValues(response) else {
-                controller.status = .failed(AppLocalization.string("The host's answer wasn't readable."))
+                controller.status = .failed(AppLocalization.string("The host's answer wasn't readable.", table: .settings))
                 return
             }
             let entry = SyncedPreferencesEngine.apply(
@@ -131,6 +131,7 @@ extension AppState {
             .defaults("app.return_key_sends", ComposerReturnKey.preferenceKey, .bool, in: defaults),
             .defaults("app.stop_at_reply_start", ChatReplyStartPreference.key, .bool, in: defaults),
             .defaults("app.main_button_new_chat", V2MainButtonPreference.key, .bool, in: defaults),
+            .defaults("app.tabs", V2TabLayout.key, .strings, in: defaults),
             .defaults("app.sessions_bar_profiles", V2SessionsBarPreferences.Profiles.key, .string, in: defaults),
             sessionsBarProjectsSlot,
             .defaults("app.sessions_bar_pulse", V2SessionsBarPreferences.showsPulseKey, .bool, in: defaults),
@@ -169,19 +170,24 @@ extension AppState {
     }
 
     /// The active profile's projects left out of Chats (Filter ▸ Projects):
-    /// project ids are the profile's own, as is the host's copy.
+    /// project ids are the profile's own, as is the host's copy, and this
+    /// phone keeps them per dashboard, so another host's never come here.
     private var hiddenChatProjectsSlot: SyncedPreferenceSlot {
         let defaults = syncedPreferences.defaults
+        let dashboard = Self.dashboardPreferenceBucket(activeDashboardID)
         let profile = activeProfile
         return SyncedPreferenceSlot(
             key: "app.hidden_chat_projects",
             read: {
-                let ids = HiddenChatProjects.ids(in: defaults.object(forKey: HiddenChatProjects.key), profile: profile)
+                let ids = HiddenChatProjects.ids(
+                    in: defaults.object(forKey: HiddenChatProjects.key), dashboard: dashboard, profile: profile
+                )
                 return ids.isEmpty ? nil : ids.sorted()
             },
             write: { value in
                 let stored = HiddenChatProjects.setting(
                     Set(value as? [String] ?? []),
+                    dashboard: dashboard,
                     profile: profile,
                     in: defaults.object(forKey: HiddenChatProjects.key)
                 )

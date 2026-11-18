@@ -400,6 +400,144 @@ final class ChatSyncTests: XCTestCase {
         XCTAssertTrue(signal.takeRead(now: at(40), turnRunningHere: false))
     }
 
+    /// Hermes signals every served profile's changes, so a busy bot
+    /// elsewhere signals while this list stays the same: each read that
+    /// lists the same rows doubles the wait, up to 60 s, and a changed list
+    /// starts it over.
+    func testQuietChangeReadsWaitLongerUpToAMinute() {
+        var signal = CatalogChangeSignal()
+        var now: TimeInterval = 0
+        var waits: [TimeInterval] = []
+        signal.noteChanged()
+        XCTAssertTrue(signal.takeRead(now: at(now), turnRunningHere: false))
+        for _ in 0..<6 {
+            signal.noteSignalRead(listedTheSameRows: true)
+            signal.noteChanged()
+            let wait = signal.delayUntilDue(now: at(now)) ?? -1
+            waits.append(wait)
+            XCTAssertFalse(signal.takeRead(now: at(now + wait - 1), turnRunningHere: false))
+            now += wait
+            XCTAssertTrue(signal.takeRead(now: at(now), turnRunningHere: false))
+        }
+        XCTAssertEqual(waits, [10, 20, 40, 60, 60, 60])
+
+        signal.noteSignalRead(listedTheSameRows: false)
+        signal.noteChanged()
+        XCTAssertEqual(signal.delayUntilDue(now: at(now)), 5, "A read that changed the list starts over")
+
+        signal.noteSignalRead(listedTheSameRows: true)
+        signal.noteSignalRead(listedTheSameRows: true)
+        signal.noteListChanged(at: at(now + 2))
+        XCTAssertEqual(signal.delayUntilDue(now: at(now + 3)), 4, "So does any other read that changed it, from that read")
+    }
+
+    /// A failed read is tried again after 5 s, whatever the quiet wait, and
+    /// a change held by a failure or a turn here counts as held (the list's
+    /// quick backstop reads it); one only spaced out by the wait doesn't.
+    func testAFailedChangeReadRetriesAfterFiveSecondsAndCountsAsHeld() {
+        var signal = CatalogChangeSignal()
+        signal.noteChanged()
+        XCTAssertTrue(signal.takeRead(now: at(0), turnRunningHere: false))
+        for _ in 0..<4 { signal.noteSignalRead(listedTheSameRows: true) }
+        XCTAssertEqual(signal.interval, 60)
+
+        signal.noteChanged()
+        XCTAssertFalse(signal.isHeld(turnRunningHere: false), "Only spaced out")
+        XCTAssertTrue(signal.isHeld(turnRunningHere: true), "Held by a turn here")
+        XCTAssertEqual(signal.delayUntilDue(now: at(60)), 0)
+        XCTAssertFalse(signal.isHeld(turnRunningHere: false), "Due, but read by its own wait, not the backstop")
+
+        XCTAssertTrue(signal.takeRead(now: at(60), turnRunningHere: false))
+        signal.noteReadFailed(at: at(63))
+        XCTAssertTrue(signal.isPending)
+        XCTAssertTrue(signal.isHeld(turnRunningHere: false), "Held by the failure")
+        XCTAssertEqual(signal.delayUntilDue(now: at(64)), 4, "Tried again 5 s after the read failed")
+        var now: TimeInterval = 68
+        for _ in 0..<2 {
+            XCTAssertTrue(signal.takeRead(now: at(now), turnRunningHere: false))
+            signal.noteReadFailed(at: at(now + 1))
+            XCTAssertEqual(signal.delayUntilDue(now: at(now + 1)), 5)
+            now += 6
+        }
+        XCTAssertTrue(signal.takeRead(now: at(now), turnRunningHere: false))
+        signal.noteReadFailed(at: at(now + 1))
+        XCTAssertEqual(signal.delayUntilDue(now: at(now + 1)), 60, "After three quick retries, the quiet wait")
+
+        XCTAssertTrue(signal.takeRead(now: at(now + 61), turnRunningHere: false))
+        signal.noteSignalRead(listedTheSameRows: true)
+        XCTAssertFalse(signal.lastReadFailed, "A read that lands ends the failures")
+        signal.noteChanged()
+        XCTAssertEqual(signal.delayUntilDue(now: at(now + 61)), 60, "The quiet wait again")
+    }
+
+    /// The same through the app: a change read that lists the same rows
+    /// waits 10 s before the next, and one that moves the list is read 5 s
+    /// after the last again.
+    func testAChangeReadThatListsTheSameRowsWaitsLongerForTheNext() async {
+        let box = Box()
+        let appState = makeAppState(box)
+        followChanges(appState)
+        let profile = appState.activeProfile
+        box.catalog = [row("a", profile: profile)]
+        await appState.loadSessions()
+        XCTAssertEqual(box.loads, 1)
+
+        box.now += 10
+        appState.handleStreamEvent(.sessionsChanged)
+        await appState.leaveCatalogRefreshTask?.value
+        XCTAssertEqual(box.loads, 2, "The first change is read")
+
+        box.now += 6
+        appState.handleStreamEvent(.sessionsChanged)
+        await appState.leaveCatalogRefreshTask?.value
+        XCTAssertEqual(box.loads, 2, "The list was the same: 10 s now, not 5")
+        box.now += 4
+        await poll(appState)
+        XCTAssertEqual(box.loads, 3, "Read at 10 s")
+
+        box.catalog = [row("b", profile: profile, minutesAgo: 1), row("a", profile: profile)]
+        box.now += 20
+        appState.handleStreamEvent(.sessionsChanged)
+        await appState.leaveCatalogRefreshTask?.value
+        XCTAssertEqual(box.loads, 4)
+        XCTAssertEqual(Set(appState.sessions.map(\.id)), ["a", "b"])
+        box.now += 5
+        appState.handleStreamEvent(.sessionsChanged)
+        await appState.leaveCatalogRefreshTask?.value
+        XCTAssertEqual(box.loads, 5, "The list moved: 5 s again")
+    }
+
+    /// A change only spaced out by the quiet-read wait keeps the slow
+    /// backstop: the list's 30 s read doesn't read it halfway through a
+    /// 40 s wait.
+    func testAChangeSpacedOutByTheQuietWaitKeepsTheSlowBackstop() async {
+        let box = Box()
+        let appState = makeAppState(box)
+        followChanges(appState)
+        let profile = appState.activeProfile
+        box.catalog = [row("a", profile: profile)]
+        await appState.loadSessions()
+        XCTAssertEqual(box.loads, 1)
+        // Three change reads that list the same rows: the next waits 40 s.
+        for wait in [10.0, 10, 20] {
+            box.now += wait
+            appState.handleStreamEvent(.sessionsChanged)
+            await appState.leaveCatalogRefreshTask?.value
+        }
+        XCTAssertEqual(box.loads, 4)
+        XCTAssertEqual(appState.catalogChangeSignal.interval, 40)
+
+        box.now += 1
+        appState.handleStreamEvent(.sessionsChanged)
+        await appState.leaveCatalogRefreshTask?.value
+        box.now += 34
+        await poll(appState)
+        XCTAssertEqual(box.loads, 4, "Not read by the 30 s backstop at 35 s")
+        box.now += 6
+        await poll(appState)
+        XCTAssertEqual(box.loads, 5, "Read when its 40 s wait ends")
+    }
+
     // MARK: - The Chats list reading the catalog
 
     private func row(_ id: String, profile: String, minutesAgo: Double = 60) -> SessionSummary {
@@ -423,9 +561,13 @@ final class ChatSyncTests: XCTestCase {
         var live: [LiveSessionStatus] = []
         var catalog: [SessionSummary] = []
         var loads = 0
+        /// The catalog read fails while set.
+        var fails = false
         var now = Date(timeIntervalSince1970: 2_000_000)
         /// Runs while the registry read is on its way.
         var onProbe: (@MainActor () -> Void)?
+        /// Runs while a catalog read is on its way.
+        var onLoad: (@MainActor () -> Void)?
     }
 
     private func makeAppState(_ box: Box) -> AppState {
@@ -434,6 +576,8 @@ final class ChatSyncTests: XCTestCase {
             loadSavedConnection: false,
             sessionCatalogLoader: { _ in
                 box.loads += 1
+                box.onLoad?()
+                if box.fails { throw URLError(.timedOut) }
                 return box.catalog
             },
             chatResumeLifecycleOperations: ChatResumeLifecycleOperations(
@@ -753,6 +897,276 @@ final class ChatSyncTests: XCTestCase {
         _ = await poll?.value
         await appState.leaveCatalogRefreshTask?.value
         XCTAssertEqual(box.loads, 1, "No catalog read after the poll was stopped")
+    }
+
+    /// Issue 1615: a Mac window behind another app is inactive but in view,
+    /// so the list's poll still reads the registry; in the background it
+    /// doesn't, on a Mac either.
+    func testAMacWindowBehindAnotherAppKeepsPollingTheRegistry() async {
+        let box = Box()
+        let appState = makeAppState(box)
+        var probes = 0
+        box.onProbe = { probes += 1 }
+        appState.inactiveSceneStaysInView = true
+        _ = appState.handleScenePhase(.active)
+        _ = appState.handleScenePhase(.inactive)
+        let beforeInactivePoll = probes
+        await poll(appState)
+        XCTAssertGreaterThan(probes, beforeInactivePoll, "Inactive with the window in view reads")
+
+        _ = appState.handleScenePhase(.background)
+        let beforeBackgroundPoll = probes
+        await poll(appState)
+        XCTAssertEqual(probes, beforeBackgroundPoll, "The background reads nothing")
+    }
+
+    // MARK: - A gateway that pushes sessions.changed (issue 851)
+
+    private func followChanges(_ appState: AppState) {
+        appState.client?.sendsChangeEvents = true
+    }
+
+    /// Each change is read as it comes, so the list's own catalog read is a
+    /// 5-minute backstop instead of 30 s.
+    func testAListFollowingChangeEventsReadsTheCatalogEveryFiveMinutes() async {
+        let box = Box()
+        let appState = makeAppState(box)
+        followChanges(appState)
+        box.catalog = [row("listed", profile: appState.activeProfile)]
+        await appState.loadSessions()
+        XCTAssertEqual(box.loads, 1)
+
+        for _ in 0..<74 { // 0 … 292 s
+            await poll(appState)
+            box.now += 4
+        }
+        XCTAssertEqual(box.loads, 1, "No timed read within 5 minutes")
+        await poll(appState) // 296 s
+        box.now += 4
+        await poll(appState) // 300 s
+        XCTAssertEqual(box.loads, 2, "The backstop still reads once")
+    }
+
+    /// A change held back by a turn running here keeps the 30 s read, so a
+    /// chat deleted elsewhere during a long reply still leaves.
+    func testAChangeHeldByATurnHereKeepsTheThirtySecondRead() async {
+        let box = Box()
+        let appState = makeAppState(box)
+        followChanges(appState)
+        let profile = appState.activeProfile
+        box.catalog = [row("open", profile: profile), row("deleted", profile: profile)]
+        await appState.loadSessions()
+        XCTAssertEqual(box.loads, 1)
+        appState.activeSessionId = "open"
+        appState.handleStreamEvent(.sessionBusy(sessionId: "open", busy: true))
+        XCTAssertTrue(appState.turnState.isRunning)
+        // Hermes runs it too, so the open chat's own check reads nothing.
+        box.live = [LiveSessionStatus(runtimeSessionId: "rt-open", storedSessionId: "open", status: "working", messageCount: 2)]
+
+        box.catalog = [row("open", profile: profile)]
+        appState.handleStreamEvent(.sessionsChanged)
+        await appState.leaveCatalogRefreshTask?.value
+        XCTAssertEqual(box.loads, 1, "Held while the turn runs here")
+        for _ in 0..<8 { // 0 … 28 s
+            await poll(appState)
+            box.now += 4
+        }
+        XCTAssertEqual(box.loads, 1)
+        await poll(appState) // 32 s
+        XCTAssertEqual(box.loads, 2, "The backstop reads it at 30 s, as before change events")
+        XCTAssertEqual(appState.sessions.map(\.id), ["open"])
+    }
+
+    /// A change whose read failed stays pending, so it's read again at the
+    /// list's next poll rather than at the 5-minute backstop (issue 2294).
+    func testAChangeWhoseReadFailedIsReadAgain() async {
+        let box = Box()
+        let appState = makeAppState(box)
+        followChanges(appState)
+        let profile = appState.activeProfile
+        box.catalog = [row("kept", profile: profile), row("deleted", profile: profile)]
+        await appState.loadSessions()
+        XCTAssertEqual(box.loads, 1)
+
+        box.catalog = [row("kept", profile: profile)]
+        box.fails = true
+        box.now += 10
+        appState.handleStreamEvent(.sessionsChanged)
+        await appState.leaveCatalogRefreshTask?.value
+        XCTAssertEqual(box.loads, 2, "The change is read")
+        XCTAssertTrue(appState.catalogChangeSignal.isPending, "and stays pending when the read fails")
+        XCTAssertNotNil(appState.catalogChangeReadTask, "its retry is set for 5 s, with or without a poll")
+        XCTAssertEqual(appState.catalogChangeSignal.delayUntilDue(now: box.now), 5, "timed from the failure")
+
+        box.fails = false
+        box.now += 6
+        await poll(appState)
+        XCTAssertEqual(box.loads, 3)
+        XCTAssertEqual(appState.sessions.map(\.id), ["kept"])
+        XCTAssertFalse(appState.catalogChangeSignal.isPending)
+    }
+
+    /// A signal while a change's read is out sets a wait timed from that
+    /// read; when the read then fails, that wait gives way to one timed
+    /// from the failure.
+    func testAChangeDuringAFailingReadRetriesFiveSecondsAfterTheFailure() async {
+        let box = Box()
+        let appState = makeAppState(box)
+        followChanges(appState)
+        let profile = appState.activeProfile
+        box.catalog = [row("a", profile: profile)]
+        await appState.loadSessions()
+
+        var staleWait: Task<Void, Never>?
+        box.fails = true
+        box.onLoad = { [weak appState] in
+            guard staleWait == nil, let appState else { return }
+            box.now += 2
+            appState.handleStreamEvent(.sessionsChanged)
+            staleWait = appState.catalogChangeReadTask
+        }
+        box.now += 10
+        appState.handleStreamEvent(.sessionsChanged)
+        await appState.leaveCatalogRefreshTask?.value
+        box.onLoad = nil
+
+        XCTAssertNotNil(staleWait, "the signal during the read set a wait")
+        XCTAssertTrue(staleWait?.isCancelled == true, "and it gave way once the read failed")
+        XCTAssertNotNil(appState.catalogChangeReadTask)
+        XCTAssertFalse(appState.catalogChangeReadTask?.isCancelled ?? true)
+        XCTAssertEqual(appState.catalogChangeSignal.delayUntilDue(now: box.now), 5, "timed from the failure")
+    }
+
+    /// A joiner cancelled while it waits stops with CancellationError; the
+    /// read still answers the others, once each.
+    func testACancelledJoinerStopsWaitingAndTheOthersGetTheAnswer() async {
+        let owner = NSObject()
+        let read = AppState.CatalogReadInFlight(
+            key: .init(profile: "default", dashboardID: nil, client: ObjectIdentifier(owner))
+        )
+        let cancelled = Task { @MainActor in try await read.join() }
+        let kept = Task { @MainActor in try await read.join() }
+        for _ in 0..<50 where read.joinedReads < 2 { await Task.yield() }
+        XCTAssertEqual(read.joinedReads, 2)
+
+        cancelled.cancel()
+        do {
+            _ = try await cancelled.value
+            XCTFail("a cancelled joiner doesn't get the answer")
+        } catch {
+            XCTAssertTrue(error is CancellationError)
+        }
+        XCTAssertEqual(read.joinedReads, 1)
+
+        let listed = row("a", profile: "default")
+        read.finish(.success(.init(sessions: [listed], olderPagesDeferred: false)))
+        let load = try? await kept.value
+        XCTAssertEqual(load?.sessions.map(\.id), ["a"])
+        XCTAssertEqual(read.joinedReads, 0)
+        read.finish(.success(.init(sessions: [], olderPagesDeferred: false)))
+        withExtendedLifetime(owner) {}
+    }
+
+    func testAQuietListFollowingChangeEventsWaitsUpToTwoMinutes() async {
+        let box = Box()
+        let appState = makeAppState(box)
+        appState.pollJitter = { 0 }
+        box.live = []
+        var waits: [TimeInterval] = []
+        for _ in 0..<7 {
+            let wait = await pollWait(appState)
+            waits.append(wait)
+            box.now += wait
+        }
+        XCTAssertEqual(waits, [4, 8, 15, 30, 60, 60, 60], "Without change events the poll stops at 60 s")
+
+        followChanges(appState)
+        let wait = await pollWait(appState)
+        XCTAssertEqual(wait, 120)
+        appState.deviceConditions = { DeviceConditions(lowPowerMode: true) }
+        let stretched = await pollWait(appState)
+        XCTAssertEqual(stretched, PollCadence.longestPoll, "Low Power Mode stretches it no further than 180 s")
+    }
+
+    /// A turn started on another device moves the stored rows: Hermes says
+    /// so, the catalog read that follows changes the list, and that wakes
+    /// the poll from its long wait, so the registry shows Running now.
+    func testAListChangeWakesTheListPollFromALongWait() async throws {
+        let box = Box()
+        let appState = makeAppState(box)
+        appState.pollJitter = { 0 }
+        followChanges(appState)
+        let profile = appState.activeProfile
+        appState.sessions = [row("listed", profile: profile)]
+        box.catalog = [row("listed", profile: profile)]
+        box.live = []
+        for _ in 0..<3 {
+            box.now += await pollWait(appState)
+        }
+        XCTAssertEqual(appState.chatListPollPacer.interval(followingChanges: true), 15)
+
+        let sleep = Task { await appState.chatListPollSleep.sleep(seconds: 600) }
+        var moved = row("listed", profile: profile, minutesAgo: 0)
+        moved.messageCount = 3
+        box.catalog = [moved]
+        box.now += 10
+        appState.handleStreamEvent(.sessionsChanged)
+        await appState.leaveCatalogRefreshTask?.value
+        XCTAssertEqual(appState.sessions.first?.messageCount, 3)
+        let woke = Task {
+            await sleep.value
+            return true
+        }
+        let timeout = Task {
+            try? await Task.sleep(for: .seconds(5))
+            woke.cancel()
+            sleep.cancel()
+        }
+        let result = await woke.value
+        timeout.cancel()
+        XCTAssertTrue(result && !woke.isCancelled, "The list's change cut the poll's wait short")
+
+        box.live = [LiveSessionStatus(runtimeSessionId: "rt-listed", storedSessionId: "listed", status: "working", messageCount: 3)]
+        let wait = await pollWait(appState)
+        XCTAssertEqual(wait, 4, "The moved list and the running turn bring the poll back to 4 s")
+    }
+
+    /// Low Power Mode stretches even the first step to 12 s: a list change
+    /// wakes that wait too.
+    func testAListChangeWakesTheFirstStepStretchedByLowPower() async {
+        let box = Box()
+        let appState = makeAppState(box)
+        appState.pollJitter = { 0 }
+        appState.deviceConditions = { DeviceConditions(lowPowerMode: true) }
+        followChanges(appState)
+        let profile = appState.activeProfile
+        appState.sessions = [row("listed", profile: profile)]
+        box.catalog = [row("listed", profile: profile)]
+        box.live = []
+        let first = await pollWait(appState)
+        XCTAssertEqual(first, 12)
+        XCTAssertTrue(appState.chatListPollPacer.backoff.isAtShortest)
+
+        let sleep = Task { await appState.chatListPollSleep.sleep(seconds: 600) }
+        var moved = row("listed", profile: profile, minutesAgo: 0)
+        moved.messageCount = 3
+        box.catalog = [moved]
+        box.now += 6
+        appState.handleStreamEvent(.sessionsChanged)
+        await appState.leaveCatalogRefreshTask?.value
+        XCTAssertEqual(appState.sessions.first?.messageCount, 3)
+        let woke = Task {
+            await sleep.value
+            return true
+        }
+        let timeout = Task {
+            try? await Task.sleep(for: .seconds(5))
+            woke.cancel()
+            sleep.cancel()
+        }
+        let result = await woke.value
+        timeout.cancel()
+        XCTAssertTrue(result && !woke.isCancelled, "The list's change cut the stretched 12 s wait short")
     }
 
     func testLowPowerModeStretchesTheListPoll() async {

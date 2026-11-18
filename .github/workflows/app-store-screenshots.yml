@@ -9,10 +9,10 @@ on:
     inputs:
       devices:
         description: "Simulator names, comma-separated"
-        default: "iPhone 17 Pro Max,iPad Pro 13-inch"
+        default: "iPhone 18 Pro Max,iPad Pro 13-inch"
       watch:
         description: "Watch simulator name"
-        default: "Apple Watch Ultra 3"
+        default: "Apple Watch Ultra 4"
 
 # The capture jobs run the demo Hermes, its plugins and Homebrew packages, so
 # they only read; the publish job, which runs none of them, pushes the refs.
@@ -25,10 +25,10 @@ concurrency:
 
 jobs:
   capture:
-    runs-on: macos-26
+    runs-on: xcode-27
     timeout-minutes: 120
     env:
-      DEVICES: ${{ inputs.devices || 'iPhone 17 Pro Max,iPad Pro 13-inch' }}
+      DEVICES: ${{ inputs.devices || 'iPhone 18 Pro Max,iPad Pro 13-inch' }}
       DEMO_HOST: hermes.tail-demo.ts.net
       DEMO_PORT: "9119"
       DEMO_USER: demo
@@ -42,7 +42,7 @@ jobs:
           persist-credentials: false
 
       - name: Select Xcode
-        run: sudo xcode-select -s /Applications/Xcode.app
+        run: sudo --preserve-env=GITHUB_ENV bash scripts/ci-select-xcode.sh
 
       - name: Install xcodegen
         run: brew install xcodegen
@@ -64,10 +64,14 @@ jobs:
           for name in "${NAMES[@]}"; do
             name="$(echo "$name" | xargs)"
             udid=$(xcrun simctl list devices available -j | python3 -c '
-          import json, sys
+          import json, os, sys
           name = sys.argv[1]
           runtimes = json.load(sys.stdin)["devices"]
           ios = sorted((r for r in runtimes if "iOS" in r), reverse=True)
+          # A fallback Xcode (ci-select-xcode.sh) pins the runtime it builds for.
+          pin = os.environ.get("SIMULATOR_OS")
+          if pin:
+              ios = [r for r in ios if r.endswith("iOS-" + pin.replace(".", "-"))]
           # Exact name first, then the first name starting with it (iPad
           # names carry the chip, which changes with each Xcode).
           for exact in (True, False):
@@ -128,9 +132,9 @@ jobs:
               grep -o "PREVIEW_MARK [a-z]* [0-9.]*" "results-$slug-preview.log" >> "shots/preview-$slug.marks" || true
               # The next device's screenshots must not show this chat.
               preview_chats=0
-              for sid in $(HERMES_HOME="$DEMO_WORK/home" "$DEMO_WORK/venv/bin/hermes" sessions list --limit 50 \
+              for sid in $(HERMES_HOME="$DEMO_WORK/home" "$DEMO_WORK/src/.venv/bin/hermes" sessions list --limit 50 \
                   | awk '/^Packing list/ {print $NF}'); do
-                HERMES_HOME="$DEMO_WORK/home" "$DEMO_WORK/venv/bin/hermes" sessions delete -y "$sid" < /dev/null \
+                HERMES_HOME="$DEMO_WORK/home" "$DEMO_WORK/src/.venv/bin/hermes" sessions delete -y "$sid" < /dev/null \
                   || echo "$name preview chat $sid not removed" >> failures.txt
                 preview_chats=$((preview_chats + 1))
               done
@@ -238,10 +242,10 @@ jobs:
   watch:
     # The Watch app needs no dashboard: its screens come from the
     # -conduitScreenshotCall fixture (ConduitWatch/WatchVoiceCall.swift).
-    runs-on: macos-26
+    runs-on: xcode-27
     timeout-minutes: 45
     env:
-      WATCH_DEVICE: ${{ inputs.watch || 'Apple Watch Ultra 3' }}
+      WATCH_DEVICE: ${{ inputs.watch || 'Apple Watch Ultra 4' }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -249,7 +253,7 @@ jobs:
           persist-credentials: false
 
       - name: Select Xcode
-        run: sudo xcode-select -s /Applications/Xcode.app
+        run: sudo --preserve-env=GITHUB_ENV bash scripts/ci-select-xcode.sh
 
       - name: Install xcodegen
         run: brew install xcodegen
@@ -262,10 +266,14 @@ jobs:
         run: |
           set -euo pipefail
           udid=$(xcrun simctl list devices available -j | python3 -c '
-          import json, sys
+          import json, os, sys
           name = sys.argv[1]
           runtimes = json.load(sys.stdin)["devices"]
           watch = sorted((r for r in runtimes if "watchOS" in r), reverse=True)
+          # A fallback Xcode (ci-select-xcode.sh) pins the runtime it builds for.
+          pin = os.environ.get("WATCH_SIMULATOR_OS")
+          if pin:
+              watch = [r for r in watch if r.endswith("watchOS-" + pin.replace(".", "-"))]
           for exact in (True, False):
               for r in watch:
                   for d in runtimes[r]:

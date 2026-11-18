@@ -1741,6 +1741,232 @@ final class ClarifyBatchStateTests: XCTestCase {
         XCTAssertEqual(decoded, ["unit", "ui"], "The wire form is a JSON array string, exactly what Hermes' batch parser accepts")
     }
 
+    /// Issue 2570: a form keeps sending after another chat opens, and every
+    /// answer still names the card's chat and its profile, never the chat
+    /// on screen now.
+    func testFormAnswersGoToTheCardsChatAfterAnotherChatOpens() async throws {
+        final class Box { weak var appState: AppState? }
+        let box = Box()
+        var addressed: [(question: String?, session: String?, profile: String?)] = []
+        var operations = ChatResumeLifecycleOperations.live
+        operations.respondToClarification = { _, _, _, questionId, sessionId, profile in
+            addressed.append((questionId, sessionId, profile))
+            // The user opens another chat while the first answer goes.
+            box.appState?.activeSessionId = "stored-b"
+            box.appState?.messages = []
+            let open = ["environment", "tests", "notes"].filter { id in !addressed.contains { $0.question == id } }
+            return .accepted(remaining: open)
+        }
+        let defaults = makeScratchDefaults("ClarifyBatchStateTests")
+        let appState = AppState(
+            defaults: defaults,
+            loadSavedConnection: false,
+            clearSessionPresentationCache: {},
+            chatResumeLifecycleOperations: operations,
+            sessionPresentationCache: SessionPresentationCache(defaults: defaults)
+        )
+        box.appState = appState
+        appState.activeSessionId = "stored-a"
+        appState.messages = [
+            ChatMessage(id: "clarify-req-batch", role: .clarify, content: "batch", timestamp: "1", clarify: makeBatchActivity())
+        ]
+        try await installConnectedClient(appState, socket: ClarifyFakeSocket(), transport: ClarifyFakeTransport())
+        let cardProfile = appState.presentationProfile(for: "stored-a")
+
+        await appState.respondToClarifyForm(requestId: "req-batch", answers: ["environment": "staging", "notes": "Window seat"])
+
+        XCTAssertEqual(addressed.map(\.question), ["environment", "tests", "notes"], "The form keeps sending off screen")
+        XCTAssertEqual(addressed.map(\.session), ["stored-a", "stored-a", "stored-a"], "Every answer names the card's chat")
+        XCTAssertTrue(addressed.allSatisfy { $0.profile == cardProfile }, "…under the card's own profile")
+        XCTAssertTrue(appState.liveClarifySubmissions.isEmpty, "Nothing is left counted as on its way")
+    }
+
+    /// Issue 2571: a relay answer still on its way keeps its question
+    /// waiting, and when it was re-tapped anyway, the second send's late
+    /// "already locked" never blanks the first answer the relay took.
+    func testARelayAnswerOnItsWayKeepsItsWaitAndALateDuplicateKeepsTheAnswer() async throws {
+        let (appState, _) = makeAppState()
+        appState.messages = [
+            ChatMessage(id: "clarify-relay", role: .clarify, content: "relay", timestamp: "1", clarify: makeRelayBatchCard())
+        ]
+        let firstSent = ClarifyGate(), releaseFirst = ClarifyGate()
+        let secondSent = ClarifyGate(), releaseSecond = ClarifyGate()
+        var calls = 0
+        appState.relayQuestionResponder = { _, _, _ in
+            calls += 1
+            if calls == 1 {
+                firstSent.signal()
+                try await releaseFirst.wait("the first answer to be released")
+                return .locked(remaining: nil)
+            }
+            secondSent.signal()
+            try await releaseSecond.wait("the second answer to be released")
+            return .questionAlreadyLocked
+        }
+
+        let first = Task { await appState.respondToClarify(requestId: "conduit-push-batch1", questionId: "environment", answer: "prod") }
+        try await firstSent.wait("the first answer to be sent")
+        XCTAssertEqual(appState.liveClarifySubmissions["conduit-push-batch1"], 1)
+        XCTAssertEqual(clarifyCard(in: appState, requestId: "conduit-push-batch1")?.questions[0].status, .submitting)
+
+        // An earlier build's reopen offered the question again; the user
+        // answers it a second time.
+        appState.messages[0].clarify?.questions[0].status = .pending
+        let second = Task { await appState.respondToClarify(requestId: "conduit-push-batch1", questionId: "environment", answer: "prod") }
+        try await secondSent.wait("the second answer to be sent")
+        XCTAssertEqual(appState.liveClarifySubmissions["conduit-push-batch1"], 2)
+
+        releaseFirst.signal()
+        await first.value
+        releaseSecond.signal()
+        await second.value
+
+        let settled = try XCTUnwrap(clarifyCard(in: appState, requestId: "conduit-push-batch1"))
+        XCTAssertEqual(settled.questions[0].status, .answered)
+        XCTAssertEqual(settled.questions[0].answer, "prod", "The answer the relay took stays shown")
+        XCTAssertNil(appState.liveClarifySubmissions["conduit-push-batch1"])
+    }
+
+    /// Issue 2571, gateway side: Hermes' resume still lists a question this
+    /// process is answering, and it stays submitting rather than offered
+    /// again; once nothing is on its way, the resume's word wins as before.
+    func testAResumeKeepsAQuestionThisProcessIsStillAnswering() throws {
+        let (appState, _) = makeAppState()
+        var sending = makeBatchActivity()
+        sending.questions[0].status = .submitting
+        appState.messages = [
+            ChatMessage(id: "clarify-req-batch", role: .clarify, content: "batch", timestamp: "1", clarify: sending)
+        ]
+        appState.liveClarifySubmissions["req-batch"] = 1
+
+        appState.applyClarifyActivity(makeBatchActivity(), source: .authoritativeSnapshot)
+
+        XCTAssertEqual(clarifyCard(in: appState, requestId: "req-batch")?.questions[0].status, .submitting)
+        XCTAssertEqual(clarifyCard(in: appState, requestId: "req-batch")?.questions[1].status, .pending)
+
+        appState.liveClarifySubmissions = [:]
+        appState.applyClarifyActivity(makeBatchActivity(), source: .authoritativeSnapshot)
+
+        XCTAssertEqual(clarifyCard(in: appState, requestId: "req-batch")?.questions[0].status, .pending)
+    }
+
+    /// #2601's review: an answer whose connection was replaced while it
+    /// went settles nothing, and its question goes back to answerable
+    /// rather than read Sending with nothing sending it. A form stopped by
+    /// the takeover puts back the questions it never sent too.
+    func testAnAnswerFencedOffByANewConnectionCanBeGivenAgain() async throws {
+        final class Box { weak var appState: AppState? }
+        let box = Box()
+        var sent: [String?] = []
+        var operations = ChatResumeLifecycleOperations.live
+        operations.respondToClarification = { _, _, _, questionId, _, _ in
+            sent.append(questionId)
+            // The connection is replaced while the answer goes; a resume
+            // on the new one kept the question's wait meanwhile.
+            box.appState?.client = nil
+            return .accepted(remaining: ["tests", "notes"])
+        }
+        let defaults = makeScratchDefaults("ClarifyBatchStateTests")
+        let appState = AppState(
+            defaults: defaults,
+            loadSavedConnection: false,
+            clearSessionPresentationCache: {},
+            chatResumeLifecycleOperations: operations,
+            sessionPresentationCache: SessionPresentationCache(defaults: defaults)
+        )
+        box.appState = appState
+        appState.activeSessionId = "stored-a"
+        appState.messages = [
+            ChatMessage(id: "clarify-req-batch", role: .clarify, content: "batch", timestamp: "1", clarify: makeBatchActivity())
+        ]
+        try await installConnectedClient(appState, socket: ClarifyFakeSocket(), transport: ClarifyFakeTransport())
+
+        await appState.respondToClarify(requestId: "req-batch", questionId: "environment", answer: "staging")
+
+        XCTAssertEqual(sent, ["environment"])
+        XCTAssertEqual(clarifyCard(in: appState, requestId: "req-batch")?.questions[0].status, .pending,
+                       "The fenced answer's question can be answered again")
+        XCTAssertTrue(appState.liveClarifySubmissions.isEmpty)
+
+        sent = []
+        try await installConnectedClient(appState, socket: ClarifyFakeSocket(), transport: ClarifyFakeTransport())
+        await appState.respondToClarifyForm(requestId: "req-batch", answers: ["environment": "staging", "notes": "Window seat"])
+
+        XCTAssertEqual(sent, ["environment"], "The rest isn't the replaced connection's to send")
+        let card = try XCTUnwrap(clarifyCard(in: appState, requestId: "req-batch"))
+        XCTAssertEqual(card.questions.map(\.status), [.pending, .pending, .pending],
+                       "Neither the fenced answer nor the unsent ones read Sending")
+        XCTAssertTrue(appState.liveClarifySubmissions.isEmpty)
+    }
+
+    /// #2636's review: two answers of one card both fenced off. Whichever
+    /// settles first waits on the other, and neither is left Sending.
+    func testTwoFencedAnswersOfOneCardBothGoBackToAnswerable() throws {
+        for lastIsFenced in [true, false] {
+            let appState = makeAppState().appState
+            var activity = makeBatchActivity()
+            activity.questions[0].status = .submitting
+            activity.questions[1].status = .submitting
+            appState.messages = [
+                ChatMessage(id: "clarify-req-batch", role: .clarify, content: "batch", timestamp: "1", clarify: activity)
+            ]
+            let first = activity.questions[0].id
+            let second = activity.questions[1].id
+            appState.liveClarifySubmissions["req-batch"] = 2
+
+            // The first fenced send settles while the second is on its way.
+            appState.endClarifySubmission("req-batch")
+            appState.rearmStaleClarifyQuestions(requestId: "req-batch", questionIds: [first])
+            XCTAssertEqual(clarifyCard(in: appState, requestId: "req-batch")?.questions[0].status, .submitting,
+                           "It waits while another send of its card is on its way")
+
+            appState.endClarifySubmission("req-batch")
+            if lastIsFenced {
+                appState.rearmStaleClarifyQuestions(requestId: "req-batch", questionIds: [second])
+            }
+            let card = try XCTUnwrap(clarifyCard(in: appState, requestId: "req-batch"))
+            XCTAssertEqual(card.questions[0].status, .pending, "lastIsFenced: \(lastIsFenced)")
+            if lastIsFenced {
+                XCTAssertEqual(card.questions[1].status, .pending)
+            }
+            XCTAssertTrue(appState.staleClarifyQuestionIds.isEmpty)
+            XCTAssertTrue(appState.liveClarifySubmissions.isEmpty)
+        }
+    }
+
+    /// #2601's review: a form's answers count as on their way for the whole
+    /// form, so a resume between two of its sends doesn't offer the rest.
+    func testAFormCountsAsOnItsWayBetweenItsSends() async throws {
+        final class Box { weak var appState: AppState? }
+        let box = Box()
+        var counts: [Int?] = []
+        var operations = ChatResumeLifecycleOperations.live
+        operations.respondToClarification = { _, requestId, _, questionId, _, _ in
+            counts.append(box.appState?.liveClarifySubmissions[requestId])
+            let open = ["environment", "tests", "notes"].drop { $0 != questionId }.dropFirst()
+            return .accepted(remaining: Array(open))
+        }
+        let defaults = makeScratchDefaults("ClarifyBatchStateTests")
+        let appState = AppState(
+            defaults: defaults,
+            loadSavedConnection: false,
+            clearSessionPresentationCache: {},
+            chatResumeLifecycleOperations: operations,
+            sessionPresentationCache: SessionPresentationCache(defaults: defaults)
+        )
+        box.appState = appState
+        appState.activeSessionId = "stored-a"
+        appState.messages = [
+            ChatMessage(id: "clarify-req-batch", role: .clarify, content: "batch", timestamp: "1", clarify: makeBatchActivity())
+        ]
+        try await installConnectedClient(appState, socket: ClarifyFakeSocket(), transport: ClarifyFakeTransport())
+
+        await appState.respondToClarifyForm(requestId: "req-batch", answers: ["environment": "staging", "notes": "Window seat"])
+
+        XCTAssertEqual(counts, [2, 2, 2], "The form's own count stays while each answer goes")
+        XCTAssertTrue(appState.liveClarifySubmissions.isEmpty, "…and goes with its last one")
+    }
+
     func testRequestStatusDerivation() {
         var activity = makeBatchActivity()
         XCTAssertEqual(activity.status, .pending)
@@ -1860,11 +2086,29 @@ final class ClarifyFakeSocket: HermesWebSocket {
     var refusesApprovalPendingBeforeRespond = false
     private var sawApprovalRespond = false
 
+    /// A gateway that refuses every request at once (-32601), for a test
+    /// about what a connection does whose steps would otherwise wait out
+    /// their timeouts on a socket that never answers. Kept out of
+    /// `sentTexts` and `onSend`.
+    var refusesEveryRequest = false
+
     func send(_ message: URLSessionWebSocketTask.Message, completionHandler: @escaping @Sendable (Error?) -> Void) {
         if case .string(let text) = message {
             let request = (try? JSONSerialization.jsonObject(with: Data(text.utf8))) as? [String: Any]
             let method = request?["method"] as? String
             if method == "approval.respond" { sawApprovalRespond = true }
+            if refusesEveryRequest, let id = request?["id"] as? Int {
+                completionHandler(nil)
+                deliver(String(
+                    decoding: try! JSONSerialization.data(withJSONObject: [
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": ["code": -32601, "message": "unknown method: \(method ?? "")"]
+                    ]),
+                    as: UTF8.self
+                ))
+                return
+            }
             if refusesApprovalPendingBeforeRespond, !sawApprovalRespond,
                method == "approval.pending", let id = request?["id"] as? Int {
                 completionHandler(nil)
@@ -1895,6 +2139,15 @@ final class ClarifyFakeSocket: HermesWebSocket {
     /// buffer and the parked continuation are guarded together.
     private var bufferedFrames: [String] = []
     private let frameLock = NSLock()
+
+    /// Whether the client's receive loop is waiting on this socket now, so
+    /// a test's `cancel` reaches it (one before the loop's first receive
+    /// would find nothing to fail).
+    var hasWaitingReceive: Bool {
+        frameLock.lock()
+        defer { frameLock.unlock() }
+        return receiveContinuation != nil
+    }
 
     func receive() async throws -> URLSessionWebSocketTask.Message {
         try await withCheckedThrowingContinuation { continuation in

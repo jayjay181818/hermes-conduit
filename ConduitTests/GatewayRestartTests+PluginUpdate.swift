@@ -745,6 +745,29 @@ extension GatewayRestartTests {
         XCTAssertNil(NotifierPluginStatus.runtime(from: ["ok": true, "version": "0.23.0", "capabilities": []]))
     }
 
+    func testARuntimeSaysWhenTheHostKeepsDisbandedRoomsChats() {
+        let base: [String: Any] = ["ok": true, "version": "0.165.0", "loaded_version": "0.165.0", "capabilities": []]
+        XCTAssertEqual(NotifierPluginStatus.runtime(from: base)?.roomChatsKept, false)
+        var kept = base
+        kept["room_chats_kept"] = true
+        XCTAssertEqual(NotifierPluginStatus.runtime(from: kept)?.roomChatsKept, true)
+    }
+
+    func testARuntimeListsWhatThePluginCantDoOnThisHermes() {
+        // Notifier issue 834: only the host's log said it before.
+        let base: [String: Any] = ["ok": true, "version": "0.177.16", "loaded_version": "0.177.16", "capabilities": []]
+        XCTAssertEqual(NotifierPluginStatus.runtime(from: base)?.degraded, [])
+        var limited = base
+        limited["degraded"] = ["workspace-files", 7, "workstream-recovery", "a-later-one", "workspace-files"]
+        let codes = NotifierPluginStatus.runtime(from: limited)?.degraded ?? []
+        XCTAssertEqual(codes, ["workspace-files", "workstream-recovery", "a-later-one"])
+        let lines = codes.map(NotifierPluginStatus.degradedText)
+        XCTAssertEqual(Set(lines).count, 3)
+        XCTAssertTrue(lines[2].contains("a-later-one"), "a code this build doesn't know is shown by its code")
+        limited["degraded"] = "workspace-files"
+        XCTAssertEqual(NotifierPluginStatus.runtime(from: limited)?.degraded, [])
+    }
+
     func testProfilePairingOwner() {
         XCTAssertEqual(PushNotificationService.profilePairing(status: ["paired": false], installationID: "i1"), .unpaired)
         XCTAssertEqual(PushNotificationService.profilePairing(status: ["paired": true, "installation_id": "i1"], installationID: "i1"), .thisDevice)
@@ -946,6 +969,16 @@ extension GatewayRestartTests {
         missing.state = .predatesCapabilities
         XCTAssertTrue(missing.predatesOneTapUpdate)
         XCTAssertTrue(NotifierPluginUpdateStatusView.row(for: .unsupported, plugin: missing)?.detail?.contains("missing") == true)
+    }
+
+    func testADashboardLeftToRestartSaysOnlyTheDashboardIsLeft() {
+        // Notifier issue 774: "Restarting the gateway…" then "restart needed" read as a stuck update.
+        let plugin = NotifierPluginStatus()
+        let plain = NotifierPluginUpdateStatusView.row(for: .needsDashboardRestart(detail: nil), plugin: plugin)
+        XCTAssertEqual(plain?.title, "Restart the Hermes dashboard to finish")
+        XCTAssertEqual(plain?.detail, "The new plugin is on the host, and only the dashboard still runs the old one. Restart the dashboard on the host once.")
+        let hosts = NotifierPluginUpdateStatusView.row(for: .needsDashboardRestart(detail: "Restart Hermes Desktop to finish the update"), plugin: plugin)
+        XCTAssertEqual(hosts?.detail, "The gateway restarted and runs the new plugin. Only the dashboard still runs the old one. Restart Hermes Desktop to finish the update")
     }
 
     private static func capabilities(loaded: String, disk: String, boot: String) -> [String: Any] {
@@ -1510,6 +1543,37 @@ extension GatewayRestartTests {
         XCTAssertTrue(detail.contains("Restart the Hermes dashboard"))
         XCTAssertEqual(NotifierPluginUpdater.explainingMixedHermes("Plugin not found"), "Plugin not found")
         XCTAssertTrue(NotifierPluginUpdater.ranMixedHermes("cannot import name 'x' from 'pm.workspace'"))
+    }
+
+    /// After an update that restarted the gateway but not the dashboard,
+    /// the restart texts name the dashboard (notifier issue 778); a restart
+    /// left by anything else still says Hermes.
+    @MainActor
+    func testOnlyADashboardLeftToRestartIsNamedAsTheDashboard() throws {
+        let suite = "PluginUpdateOnlyDashboard.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let appState = AppState(defaults: defaults, loadSavedConnection: false)
+        let current = NotifierPluginStatus.recommendedVersion
+        appState.notifierPlugin = NotifierPluginStatus(
+            state: .reported(version: current, capabilities: Set(NotifierPluginStatus.usedCapabilities)),
+            runtime: NotifierPluginStatus.Runtime(loadedVersion: "0.30.0", restartNeeded: true, bootID: "b")
+        )
+        XCTAssertTrue(appState.notifierPlugin.restartPending)
+        XCTAssertFalse(appState.notifierPluginOnlyDashboardLeft, "no update ran here: Hermes needs the restart")
+
+        let run = appState.notifierPluginUpdate.start(on: appState.activeDashboardID)
+        appState.notifierPluginUpdate.update(.needsDashboardRestart(detail: nil), run: run)
+        XCTAssertTrue(appState.notifierPluginOnlyDashboardLeft)
+
+        let otherRun = appState.notifierPluginUpdate.start(on: UUID())
+        appState.notifierPluginUpdate.update(.needsDashboardRestart(detail: nil), run: otherRun)
+        XCTAssertFalse(appState.notifierPluginOnlyDashboardLeft, "another dashboard's update says nothing here")
+
+        let again = appState.notifierPluginUpdate.start(on: appState.activeDashboardID)
+        appState.notifierPluginUpdate.update(.needsDashboardRestart(detail: nil), run: again)
+        appState.notifierPlugin.runtime = NotifierPluginStatus.Runtime(loadedVersion: current, restartNeeded: false, bootID: "c")
+        XCTAssertFalse(appState.notifierPluginOnlyDashboardLeft, "once the dashboard runs it, nothing is left")
     }
 
     func testHostJobOutcomes() {

@@ -74,11 +74,11 @@ extension GroupChatModelsTests {
             "m-laifu": RoomPerson(owner: "Mona", isYours: false, out: .removed),
         ]
         let members = GroupRoomTurns.members(copy.room.members, people: people)
-        let yours = AppLocalization.string("Your agent")
-        let left = AppLocalization.string("Left the room")
+        let yours = AppLocalization.string("Your agent", table: .rooms)
+        let left = AppLocalization.string("Left the room", table: .rooms)
         let mona = AppLocalization.string("Mona's agent")
-        let takenOut = AppLocalization.string("Taken out")
-        XCTAssertEqual(members.map(GroupRoomTurns.ownerLine(of:)), [
+        let takenOut = AppLocalization.string("Taken out", table: .rooms)
+        XCTAssertEqual(members.map { GroupRoomTurns.ownerLine(of: $0) }, [
             AppLocalization.string("Furina's agent"),
             // Once yours left, the copy lists it as the host's, as Eric's:
             // the plugin's people say it's yours.
@@ -123,9 +123,93 @@ extension GroupChatModelsTests {
         routes.leavingStatus = 504
         routes.people = leaveOwnPeople(laifu: "removed")
         let result = await appState.takeOut(laifu)
-        XCTAssertEqual(result, .sending(AppLocalization.string("Your Hermes is still sending this. The room shows it once it has.")))
+        XCTAssertEqual(result, .sending(AppLocalization.string("Your Hermes is still sending this. The room shows it once it has.", table: .rooms)))
         XCTAssertEqual(appState.activeRoomPeople["m-laifu"]?.out, .removed, "who's in is read again")
         appState.closeGroupRoom()
+    }
+
+    @MainActor
+    func testARoomOfOnlyYourOwnHermesIsReadFromThePeopleAndForgottenWithTheRoom() async throws {
+        // Multi-instance plan, Rooms 1: Group Info offers no room choices where every Hermes is yours.
+        let routes = CopiesRoutes(copies: [])
+        var own = leaveOwnPeople(laifu: "in")
+        own["own_hermes"] = true
+        routes.people = own
+        let appState = try await leaveAppState(routes, room: leaveOwnRoom)
+        await appState.openGroupRoom(leaveOwnRoom)
+        await copiesWait("the people read", until: { appState.activeRoomOwnHermes == true })
+        appState.closeGroupRoom()
+        XCTAssertNil(appState.activeRoomOwnHermes, "forgotten with the room")
+
+        // Another person's Hermes in it (or a plugin before 0.169, which doesn't say): choices as before.
+        routes.people = leaveOwnPeople(laifu: "in")
+        await appState.openGroupRoom(leaveOwnRoom)
+        await copiesWait("the people read", until: { appState.activeRoomPeople["m-laifu"]?.owner == "Mona" })
+        XCTAssertEqual(appState.activeRoomOwnHermes, false)
+        routes.people = ["ok": true, "room_id": "conduit-5", "home": NSNull(), "members": [[String: Any]](),
+                         "own_hermes": false]
+        await appState.refreshActiveRoomPeople()
+        XCTAssertEqual(appState.activeRoomOwnHermes, false)
+
+        // Opened again straight from an own room, without closing it: the last room's answer doesn't carry over.
+        routes.people = own
+        await appState.refreshActiveRoomPeople()
+        XCTAssertEqual(appState.activeRoomOwnHermes, true)
+        routes.people = leaveOwnPeople(laifu: "in")
+        routes.peopleDelays = [.milliseconds(400)]
+        let asked = routes.peopleReads.count
+        await appState.openGroupRoom(leaveOwnRoom)
+        await copiesWait("the new read asked", until: { routes.peopleReads.count > asked })
+        XCTAssertNil(appState.activeRoomOwnHermes, "reset on open, while the new read waits")
+        await copiesWait("the people read", until: { appState.activeRoomOwnHermes == false })
+        appState.closeGroupRoom()
+    }
+
+    @MainActor
+    func testARoomWhosePeopleCantBeReadIsNotYourOwnHermes() async throws {
+        // Issue 2405: a failed people read, a plugin without room invites,
+        // and a room with no linked people all settle it as false: the
+        // owner's rules hold and Group Info offers the room choices.
+        let routes = CopiesRoutes(copies: [])
+        routes.people = ["ok": false]
+        let appState = try await leaveAppState(routes, room: leaveOwnRoom)
+        await appState.openGroupRoom(leaveOwnRoom)
+        await copiesWait("the failed people read", until: { appState.activeRoomOwnHermes == false })
+        appState.closeGroupRoom()
+
+        var withoutInvites = copiesPluginReport
+        withoutInvites["capabilities"] = (withoutInvites["capabilities"] as? [String] ?? [])
+            .filter { $0 != RoomDraftsClient.capability }
+        let noInvites = try await leaveAppState(CopiesRoutes(copies: []), room: leaveOwnRoom, report: withoutInvites)
+        await noInvites.openGroupRoom(leaveOwnRoom)
+        await copiesWait("no people read to wait for", until: { noInvites.activeRoomOwnHermes == false })
+        noInvites.closeGroupRoom()
+
+        let own = leaveOwnRoom
+        let mine = GroupRoom(
+            roomID: own.roomID, name: own.name, members: own.members.filter { $0.memberID != "m-laifu" },
+            authorityGatewayID: "gw-a", authorityEpoch: 1, revision: 1, createdAt: 0, updatedAt: 0,
+            disbandedAt: nil, latestSeq: 0
+        )
+        let local = try await leaveAppState(CopiesRoutes(copies: []), room: mine)
+        await local.openGroupRoom(mine)
+        await copiesWait("a room with no linked people", until: { local.activeRoomOwnHermes == false })
+        local.closeGroupRoom()
+    }
+
+    func testGroupInfoOffersRoomChoicesOnlyOnceTheRoomIsKnownNotToBeOnlyYourOwnHermes() {
+        let yours = GroupMember(memberID: "m-furina", profile: "furina", handle: "furina", displayName: "Furina",
+                                target: nil, extra: [:])
+        let theirs = GroupMember(memberID: "m-laifu", profile: nil, handle: "laifu", displayName: "Laifu",
+                                 target: ["kind": .string("peer")], extra: [:])
+        XCTAssertTrue(GroupRoomTurns.offersChoices(canSet: true, members: [yours, theirs], ownHermes: false))
+        XCTAssertFalse(GroupRoomTurns.offersChoices(canSet: true, members: [yours, theirs], ownHermes: true),
+                       "every Hermes is yours")
+        XCTAssertFalse(GroupRoomTurns.offersChoices(canSet: true, members: [yours, theirs], ownHermes: nil),
+                       "not before the people read lands")
+        XCTAssertFalse(GroupRoomTurns.offersChoices(canSet: true, members: [yours], ownHermes: false),
+                       "no one else's agents")
+        XCTAssertFalse(GroupRoomTurns.offersChoices(canSet: false, members: [yours, theirs], ownHermes: false))
     }
 
     func testAMemberThatsOutIsntOfferedToMentionOrAddress() {
@@ -153,8 +237,10 @@ extension GroupChatModelsTests {
             ["member_id": "m-kuro", "owner": NSNull(), "status": "left"],
             ["member_id": "m-laifu", "owner": "Mona", "status": "in"],
         ]]
+        let generation = appState.linkedRosterGeneration
         let result = await appState.leaveActiveRoom()
         XCTAssertEqual(result, .done)
+        XCTAssertNotEqual(appState.linkedRosterGeneration, generation, "a roster read from before the leave is dropped (issue 2347)")
         XCTAssertEqual(routes.leaves.count, 1)
         let body = try XCTUnwrap(routes.leaves.first)
         XCTAssertEqual(body["link"] as? String, "lk1a2b3c4d5e6f")
@@ -182,8 +268,10 @@ extension GroupChatModelsTests {
         XCTAssertTrue(appState.canTakeOut(kuro))
         XCTAssertFalse(appState.canTakeOut(laifu), "only the host takes others out")
 
+        let generation = appState.linkedRosterGeneration
         let result = await appState.takeOut(kuro)
         XCTAssertEqual(result, .done)
+        XCTAssertNotEqual(appState.linkedRosterGeneration, generation, "a roster read from before the take out is dropped")
         XCTAssertEqual(routes.leaves.first?["agents"] as? [String], ["research"])
         XCTAssertEqual(routes.removes.count, 0)
         XCTAssertFalse(routes.peopleReads.isEmpty, "who's in is read again")
@@ -203,8 +291,10 @@ extension GroupChatModelsTests {
         XCTAssertFalse(appState.canLeaveActiveRoom, "you host it")
 
         routes.people = leaveOwnPeople(laifu: "removed")
+        let generation = appState.linkedRosterGeneration
         let result = await appState.takeOut(laifu)
         XCTAssertEqual(result, .done)
+        XCTAssertNotEqual(appState.linkedRosterGeneration, generation, "a roster read from before the take out is dropped")
         XCTAssertEqual(routes.removes.count, 1)
         XCTAssertEqual(routes.removes.first?["room_id"] as? String, "conduit-5")
         XCTAssertEqual(routes.removes.first?["member"] as? String, "m-laifu")
@@ -213,7 +303,7 @@ extension GroupChatModelsTests {
         let out = try XCTUnwrap(appState.activeRoomMembers.first { $0.memberID == "m-laifu" })
         XCTAssertEqual(out.out, .removed)
         let mona = AppLocalization.string("Mona's agent")
-        let takenOut = AppLocalization.string("Taken out")
+        let takenOut = AppLocalization.string("Taken out", table: .rooms)
         XCTAssertEqual(GroupRoomTurns.ownerLine(of: out), AppLocalization.string("\(mona) · \(takenOut)"))
         XCTAssertFalse(appState.canTakeOut(out), "it's out already")
         appState.closeGroupRoom()
@@ -227,15 +317,17 @@ extension GroupChatModelsTests {
         let appState = try await leaveAppState(routes)
         await appState.openRoomCopy(try XCTUnwrap(appState.linkedRoomCopyRows.first))
 
+        let generation = appState.linkedRosterGeneration
         let result = await appState.leaveActiveRoom()
-        XCTAssertEqual(result, .refused(AppLocalization.string("Could not leave this room: \(refusal)")))
+        XCTAssertEqual(result, .refused(AppLocalization.string("Could not leave this room: \(refusal)", table: .rooms)))
+        XCTAssertEqual(appState.linkedRosterGeneration, generation, "a refused leave changed nothing")
         XCTAssertEqual(appState.activeRoomSurface?.copy?.status, "started")
         XCTAssertTrue(appState.canLeaveActiveRoom)
         XCTAssertTrue(appState.isPollingActiveRoom)
 
         let kuro = try XCTUnwrap(appState.activeRoomMembers.first { $0.memberID == "m-kuro" })
         let refused = await appState.takeOut(kuro)
-        XCTAssertEqual(refused, .refused(AppLocalization.string("Could not take this agent out: \(refusal)")))
+        XCTAssertEqual(refused, .refused(AppLocalization.string("Could not take this agent out: \(refusal)", table: .rooms)))
         appState.closeGroupRoom()
     }
 
@@ -254,7 +346,7 @@ extension GroupChatModelsTests {
         routes.copies = [copiesCopy(status: "left", yours: [])]
         routes.invites = [routes.leftInvite]
         let result = await appState.leaveActiveRoom()
-        XCTAssertEqual(result, .sending(AppLocalization.string("Your Hermes is still sending this. The room shows it once it has.")))
+        XCTAssertEqual(result, .sending(AppLocalization.string("Your Hermes is still sending this. The room shows it once it has.", table: .rooms)))
         XCTAssertEqual(appState.activeRoomSurface?.copy?.status, "left", "the copy is read again")
         XCTAssertEqual(appState.linkedRoomInvite(copy.id)?.status, "left", "and its invite")
         XCTAssertFalse(appState.canLeaveActiveRoom)
@@ -271,8 +363,8 @@ extension GroupChatModelsTests {
         let kuro = try XCTUnwrap(appState.activeRoomMembers.first { $0.memberID == "m-kuro" })
         XCTAssertTrue(kuro.isYours)
         XCTAssertEqual(kuro.out, .left)
-        let yours = AppLocalization.string("Your agent")
-        let left = AppLocalization.string("Left the room")
+        let yours = AppLocalization.string("Your agent", table: .rooms)
+        let left = AppLocalization.string("Left the room", table: .rooms)
         XCTAssertEqual(GroupRoomTurns.ownerLine(of: kuro), AppLocalization.string("\(yours) · \(left)"))
         XCTAssertNil(GroupRoomTurns.shownOwner(of: kuro), "not the host's name for you")
         let laifu = try XCTUnwrap(appState.activeRoomMembers.first { $0.memberID == "m-laifu" })

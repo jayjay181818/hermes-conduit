@@ -229,6 +229,10 @@ final class PhoneSyncEngine: ObservableObject {
     /// a tap from an earlier sharing applies nothing.
     var sharingSession: Int { turnOffs }
     private var stateUnread = false
+    /// A wake from the host asked for the status (conduit_phone's `fresh`,
+    /// issue 888): the next pass that sends goes with it even when it
+    /// hasn't changed, so the host sees a new reading.
+    private var statusAsked = false
     /// What the state file holds (or is about to): a pass that changed
     /// nothing writes nothing.
     private var saved: PhoneSyncState?
@@ -526,7 +530,7 @@ final class PhoneSyncEngine: ObservableObject {
             "public_key": NotificationE2E.base64URL(devicePrivate.publicKey.rawRepresentation),
         ])
         guard let hostPublic = answer["host_public_key"] as? String, let kid = answer["kid"] as? String else {
-            throw DashboardTicketBridgeError.requestFailed(AppLocalization.string("The host didn't return a key."))
+            throw DashboardTicketBridgeError.requestFailed(AppLocalization.string("The host didn't return a key.", table: .phone))
         }
         let key = try PhoneSyncCrypto.agree(devicePrivate: devicePrivate, deviceID: state.deviceID, hostPublicKey: hostPublic, kid: kid)
         try Task.checkCancellation()
@@ -626,7 +630,7 @@ final class PhoneSyncEngine: ObservableObject {
             var status = await statusSource.snapshot()
             let hash = Self.hash(Self.comparableStatus(status))
             let stale = state.statusSentAt.map { currentNow.timeIntervalSince($0) > PhoneSyncLimits.statusRefresh } ?? true
-            if full || hash != state.statusHash || stale {
+            if full || statusAsked || hash != state.statusHash || stale {
                 status["at"] = PhoneDates.format(currentNow)
                 batch["status"] = status
                 newStatusHash = hash
@@ -769,7 +773,10 @@ final class PhoneSyncEngine: ObservableObject {
         state.contactsHash = newContactsHash
         state.shortcutsHash = newShortcutsHash
         state.photoHashes = newPhotoHashes
-        if statusSent { state.statusSentAt = currentNow }
+        if statusSent {
+            state.statusSentAt = currentNow
+            statusAsked = false
+        }
         state.fingerprint = preferences.fingerprint
         if full { state.lastFullSync = currentNow }
         persist()
@@ -801,6 +808,12 @@ final class PhoneSyncEngine: ObservableObject {
     /// Whether an upload has a section to send.
     nonisolated static func carriesNews(_ batch: [String: Any]) -> Bool {
         batch.keys.contains { !frameKeys.contains($0) }
+    }
+
+    /// The next pass sends the status even when it hasn't changed: the
+    /// host woke the phone for a new reading.
+    func sendStatusOnNextPass() {
+        statusAsked = true
     }
 
     /// The sharing as it really is: access taken away in the Settings app
@@ -1236,7 +1249,7 @@ final class PhoneSyncEngine: ObservableObject {
                     let edit = change.fields.contact
                     let typed = [edit?.givenName, edit?.familyName].compactMap { $0 }.joined(separator: " ")
                     let name = change.fields.personName ?? (typed.isEmpty ? edit?.organization : typed)
-                    added = PhonePerson(id: PhonePerson.id(forContact: identifier), name: name ?? AppLocalization.string("Contact"))
+                    added = PhonePerson(id: PhonePerson.id(forContact: identifier), name: name ?? AppLocalization.string("Contact", table: .phone))
                     added.organization = edit?.organization
                     added.nickname = edit?.nickname
                     added.phones = edit?.phones ?? []
@@ -1459,7 +1472,7 @@ final class PhoneSyncEngine: ObservableObject {
     /// Photos turned on without access to the library.
     struct PhotosNotAllowed: LocalizedError {
         var errorDescription: String? {
-            AppLocalization.string("Conduit can't see your photos. Allow Photos for Conduit in Settings to share them with Hermes.")
+            AppLocalization.string("Conduit can't see your photos. Allow Photos for Conduit in Settings to share them with Hermes.", table: .phone)
         }
     }
 

@@ -48,6 +48,17 @@ enum PollCadence {
     /// The Chats list's registry poll: 4 s while something on the list
     /// changes or a turn runs, then longer each time nothing moved.
     static let chatListSteps: [TimeInterval] = [4, 8, 15, 30, 60]
+    /// The same poll on a gateway that pushes `sessions.changed` (issue
+    /// 851): a turn's first and last messages move the stored rows, and the
+    /// catalog read that follows wakes the poll, so a quiet list may wait
+    /// one step longer.
+    static let chatListStepsFollowingChanges: [TimeInterval] = chatListSteps + [120]
+    /// A window counted in view while inactive (a Mac's behind other apps,
+    /// with no way to tell it's covered) keeps the list's 4 s pace for this
+    /// long, then waits at least `chatListInactiveFloor` even while a turn
+    /// runs (issue 2360). Coming back to it reads at once.
+    static let chatListInactiveAfter: TimeInterval = 120
+    static let chatListInactiveFloor: TimeInterval = 30
     /// An idle open chat's registry check (another device's turn): 15 s,
     /// then longer while the chat stays the same.
     static let openChatIdleSteps: [TimeInterval] = [15, 30, 60]
@@ -145,10 +156,25 @@ struct ChatListPollPacer {
         var turnRunning: Bool
         /// Bumped by every catalog read that changed the list.
         var catalogGeneration: Int
+        /// The gateway pushes `sessions.changed` (`change_events`).
+        var followsChanges = false
+        /// How long the app has been inactive while its window still counts
+        /// as in view (a Mac's); nil while it's active.
+        var inactiveFor: TimeInterval? = nil
     }
 
-    private(set) var backoff = PollBackoff(steps: PollCadence.chatListSteps)
+    /// Steps through the longer pace; `interval(followingChanges:)` stops
+    /// at 60 s on a gateway without change events.
+    private(set) var backoff = PollBackoff(steps: PollCadence.chatListStepsFollowingChanges)
     private var last: Observation?
+
+    /// The wait at the current step.
+    func interval(followingChanges: Bool) -> TimeInterval {
+        let longest = followingChanges
+            ? PollCadence.chatListStepsFollowingChanges.last
+            : PollCadence.chatListSteps.last
+        return min(backoff.interval, longest ?? backoff.interval)
+    }
 
     /// Something the user did, a return to the app or a send: back to the
     /// shortest interval, and the next tick compares afresh.
@@ -169,21 +195,31 @@ struct ChatListPollPacer {
             // A failed read moves nothing: it backs off like a quiet one,
             // with jitter.
             backoff.lengthen()
-            return PollCadence.afterFailure(
-                PollCadence.stretched(backoff.interval, by: conditions),
-                random: random
-            )
+            var wait = interval(followingChanges: observation.followsChanges)
+            if let inactive = observation.inactiveFor, inactive >= PollCadence.chatListInactiveAfter {
+                wait = max(wait, PollCadence.chatListInactiveFloor)
+            }
+            return PollCadence.afterFailure(PollCadence.stretched(wait, by: conditions), random: random)
         }
         let changed = last.map {
             $0.registry != registry || $0.catalogGeneration != observation.catalogGeneration
         } ?? true
         last = observation
+        if let inactive = observation.inactiveFor, inactive >= PollCadence.chatListInactiveAfter {
+            // Nothing says anyone sees the window: no turn or change keeps
+            // the 4 s pace.
+            backoff.lengthen()
+            return PollCadence.stretched(
+                max(interval(followingChanges: observation.followsChanges), PollCadence.chatListInactiveFloor),
+                by: conditions
+            )
+        }
         if observation.turnRunning || changed {
             backoff.reset()
         } else {
             backoff.lengthen()
         }
-        return PollCadence.stretched(backoff.interval, by: conditions)
+        return PollCadence.stretched(interval(followingChanges: observation.followsChanges), by: conditions)
     }
 
     /// The registry rows' part of an observation.

@@ -60,18 +60,18 @@ enum RoomApprovalText {
     static func line(for approval: RoomApproval) -> String {
         let agent = [approval.agentName, approval.agentHandle, approval.agentProfile]
             .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .first { !$0.isEmpty } ?? AppLocalization.string("Your agent")
+            .first { !$0.isEmpty } ?? AppLocalization.string("Your agent", table: .rooms)
         let room = approval.room?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let host = approval.from?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         switch (room.isEmpty, host.isEmpty) {
         case (false, false):
-            return AppLocalization.string("\(agent) in \(room), hosted by \(host)")
+            return AppLocalization.string("\(agent) in \(room), hosted by \(host)", table: .rooms)
         case (false, true):
-            return AppLocalization.string("\(agent) in \(room)")
+            return AppLocalization.string("\(agent) in \(room)", table: .rooms)
         case (true, false):
-            return AppLocalization.string("\(agent) in a room hosted by \(host)")
+            return AppLocalization.string("\(agent) in a room hosted by \(host)", table: .rooms)
         case (true, true):
-            return AppLocalization.string("\(agent) in a room hosted elsewhere")
+            return AppLocalization.string("\(agent) in a room hosted elsewhere", table: .rooms)
         }
     }
 }
@@ -150,7 +150,7 @@ struct RoomApprovalsClient {
     /// the turn moved on, the agent's place in the room ended, its API
     /// server down).
     static func refusal(for error: Error) -> String {
-        AppLocalization.string("Could not answer: \(RoomLinksClient.message(for: error))")
+        AppLocalization.string("Could not answer: \(RoomLinksClient.message(for: error))", table: .rooms)
     }
 }
 
@@ -199,13 +199,40 @@ extension AppState {
         return !approvals.approvals.contains { $0.id == id }
     }
 
+    /// How long Group Chats waits on screen before reading your agents'
+    /// approvals again: sooner while one is listed (answered on another
+    /// device, its row goes), and still now and then when none is (one asked
+    /// meanwhile shows without a pull to refresh).
+    nonisolated static func rosterApprovalsInterval(listed: Bool) -> Duration {
+        listed ? .seconds(15) : .seconds(45)
+    }
+
+    /// Reads the approvals again for as long as Group Chats is on screen
+    /// (its task's lifetime), as a copy's room screen does each tick, while
+    /// the app is active.
+    func followLinkedRoomApprovalsOnScreen() async {
+        while !Task.isCancelled {
+            // From this dashboard's list: another's stale one doesn't set the pace.
+            let listed = !linkedRoomApprovalRows.isEmpty
+            try? await Task.sleep(for: Self.rosterApprovalsInterval(listed: listed))
+            guard !Task.isCancelled else { return }
+            // Inactive or in the background: skipped, as the invites' follow is.
+            if groupChatPhase == .available, canAnswerRoomApprovals, isSceneActive { await refreshLinkedRoomApprovals() }
+        }
+    }
+
     /// Reads the approvals. A read that fails keeps what was read last, and
     /// one that a sign-out or another dashboard overtook is dropped, as the
     /// invites' is.
     /// True when the plugin answered.
     @discardableResult
-    func refreshLinkedRoomApprovals() async -> Bool {
-        await readLinkedRoomApprovals() != nil
+    func refreshLinkedRoomApprovals(since: Date? = nil) async -> Bool {
+        guard canAnswerRoomApprovals, isConnected else { return false }
+        // One at a time (issue 2359): a burst of pushes, the 15 s follow
+        // and Group Chats' reads share it.
+        return await linkedRoomApprovalsReader.read(key: linkedRoomListReadKey(), since: since) { [weak self] in
+            await self?.readLinkedRoomApprovals() != nil
+        }
     }
 
     /// The approvals read now, kept for Group Chats; nil when the read
@@ -213,9 +240,12 @@ extension AppState {
     private func readLinkedRoomApprovals(timeoutMilliseconds: Int? = nil) async -> [RoomApproval]? {
         guard canAnswerRoomApprovals, isConnected else { return nil }
         let epoch = groupRoomEpoch
+        let generation = linkedRosterGeneration
         let client = roomApprovalsClient
+        // One a Block or leave overtook could list grants it ended.
         guard let approvals = try? await client.approvals(timeoutMilliseconds: timeoutMilliseconds),
-              groupRoomEpoch == epoch, activeDashboardID == client.dashboardID else { return nil }
+              groupRoomEpoch == epoch, linkedRosterGeneration == generation,
+              activeDashboardID == client.dashboardID else { return nil }
         // One the plugin no longer lists needn't be remembered as answered.
         let listed = Set(approvals.map(\.id))
         if !answeredLinkedRoomApprovalIDs.isSubset(of: listed) {

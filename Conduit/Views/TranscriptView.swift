@@ -43,6 +43,12 @@ struct TranscriptView: UIViewControllerRepresentable {
     /// has none.
     var renderedScope: ChatRenderedScrollScope? = nil
     var layoutSettled: @MainActor (ChatRenderedScrollScope) -> Void = { _ in }
+    /// The composer ⌘V in the transcript pastes into, on a Mac (issue
+    /// 1692): the chat's or the room's.
+    var pasteTarget: ComposerPasteTarget? = nil
+    /// The slide a Bot Chat and its workstream change places with, on a
+    /// screen that shows both (`TranscriptSwapMotion`).
+    var swapMotion: TranscriptSwapMotion? = nil
 
     func makeUIViewController(context: Context) -> TranscriptViewController {
         TranscriptViewController(appState: appState, scroller: scroller)
@@ -51,6 +57,8 @@ struct TranscriptView: UIViewControllerRepresentable {
     func updateUIViewController(_ controller: TranscriptViewController, context: Context) {
         controller.rowContent = rowContent
         controller.layoutSettled = layoutSettled
+        controller.pasteTarget = pasteTarget
+        controller.swapMotion = swapMotion
         let transaction = context.transaction
         controller.update(
             rows: rows,
@@ -72,7 +80,7 @@ struct TranscriptView: UIViewControllerRepresentable {
 /// (children of this one, so what a row presents, a sheet or a popover,
 /// has a place to present from) and the scroller's attachment to them.
 @MainActor
-final class TranscriptViewController: UIViewController, UICollectionViewDelegate, UIGestureRecognizerDelegate {
+final class TranscriptViewController: UIViewController, UICollectionViewDelegate, UIGestureRecognizerDelegate, TranscriptSwapStage {
     let layout = TranscriptLayout()
     private(set) lazy var collectionView = TranscriptCollectionView(frame: .zero, collectionViewLayout: layout)
     private var dataSource: UICollectionViewDiffableDataSource<Int, String>?
@@ -84,6 +92,19 @@ final class TranscriptViewController: UIViewController, UICollectionViewDelegate
     private var rowEnvironment = TranscriptCellEnvironment(EnvironmentValues(), disclosure: nil)
     var rowContent: @MainActor (TranscriptRow) -> AnyView = { _ in AnyView(EmptyView()) }
     var layoutSettled: @MainActor (ChatRenderedScrollScope) -> Void = { _ in }
+    /// Slides this transcript when its chat is swapped in place.
+    var swapMotion: TranscriptSwapMotion? {
+        didSet {
+            guard swapMotion !== oldValue else { return }
+            if oldValue?.stage === self { oldValue?.stage = nil }
+            swapMotion?.stage = self
+        }
+    }
+    private(set) var conversationJustChanged = false
+    /// The rows slid away and wait for `slideIn` or `comeBack`. Kept here
+    /// rather than read off the layer: UIKit drops a layer's animations
+    /// when the app leaves the screen, and the rows must still come back.
+    private(set) var rowsAreAway = false
 
     private var rowsByID: [String: TranscriptRow] = [:]
     private var appliedRows: [TranscriptRow] = []
@@ -142,7 +163,14 @@ final class TranscriptViewController: UIViewController, UICollectionViewDelegate
         collectionView.didLayout = { [weak self] in self?.collectionViewDidLayout() }
         dataSource = UICollectionViewDiffableDataSource<Int, String>(collectionView: collectionView) { [weak self] collectionView, indexPath, id in
             let cell = collectionView.dequeueReusableCell(withReuseIdentifier: TranscriptCell.reuseIdentifier, for: indexPath)
-            if let cell = cell as? TranscriptCell { self?.configure(cell, id: id) }
+            if let cell = cell as? TranscriptCell {
+                if cell.knowsHeight == nil {
+                    cell.knowsHeight = { [weak self] id, width in
+                        self?.layout.hasCurrentMeasurement(of: id, width: width) ?? false
+                    }
+                }
+                self?.configure(cell, id: id)
+            }
             return cell
         }
         // After UIScrollView's own target, so a fling has begun by the time
@@ -154,6 +182,15 @@ final class TranscriptViewController: UIViewController, UICollectionViewDelegate
         tap.cancelsTouchesInView = false
         tap.delegate = self
         collectionView.addGestureRecognizer(tap)
+        // On a Mac a click anywhere in the transcript, on a row too, leaves
+        // it the keys, so ⌘V pastes into the composer (issue 1692).
+        if ComposerLayout.transcriptTakesPaste() {
+            let pasteTap = UITapGestureRecognizer(target: self, action: #selector(takeKeysAfterClick))
+            pasteTap.cancelsTouchesInView = false
+            pasteTap.delegate = self
+            collectionView.addGestureRecognizer(pasteTap)
+            self.pasteTap = pasteTap
+        }
     }
 
     /// Saves a chat trace when rows on screen aren't drawn (issue 1942).
@@ -197,6 +234,17 @@ final class TranscriptViewController: UIViewController, UICollectionViewDelegate
         dropParkedIfIdle()
         // Before the rows: a cell configured for them draws with these.
         if environment != rowEnvironment {
+            // Rows measured under the last environment, off screen too,
+            // measure again as their cells next show them, unless only
+            // something no row's height reads changed.
+            // Most changes in a live chat name their rows (a turn starting
+            // or ending, a reply landing): only those measure again, so
+            // scrolling back after a turn keeps the rest (issue 2358).
+            if let ids = environment.measurementChange(from: rowEnvironment).rowIDs(in: rows) {
+                layout.forgetMeasurements(of: ids)
+            } else {
+                layout.forgetCurrentMeasurements()
+            }
             rowEnvironment = environment
             for case let cell as TranscriptCell in collectionView.visibleCells {
                 cell.updateEnvironment(environment)
@@ -209,12 +257,147 @@ final class TranscriptViewController: UIViewController, UICollectionViewDelegate
         applyInsets(insets, animation: insetsAnimation)
         applyEdgeEffect(composerFloats: composerFloats)
         let conversationChanged = appliedConversation != nil && appliedConversation != conversation
+        if conversationChanged { chatLeft.chatChanged(showing: appliedRows) }
         appliedConversation = conversation
         applyRows(rows, redrawingAll: conversationChanged)
+        showsRowsOfChatLeft = chatLeft.areStill(appliedRows)
+        rowsWereDrawn(conversationChanged: conversationChanged)
         if renderedScope != pendingScope {
             pendingScope = renderedScope
             collectionView.setNeedsLayout()
         }
+    }
+
+    // MARK: - Swap slide (TranscriptSwapMotion)
+
+    /// The rows as the chat changed, until the new chat's replace them.
+    private var chatLeft = TranscriptRowsOfChatLeft()
+    private var showsRowsOfChatLeft = false
+    var showsChatRows: Bool { !showsRowsOfChatLeft && appliedRows.contains(where: \.isChatRow) }
+    var shownConversation: String? { appliedConversation }
+
+    /// Rows were applied. Another chat's slide in when the screen swapped
+    /// them for the last one's, in the commit that draws them: its own
+    /// rows, so a chat still waiting for them (its welcome showing) slides
+    /// in when they land. Any other chat just shows.
+    private func rowsWereDrawn(conversationChanged: Bool) {
+        if conversationChanged, let swapMotion, swapMotion.waitsForAnotherChat(than: appliedConversation) {
+            // Another chat's rows than the swap waiting was asked for (a
+            // quick second swap the screen hears of after this pass, issue
+            // 2513): they don't come in with the first swap's slide. The
+            // screen asks theirs before this pass ends; asked for nothing
+            // (the same chat drawn under its open id), the waiting swap
+            // brings them in as before.
+            conversationJustChanged = true
+            let drawn = appliedConversation
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.conversationJustChanged = false
+                guard self.appliedConversation == drawn, let motion = self.swapMotion,
+                      motion.waitsForAnotherChat(than: drawn) else { return }
+                if let swap = motion.rowsDrawn(conversationChanged: true, chatRows: self.showsChatRows) {
+                    self.slideIn(swap)
+                }
+            }
+            return
+        }
+        guard let swapMotion, swapMotion.expected != nil else {
+            guard conversationChanged else { return }
+            // The screen may hear of the open after the transcript: until
+            // this pass ends, it can still ask for the chat's slide. Asked
+            // for nothing, the chat just shows, and rows that left for it
+            // come back.
+            conversationJustChanged = true
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.conversationJustChanged = false
+                if self.swapMotion?.expected == nil { self.comeBack() }
+            }
+            return
+        }
+        if let swap = swapMotion.rowsDrawn(conversationChanged: conversationChanged, chatRows: showsChatRows) {
+            slideIn(swap)
+        }
+    }
+
+    /// Toward the trailing edge, in points.
+    private func swapDistance(_ widths: CGFloat) -> CGFloat {
+        let trailing: CGFloat = collectionView.effectiveUserInterfaceLayoutDirection == .rightToLeft ? -1 : 1
+        return widths * trailing * collectionView.bounds.width
+    }
+
+    /// A picture of the rows that left, which slides out in their place:
+    /// the open replaces the rows themselves within a few milliseconds
+    /// (with the new chat's welcome first, often), and those would slide
+    /// out instead. The rows wait unseen until `slideIn` or `comeBack`.
+    private(set) var leaving: UIView?
+
+    func slideOut(_ swap: BotChatSwap, atOnce: Bool) {
+        guard isViewLoaded else { return }
+        let layer = collectionView.layer
+        let distance = swapDistance(TranscriptSwapSlide.leavingShift(swap))
+        if let picture = leaving ?? collectionView.snapshotView(afterScreenUpdates: false) {
+            // From where the rows show now (a slide in still playing), or
+            // where the picture already is (asked again while away).
+            let out = TranscriptSwapSlide.out(from: leaving == nil ? layer : picture.layer, by: distance)
+            if leaving == nil {
+                picture.frame = collectionView.frame
+                picture.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+                picture.isUserInteractionEnabled = false
+                picture.accessibilityElementsHidden = true
+                view.insertSubview(picture, aboveSubview: collectionView)
+                leaving = picture
+            }
+            picture.layer.add(out, forKey: TranscriptSwapSlide.key)
+            layer.add(TranscriptSwapSlide.unseen(), forKey: TranscriptSwapSlide.key)
+        } else {
+            layer.add(TranscriptSwapSlide.out(from: layer, by: distance), forKey: TranscriptSwapSlide.key)
+        }
+        // Away, the rows take no taps where they were: only what shows
+        // moved, not the views.
+        rowsAreAway = true
+        collectionView.isUserInteractionEnabled = false
+        collectionView.accessibilityElementsHidden = true
+        // Sent to the render server now, so it plays while the open that
+        // follows keeps the main thread.
+        if atOnce { CATransaction.flush() }
+    }
+
+    func slideIn(_ swap: BotChatSwap) {
+        guard isViewLoaded else { return }
+        rowsAreBack()
+        let slide = TranscriptSwapSlide.in(
+            from: swapDistance(TranscriptSwapSlide.arrivingShift(swap)),
+            opacity: TranscriptSwapSlide.arrivingOpacity(swap)
+        )
+        collectionView.layer.add(slide, forKey: TranscriptSwapSlide.key)
+    }
+
+    func comeBack() {
+        guard isViewLoaded else { return }
+        let layer = collectionView.layer
+        // Only rows that left and are held away: a slide in ends on its own.
+        guard rowsAreAway else { return }
+        // From where the picture of them went.
+        layer.add(TranscriptSwapSlide.back(from: leaving?.layer ?? layer), forKey: TranscriptSwapSlide.key)
+        leaving?.removeFromSuperview()
+        leaving = nil
+        rowsAreBack()
+    }
+
+    /// The rows show again, so they take taps and VoiceOver again. The
+    /// picture of the ones that left finishes its slide (it ends unseen),
+    /// then goes.
+    private func rowsAreBack() {
+        if let picture = leaving {
+            leaving = nil
+            DispatchQueue.main.asyncAfter(deadline: .now() + TranscriptSwapSlide.outDuration) { [weak picture] in
+                picture?.removeFromSuperview()
+            }
+        }
+        rowsAreAway = false
+        collectionView.isUserInteractionEnabled = true
+        collectionView.accessibilityElementsHidden = false
     }
 
     /// The rows, by id: a row that changed draws again in its cell, the
@@ -318,8 +501,8 @@ final class TranscriptViewController: UIViewController, UICollectionViewDelegate
     /// lays out the row's cell, after the collection view's own pass, so
     /// the pass that lays the rows out again, and moves a following reader
     /// to the new end, is asked for at once: left to UIKit, it waits for
-    /// whatever next wakes the main thread, with the row drawn past its
-    /// cell and the reader a line short of the end meanwhile.
+    /// whatever next wakes the main thread, with the row cut off at its
+    /// cell's bottom and the reader a line short of the end meanwhile.
     private func rowResized(_ id: String, to size: CGSize) {
         layout.rowResized(id, to: size)
         guard !passAsked else { return }
@@ -467,10 +650,60 @@ final class TranscriptViewController: UIViewController, UICollectionViewDelegate
         ReturnKeyTextView.putAwayFocus()
     }
 
+    // MARK: - ⌘V on a Mac (issue 1692)
+
+    /// The composer ⌘V here pastes into; nil takes none.
+    var pasteTarget: ComposerPasteTarget?
+    private var pasteTap: UITapGestureRecognizer?
+
+    /// After a click that left nobody the keys (a click on the transcript
+    /// puts the composer's focus away), the transcript takes them, so ⌘V
+    /// still has somewhere to go. A click that selected text, or that a
+    /// field took, keeps its own.
+    @objc private func takeKeysAfterClick() {
+        // After the click's own handling: a row's tap puts focus away too.
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.canBecomeFirstResponder, self.view.window != nil,
+                  FirstResponderProbe.current == nil else { return }
+            _ = self.becomeFirstResponder()
+        }
+    }
+
+    override var canBecomeFirstResponder: Bool {
+        pasteTarget != nil && ComposerLayout.transcriptTakesPaste()
+    }
+
+    override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
+        if action == #selector(paste(_:)) {
+            return pasteTarget != nil && ComposerLayout.transcriptTakesPaste() && ComposerPaste.clipboardHasSomething
+        }
+        return super.canPerformAction(action, withSender: sender)
+    }
+
+    /// ⌘V (or Edit › Paste) with the transcript holding the keys: the
+    /// conversation's composer takes focus and the paste.
+    override func paste(_ sender: Any?) {
+        // A Mac's alone: an iPhone or iPad keeps ⌘V doing nothing here,
+        // so it never brings the on-screen keyboard up.
+        guard let pasteTarget, ComposerLayout.transcriptTakesPaste() else { return }
+        ComposerPaste.requests.send(pasteTarget)
+    }
+
     /// Only touches on the collection view itself: one on a row is the
-    /// row's.
+    /// row's. The Mac's click that leaves the transcript the keys hears
+    /// them all.
     func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
-        touch.view === collectionView
+        if let pasteTap, gestureRecognizer === pasteTap { return true }
+        return touch.view === collectionView
+    }
+
+    /// The Mac's click recognizer never takes a click from anyone else's.
+    func gestureRecognizer(
+        _ gestureRecognizer: UIGestureRecognizer,
+        shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer
+    ) -> Bool {
+        if let pasteTap { return gestureRecognizer === pasteTap || otherGestureRecognizer === pasteTap }
+        return false
     }
 }
 
@@ -534,11 +767,38 @@ final class TranscriptCell: UICollectionViewCell {
     /// the main thread never gets back to its run loop (build 265's
     /// watchdog kill swiping out of a Bot Chat).
     private(set) var drawnSize: CGSize?
+    /// Whether the transcript already holds a row's height at a width,
+    /// measured since the row last drew something else: a cell showing it
+    /// again (scrolling back over rows already seen) takes that height
+    /// instead of measuring the row's SwiftUI content once more, which was
+    /// most of a long chat's per-row cost on every pass (issue 1763).
+    /// The layout forgets them all when the chat's environment changes
+    /// (TranscriptLayout.forgetCurrentMeasurements).
+    var knowsHeight: (@MainActor (String, CGFloat) -> Bool)?
+
+    /// The row draws inside it, cut off at the cell's top and bottom, so a
+    /// row never draws over the rows above or under it: a row that grows
+    /// (a fold opened, a reply streaming in) shows its new part once the
+    /// pass it asks for gives the cell its height (`rowResized`). Beside
+    /// the row it reaches `sideOverhang` past the cell, so a row's shadow
+    /// (a sent message's bubble) isn't cut off. A card's text was drawn
+    /// over the rows under it while it folded (an App Store review of build
+    /// 259, 2026-11-13).
+    private let clipView = UIView()
+    private static let sideOverhang: CGFloat = 64
+
+    /// The view the hosted row's view is in (TranscriptBlankWatch).
+    var rowContainer: UIView { clipView }
 
     override init(frame: CGRect) {
         super.init(frame: frame)
         backgroundColor = .clear
         contentView.backgroundColor = .clear
+        clipView.backgroundColor = .clear
+        clipView.clipsToBounds = true
+        clipView.frame = contentView.bounds.insetBy(dx: -Self.sideOverhang, dy: 0)
+        clipView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        contentView.addSubview(clipView)
     }
 
     @available(*, unavailable)
@@ -549,6 +809,7 @@ final class TranscriptCell: UICollectionViewCell {
     /// Shows `root` in the cell, in a hosting controller that is a child of
     /// `parent`'s.
     func host(_ root: TranscriptCellRoot, rowID: String, in parent: UIViewController) {
+        let otherRow = hostedRowID != rowID
         hostedRowID = rowID
         // Another row, or the same row drawing something else: measured
         // afresh until it reports how it draws.
@@ -560,7 +821,22 @@ final class TranscriptCell: UICollectionViewCell {
             resized(size)
         }
         if let hosting {
-            hosting.rootView = root
+            guard otherRow else {
+                hosting.rootView = root
+                return
+            }
+            // Another row in a reused cell draws at once. Reused inside an
+            // animated update, the last row's content would animate into
+            // this one's, drawn across both.
+            var transaction = Transaction()
+            transaction.disablesAnimations = true
+            withTransaction(transaction) {
+                hosting.rootView = root
+                // Drawn now, in this transaction: left for the next pass,
+                // it would draw in the update's animation all the same.
+                hosting.view.setNeedsLayout()
+                hosting.view.layoutIfNeeded()
+            }
             return
         }
         let hosting = UIHostingController(rootView: root)
@@ -568,10 +844,10 @@ final class TranscriptCell: UICollectionViewCell {
         // one mustn't pad its row as well.
         hosting.safeAreaRegions = []
         hosting.view.backgroundColor = .clear
-        hosting.view.frame = contentView.bounds
+        hosting.view.frame = clipView.bounds.insetBy(dx: Self.sideOverhang, dy: 0)
         hosting.view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         parent.addChild(hosting)
-        contentView.addSubview(hosting.view)
+        clipView.addSubview(hosting.view)
         hosting.didMove(toParent: parent)
         self.hosting = hosting
     }
@@ -606,6 +882,9 @@ final class TranscriptCell: UICollectionViewCell {
         let size: CGSize
         if let drawnSize, abs(drawnSize.width - width) <= 0.5 {
             size = drawnSize
+        } else if let hostedRowID, knowsHeight?(hostedRowID, width) == true {
+            // Its frame already has the height it measured.
+            return layoutAttributes
         } else {
             size = hosting.sizeThatFits(in: CGSize(width: width, height: .greatestFiniteMagnitude))
         }
@@ -657,9 +936,10 @@ struct TranscriptCellRoot: View {
 /// The row in its cell. Measured (the cell asks with no height, or one no
 /// row reaches), it's the row's ideal height at the cell's width. Drawn,
 /// it's the cell's frame, the row at its top at its ideal height: a row
-/// that grows draws down from its top at once while the cell takes its new
-/// height in the next pass, where the hosting controller would center it
-/// in the old frame meanwhile and move it up and back.
+/// that grows draws down from its top at once (cut off at the cell's
+/// bottom, TranscriptCell) while the cell takes its new height in the next
+/// pass, where the hosting controller would center it in the old frame
+/// meanwhile and move it up and back.
 private struct TranscriptCellLayout: Layout {
     /// A proposed height at least this tall is a measurement's.
     private static let measuringHeight: CGFloat = 1e7

@@ -39,56 +39,72 @@ enum RoomLeaveResult: Equatable {
 enum RoomLeaveText {
     static func outLine(_ out: RoomMemberOut) -> String {
         switch out {
-        case .left: return AppLocalization.string("Left the room")
-        case .removed: return AppLocalization.string("Taken out")
+        case .left: return AppLocalization.string("Left the room", table: .rooms)
+        case .removed: return AppLocalization.string("Taken out", table: .rooms)
         }
     }
 
     static func takeOutTitle(_ name: String) -> String {
-        AppLocalization.string("Take \(name) out of this room?")
+        AppLocalization.string("Take \(name) out of this room?", table: .rooms)
+    }
+
+    /// A bot of your other Hermes, in a room of only your own Hermes (either
+    /// side's Take Out, and Leave on the far side).
+    static func takeOutOwnMessage(_ name: String) -> String {
+        AppLocalization.string("\(name) stops taking part, and your other Hermes is told.", table: .rooms)
+    }
+
+    static var leaveOwnMessage: String {
+        AppLocalization.string(
+            "Your bots stop taking part, and your other Hermes is told. Your copy of the room and their chats for it stay until you delete it.", table: .rooms)
     }
 
     /// Another person's agent, in a room you host.
     static func takeOutMessage(_ name: String, owner: String?) -> String {
         if let owner = owner?.trimmingCharacters(in: .whitespacesAndNewlines), !owner.isEmpty {
-            return AppLocalization.string("\(name) stops taking part, and \(owner)'s Hermes is told.")
+            return AppLocalization.string("\(name) stops taking part, and \(owner)'s Hermes is told.", table: .rooms)
         }
-        return AppLocalization.string("\(name) stops taking part, and their Hermes is told.")
+        return AppLocalization.string("\(name) stops taking part, and their Hermes is told.", table: .rooms)
     }
 
     /// Your agent, in a room someone else hosts.
     static func takeOutMessage(_ name: String, in copy: RoomCopy) -> String {
         let host = copy.from.trimmingCharacters(in: .whitespacesAndNewlines)
         if !host.isEmpty {
-            return AppLocalization.string("\(name) stops taking part, and \(host) is told.")
+            return AppLocalization.string("\(name) stops taking part, and \(host) is told.", table: .rooms)
         }
-        return AppLocalization.string("\(name) stops taking part, and the host is told.")
+        return AppLocalization.string("\(name) stops taking part, and the host is told.", table: .rooms)
     }
 
-    static var leaveTitle: String { AppLocalization.string("Leave this room?") }
+    static var leaveTitle: String { AppLocalization.string("Leave this room?", table: .rooms) }
 
     static func leaveMessage(_ copy: RoomCopy) -> String {
         let host = copy.from.trimmingCharacters(in: .whitespacesAndNewlines)
+        if copy.justMe {
+            return host.isEmpty
+                ? AppLocalization.string("You stop getting this room, and the host is told. Your copy of it stays until you delete it.", table: .rooms)
+                : AppLocalization.string("You stop getting this room, and \(host) is told. Your copy of it stays until you delete it.", table: .rooms)
+        }
         if !host.isEmpty {
             return AppLocalization.string(
-                "Your agents stop taking part, and \(host) is told. Your copy of the room and their chats for it stay until you delete it.")
+                "Your agents stop taking part, and \(host) is told. Your copy of the room and their chats for it stay until you delete it.", table: .rooms)
         }
         return AppLocalization.string(
-            "Your agents stop taking part, and the host is told. Your copy of the room and their chats for it stay until you delete it.")
+            "Your agents stop taking part, and the host is told. Your copy of the room and their chats for it stay until you delete it.", table: .rooms)
     }
 
     static func takeOutRefusal(for error: Error) -> String {
-        AppLocalization.string("Could not take this agent out: \(RoomLinksClient.message(for: error))")
+        AppLocalization.string("Could not take this agent out: \(RoomLinksClient.message(for: error))", table: .rooms)
     }
 
     static func leaveRefusal(for error: Error) -> String {
-        AppLocalization.string("Could not leave this room: \(RoomLinksClient.message(for: error))")
+        AppLocalization.string("Could not leave this room: \(RoomLinksClient.message(for: error))", table: .rooms)
     }
 
-    static var stillSendingTitle: String { AppLocalization.string("Still on its way") }
+    static var stillSendingTitle: String { AppLocalization.string("Still on its way", table: .rooms) }
 
     static var stillSending: String {
-        AppLocalization.string("Your Hermes is still sending this. The room shows it once it has.")
+        AppLocalization.string("Your Hermes is still sending this. The room shows it once it has.", table: .rooms)
     }
 
     /// A 504: the mailbox hasn't answered yet, and the change may be made.
@@ -182,10 +198,11 @@ extension AppState {
         return member.isPeer
     }
 
-    /// Whether your agents can leave the open room someone else hosts.
+    /// Whether your agents, or you with Just me, can leave the open room
+    /// someone else hosts.
     var canLeaveActiveRoom: Bool {
         guard canLeaveLinkedRooms, let copy = activeRoomSurface?.copy else { return false }
-        return !copy.isOver && !copy.yours.isEmpty
+        return !copy.isOver && (!copy.yours.isEmpty || copy.justMe)
     }
 
     /// Takes `member` out of the open room: your agent out of a room someone
@@ -198,9 +215,11 @@ extension AppState {
         do {
             if let copy = surface.copy, let profile = member.profile {
                 let invite = try await client.leave(link: copy.link, roomID: copy.roomID, profiles: [profile])
+                linkedRosterGeneration &+= 1
                 adoptLinkedRoomInvite(invite, from: client.dashboardID)
             } else {
                 try await client.remove(roomID: surface.room.roomID, memberID: memberID)
+                linkedRosterGeneration &+= 1
             }
         } catch {
             return await refused(error, in: surface, saying: RoomLeaveText.takeOutRefusal(for: error))
@@ -218,6 +237,8 @@ extension AppState {
         let client = roomLeaveClient
         do {
             let invite = try await client.leave(link: copy.link, roomID: copy.roomID, profiles: nil)
+            // A read issued before the leave could put back what it changed.
+            linkedRosterGeneration &+= 1
             adoptLinkedRoomInvite(invite, from: client.dashboardID)
         } catch {
             return await refused(error, in: surface, saying: RoomLeaveText.leaveRefusal(for: error))

@@ -24,6 +24,28 @@ extension SidebarLayoutTests {
         }
     }
 
+    /// A chat kept beside the open one (all-live stage 2) takes half of
+    /// what the list leaves, less where the open chat would fall under its
+    /// least width, and no pane at all where the two don't fit.
+    func testAChatKeptBesideFitsOnlyWhereBothChatsKeepTheirWidth() {
+        // An 11-inch iPad on its side: 1194 pt, less the list and its line.
+        XCTAssertEqual(V2SplitLayout.besideChatWidth(chatRoom: 818), 387)
+        // A 13-inch iPad: half of the room.
+        XCTAssertEqual(V2SplitLayout.besideChatWidth(chatRoom: 1000), 499)
+        // The least room, and one point short of it.
+        let least = V2SplitLayout.minimumChatWidth + 1 + V2SplitLayout.minimumBesideChatWidth
+        XCTAssertEqual(V2SplitLayout.besideChatWidth(chatRoom: least), V2SplitLayout.minimumBesideChatWidth)
+        XCTAssertNil(V2SplitLayout.besideChatWidth(chatRoom: least - 1))
+        // An iPhone on its side, a portrait iPad.
+        XCTAssertNil(V2SplitLayout.besideChatWidth(chatRoom: 580))
+        XCTAssertNil(V2SplitLayout.besideChatWidth(chatRoom: 0))
+
+        XCTAssertTrue(V2SplitLayout.showsBesideChat(path: [.conversation], showsSettings: false, inRoom: false))
+        XCTAssertFalse(V2SplitLayout.showsBesideChat(path: [], showsSettings: false, inRoom: false), "The placeholder has no chat to sit beside")
+        XCTAssertFalse(V2SplitLayout.showsBesideChat(path: [.conversation], showsSettings: true, inRoom: false))
+        XCTAssertFalse(V2SplitLayout.showsBesideChat(path: [.conversation], showsSettings: false, inRoom: true))
+    }
+
     func testV2SplitHiddenListKeepsOneColumn() {
         // #1164: the list hidden, a wide window keeps one column (the chat's
         // readable column scales on its own, #1320).
@@ -125,7 +147,8 @@ extension SidebarLayoutTests {
 
     func testV2SplitListLeavesVoiceToTheChatBesideIt() {
         let project = ProjectSummary(id: "p1", title: "Trips", isHome: false, sessionCount: 0, previewSessions: [])
-        // A chat beside the list has its own voice button by the composer.
+        // A chat beside the list has its own voice button (by the composer,
+        // or a Mac's live call in the chat's header).
         XCTAssertTrue(V2SplitLayout.hasChatVoiceBeside(split: true, path: [.conversation], inRoom: false))
         XCTAssertTrue(V2SplitLayout.hasChatVoiceBeside(split: true, path: [.project(project), .conversation], inRoom: false))
         // No chat shown, a group room (no voice button), or one column
@@ -187,6 +210,201 @@ extension SidebarLayoutTests {
         XCTAssertFalse(V2SplitLayout.settingsBesideList(split: false))
         XCTAssertFalse(V2SplitLayout.tabBarUnderList(split: false, tab: .settings))
         XCTAssertFalse(V2SplitLayout.tabBarUnderList(split: false, tab: .chats))
+    }
+
+    // MARK: - The tabs' order (issue 2084)
+
+    func testAnUnsetTabLayoutIsTheStandardOne() {
+        let layout = V2TabLayout(stored: nil)
+        XCTAssertEqual(layout.shown, [.bots, .chats, .tasks, .settings])
+        // Pulse and Artifacts wait before Settings, hidden.
+        XCTAssertEqual(layout.order, [.bots, .chats, .tasks, .pulse, .artifacts, .settings])
+        XCTAssertTrue(layout.isStandard)
+        XCTAssertEqual(layout, V2TabLayout(stored: []))
+        XCTAssertEqual(layout.stored, ["bots", "chats", "tasks", "-pulse", "-artifacts", "settings"])
+        // A list saved before the pages could be tabs reads the same.
+        XCTAssertEqual(V2TabLayout(stored: ["bots", "chats", "tasks", "settings"]), layout)
+    }
+
+    func testConduitOpensOnTheFirstTabShown() {
+        XCTAssertEqual(V2TabLayout(stored: ["chats", "bots", "tasks", "settings"]).first, .chats)
+        XCTAssertEqual(V2TabLayout(stored: ["tasks", "chats", "bots", "settings"]).first, .tasks)
+        // A hidden first tab passes it to the next one.
+        XCTAssertEqual(V2TabLayout(stored: ["-bots", "chats", "tasks", "settings"]).first, .chats)
+        XCTAssertEqual(V2TabLayout(stored: ["-bots", "-tasks", "settings", "chats"]).first, .settings)
+    }
+
+    func testAHiddenTabLeavesTheBarButKeepsItsPlace() {
+        var layout = V2TabLayout.standard
+        layout.setHidden(.tasks, true)
+        XCTAssertEqual(layout.shown, [.bots, .chats, .settings])
+        XCTAssertEqual(layout.stored, ["bots", "chats", "-tasks", "-pulse", "-artifacts", "settings"])
+        XCTAssertFalse(layout.isStandard)
+        layout.setHidden(.tasks, false)
+        XCTAssertEqual(layout.shown, [.bots, .chats, .tasks, .settings])
+        XCTAssertTrue(layout.isStandard)
+    }
+
+    func testSessionsAndSettingsCannotBeHidden() {
+        var layout = V2TabLayout.standard
+        layout.setHidden(.chats, true)
+        layout.setHidden(.settings, true)
+        XCTAssertEqual(layout.shown, [.bots, .chats, .tasks, .settings])
+        XCTAssertFalse(layout.canHide(.chats))
+        XCTAssertFalse(layout.canHide(.settings))
+        XCTAssertTrue(layout.canHide(.bots))
+        XCTAssertTrue(layout.canHide(.tasks))
+        // A stored list that hides them (hand-edited, or another build's)
+        // shows them anyway.
+        let stored = V2TabLayout(stored: ["-chats", "-settings", "-bots", "-tasks"])
+        XCTAssertEqual(stored.shown, [.chats, .settings])
+    }
+
+    func testAnOddStoredTabListStillListsEveryTabOnce() {
+        // A name twice counts once; a tab left out is shown after the rest.
+        let layout = V2TabLayout(stored: ["chats", "chats", "-chats", "settings"])
+        XCTAssertEqual(layout.order, [.chats, .settings, .bots, .tasks, .pulse, .artifacts])
+        XCTAssertEqual(layout.shown, [.chats, .settings, .bots, .tasks])
+        // A tab a newer Conduit added is kept for it, in neither list here.
+        let newer = V2TabLayout(stored: ["canvas", "chats", "-files", "bots", "tasks", "settings", ""])
+        XCTAssertEqual(newer.shown, [.chats, .bots, .tasks, .settings])
+        XCTAssertEqual(newer.stored, ["canvas", "chats", "-files", "bots", "tasks", "-pulse", "-artifacts", "settings"])
+        // An edit here keeps them where the newer Conduit put them: each
+        // goes with the tab it came after.
+        var edited = newer
+        edited.setHidden(.tasks, true)
+        XCTAssertEqual(edited.stored, ["canvas", "chats", "-files", "bots", "-tasks", "-pulse", "-artifacts", "settings"])
+        edited.move(fromOffsets: [0], toOffset: 4)
+        XCTAssertEqual(edited.stored, ["canvas", "bots", "-tasks", "-pulse", "chats", "-files", "-artifacts", "settings"])
+        XCTAssertEqual(V2TabLayout(stored: edited.stored), edited)
+    }
+
+    func testMovingATabChangesTheBarAndTheTabConduitOpensOn() {
+        var layout = V2TabLayout.standard
+        layout.move(fromOffsets: [1], toOffset: 0)
+        XCTAssertEqual(layout.shown, [.chats, .bots, .tasks, .settings])
+        XCTAssertEqual(layout.first, .chats)
+        layout.reset()
+        XCTAssertEqual(layout, .standard)
+    }
+
+    func testAHiddenTabStandsInTheBarOnlyWhileItShows() {
+        let layout = V2TabLayout(stored: ["chats", "-tasks", "-bots", "settings"])
+        XCTAssertEqual(layout.bar(selected: .chats), [.chats, .settings])
+        // A link to a task with Tasks hidden: the tab stands in its place
+        // until the reader leaves it.
+        XCTAssertEqual(layout.bar(selected: .tasks), [.chats, .tasks, .settings])
+        XCTAssertEqual(layout.bar(selected: .bots), [.chats, .bots, .settings])
+    }
+
+    func testAHiddenBotsTabIsNotMadeAtLaunch() {
+        XCTAssertEqual(V2TabLayout.standard.madeAtLaunch(opensOn: .bots), [.bots, .chats])
+        let sessionsFirst = V2TabLayout(stored: ["chats", "bots", "tasks", "settings"])
+        XCTAssertEqual(sessionsFirst.madeAtLaunch(opensOn: .chats), [.bots, .chats])
+        let noBots = V2TabLayout(stored: ["chats", "-bots", "tasks", "settings"])
+        XCTAssertEqual(noBots.madeAtLaunch(opensOn: .chats), [.chats])
+        // A Bot Chat iOS closed Conduit on opens there all the same.
+        XCTAssertEqual(noBots.madeAtLaunch(opensOn: .bots), [.bots, .chats])
+        let tasksFirst = V2TabLayout(stored: ["tasks", "-bots", "chats", "settings"])
+        XCTAssertEqual(tasksFirst.madeAtLaunch(opensOn: .tasks), [.tasks, .chats])
+    }
+
+    @MainActor
+    func testTheTabLayoutStoreSavesAndFollowsTheDefaults() throws {
+        let suite = "V2TabLayoutStoreTests"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defaults.removePersistentDomain(forName: suite)
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = V2TabLayoutStore(defaults: defaults)
+        XCTAssertTrue(store.layout.isStandard)
+        var layout = store.layout
+        layout.move(fromOffsets: [1], toOffset: 0)
+        layout.setHidden(.bots, true)
+        store.save(layout)
+        XCTAssertEqual(defaults.stringArray(forKey: V2TabLayout.key), ["chats", "-bots", "tasks", "-pulse", "-artifacts", "settings"])
+        // Another device's layout, written by Sync across devices.
+        defaults.set(["tasks", "chats", "bots", "settings"], forKey: V2TabLayout.key)
+        store.reload()
+        XCTAssertEqual(store.layout.shown, [.tasks, .chats, .bots, .settings])
+        XCTAssertEqual(V2TabLayoutStore(defaults: defaults).layout, store.layout)
+        // A dashboard without Pulse: its tab leaves the bar and the keys.
+        defaults.set(["pulse", "chats", "bots", "-tasks", "settings"], forKey: V2TabLayout.key)
+        store.reload()
+        XCTAssertEqual(store.tabs, [.pulse, .chats, .bots, .settings])
+        store.setAvailable(.pulse, false)
+        XCTAssertEqual(store.tabs, [.chats, .bots, .settings])
+        store.setAvailable(.pulse, true)
+        XCTAssertEqual(store.tabs.first, .pulse)
+    }
+
+    func testPulseAndArtifactsCanBeTabsUpToFive() {
+        var layout = V2TabLayout.standard
+        XCTAssertTrue(layout.canShow(.pulse))
+        layout.setHidden(.pulse, false)
+        XCTAssertEqual(layout.shown, [.bots, .chats, .tasks, .pulse, .settings])
+        XCTAssertFalse(layout.isStandard)
+        // The bar is full: Artifacts waits for another to come off.
+        XCTAssertFalse(layout.canShow(.artifacts))
+        layout.setHidden(.artifacts, false)
+        XCTAssertEqual(layout.shown.count, V2TabLayout.mostShown)
+        layout.setHidden(.tasks, true)
+        layout.setHidden(.artifacts, false)
+        XCTAssertEqual(layout.shown, [.bots, .chats, .pulse, .artifacts, .settings])
+        // A stored list with all six shows the first five that can go.
+        let six = V2TabLayout(stored: ["bots", "chats", "tasks", "pulse", "artifacts", "settings"])
+        XCTAssertEqual(six.shown, [.bots, .chats, .tasks, .pulse, .settings])
+        layout.reset()
+        XCTAssertEqual(layout, .standard)
+    }
+
+    func testAPulseTabStaysOutWhereTheDashboardHasNoPulse() {
+        let layout = V2TabLayout(stored: ["pulse", "chats", "bots", "tasks", "settings"])
+        XCTAssertEqual(layout.first, .pulse)
+        XCTAssertEqual(layout.first(without: [.pulse]), .chats)
+        XCTAssertEqual(layout.bar(selected: .chats, without: [.pulse]), [.chats, .bots, .tasks, .settings])
+        // A chat opened from it is still showing: the tab stays until it's left.
+        XCTAssertEqual(layout.bar(selected: .pulse, without: [.pulse]).first, .pulse)
+        // Its switch can't turn it on there, but can turn it off.
+        XCTAssertTrue(layout.canSwitch(.pulse, without: [.pulse]))
+        var off = layout
+        off.setHidden(.pulse, true)
+        XCTAssertFalse(off.canSwitch(.pulse, without: [.pulse]))
+        XCTAssertTrue(off.canSwitch(.pulse, without: []))
+    }
+
+    /// Five shown with a Pulse this dashboard lacks: Artifacts waits for a
+    /// place, and Pulse's switch here gives it one (issue 2432).
+    func testAPulseThisDashboardLacksCanGiveBackItsPlace() {
+        var layout = V2TabLayout(stored: ["bots", "chats", "tasks", "pulse", "-artifacts", "settings"])
+        XCTAssertFalse(layout.canSwitch(.artifacts, without: [.pulse]))
+        XCTAssertTrue(layout.canSwitch(.pulse, without: [.pulse]))
+        XCTAssertFalse(layout.canSwitch(.settings, without: [.pulse]))
+        layout.setHidden(.pulse, true)
+        XCTAssertTrue(layout.canSwitch(.artifacts, without: [.pulse]))
+        layout.setHidden(.artifacts, false)
+        XCTAssertEqual(layout.bar(selected: .chats, without: [.pulse]), [.bots, .chats, .tasks, .artifacts, .settings])
+    }
+
+    func testAChatOpenedFromAPageTabStaysInIt() {
+        XCTAssertEqual(V2Tab.conversationTab(selected: .pulse, isBotsChat: false), .pulse)
+        XCTAssertEqual(V2Tab.conversationTab(selected: .pulse, isBotsChat: true), .pulse)
+        XCTAssertEqual(V2Tab.conversationTab(selected: .artifacts, isBotsChat: false), .artifacts)
+        // A new chat out of a room is an ordinary one wherever it starts.
+        XCTAssertEqual(V2Tab.conversationTab(selected: .pulse, isBotsChat: false, fromPageTab: false), .chats)
+        // The window keeps it for the launch after iOS ends Conduit.
+        let stored = V2ReopenedConversation.record(showing: .pulse, path: [.conversation], roomID: nil)
+        XCTAssertEqual(
+            V2ReopenedConversation.launch(stored: stored, lastChat: .dashboard, hasSavedCopy: false, projects: [], showsPulse: true),
+            V2ReopenedConversation.Launch(tab: .pulse, path: [.conversation])
+        )
+        XCTAssertNil(V2ReopenedConversation.launch(stored: stored, lastChat: .dashboard, hasSavedCopy: false, projects: [], showsPulse: false))
+        let artifacts = V2ReopenedConversation.record(showing: .artifacts, path: [.conversation], roomID: nil)
+        XCTAssertEqual(
+            V2ReopenedConversation.launch(stored: artifacts, lastChat: nil, hasSavedCopy: true, projects: [], showsPulse: false)?.tab,
+            .artifacts
+        )
+        // The page itself showing keeps nothing: the launch opens on the first tab.
+        XCTAssertEqual(V2ReopenedConversation.record(showing: .pulse, path: [], roomID: nil), "")
     }
 
     func testV2SplitListStackLeavesOutTheConversation() {
@@ -483,5 +701,13 @@ extension SidebarLayoutTests {
         pick.tap("lab", dashboardID: dashboard)
         XCTAssertNil(pick.take(landedOn: "work", dashboardID: UUID()), "A tap on another dashboard is dropped.")
         XCTAssertNil(pick.take(landedOn: "work", dashboardID: dashboard), "Dropped, not kept for later.")
+
+        pick.tap("lab", dashboardID: dashboard, leavesAll: true)
+        XCTAssertTrue(pick.leavesAll, "A pick from under All keeps that until it goes.")
+        pick.tap("home", dashboardID: dashboard)
+        XCTAssertFalse(pick.leavesAll, "A newer tap made with All already off replaces it.")
+        pick.tap("lab", dashboardID: dashboard, leavesAll: true)
+        XCTAssertEqual(pick.take(landedOn: "work", dashboardID: dashboard), "lab")
+        XCTAssertFalse(pick.leavesAll, "Taking the pick clears it.")
     }
 }

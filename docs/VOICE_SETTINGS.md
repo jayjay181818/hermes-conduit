@@ -85,6 +85,32 @@ administration concerns and are intentionally not mirrored here. Unknown or
 plugin providers discovered by Hermes still appear in the pickers with the
 generic model/language/voice fields.
 
+## Microphone and output
+
+Settings > Voice > Microphone and output, and two buttons under every call
+screen's title (Classic, Gemini, Qwen, Grok, GPT-Live, Local Live, and calls
+from Hermes), show the microphone and the output the voice uses now and open
+iOS's own pickers (issue 2389):
+
+- **Microphone**: on iOS 26 and later, iOS's input picker, which lists the
+  microphones on offer (the iPhone's, a wired headset, Bluetooth), the Mic
+  Mode (Voice Isolation, Wide Spectrum and the standard one) and a level
+  meter. iOS remembers the choice for Conduit. Outside a call the picker
+  holds the voice session open while it's up, since iOS lists inputs only
+  for a session that records. Before iOS 26 the call screen's button opens
+  Control Center's Mic Mode. Apps can't set a Mic Mode themselves.
+- **Output**: iOS's route picker (speaker, earpiece, headsets, the car).
+  Calls play on what's connected, otherwise on the speaker; calls from
+  Hermes start on the earpiece, and the call screen's Speaker button still
+  moves them.
+- **When the microphone opens**: there is no level to set. Classic voice
+  learns the room's noise and listens for speech above it; the live modes'
+  providers detect speech themselves. Settings says so.
+
+Wake listening on CarPlay and the built-in microphone fallback for a
+Bluetooth headset that won't record put the user's chosen microphone back
+when they finish, instead of clearing it.
+
 ## Keep listening when locked
 
 Classic Voice normally suspends when Conduit leaves the foreground and is
@@ -108,13 +134,13 @@ voice calls" section saying why, with Save Now to retry at once.
 
 ## Minimising a live call
 
-Swiping down the Gemini Live, Grok Live or GPT-Live sheet minimises the call instead of ending it. The call keeps running, and a bar above the composer shows its state, with mute and end controls. When the call is attached to a chat, the bar also names that chat. Tapping the bar or swiping it up, or the composer's voice button, brings the sheet back. End (in the sheet or on the bar), a spoken goodbye, sign-out and server or profile changes still end the call. While minimised the screen can lock as usual; only the full sheet keeps the phone awake. Classic Voice is unchanged: swiping its sheet away still closes it.
+Swiping down the Gemini Live, Grok Live or GPT-Live sheet minimises the call instead of ending it. The call keeps running, and a bar above the composer shows its state, with mute and end controls. When the call is attached to a chat, the bar also names that chat. Tapping the bar or swiping it up, or the composer's voice button, brings the sheet back. On a wide iPad or Mac window with the chat list beside a chat or room, the bar shows once, by that conversation's composer, not under the list too. End (in the sheet or on the bar), a spoken goodbye, sign-out and a server change still end the call. A switch to another profile on the same dashboard doesn't, for a call you started or one from Hermes you answered: the call goes on, on the profile it started on (its jobs, its chat and what it reads stay there), and the bar names that profile while another one is on screen. Opening its chat from the call switches back to it. While minimised the screen can lock as usual; only the full sheet keeps the phone awake. Classic Voice is unchanged: swiping its sheet away still closes it.
 
 ## GPT-Live billing: ChatGPT plan or API key
 
 GPT-Live's settings have a **Billing** choice, per profile:
 
-- **ChatGPT plan** (the default): the call bills the ChatGPT subscription the Hermes server is signed in to (`hermes auth`, OpenAI Codex), with ChatGPT's voices.
+- **ChatGPT plan** (the default): the call bills the ChatGPT subscription the Hermes server is signed in to (`hermes auth`, OpenAI Codex), with ChatGPT's voices. Haetsal and Hanul are ChatGPT's Korean voices; like the others they speak the call's language, not only Korean. A call with a voice your plan doesn't offer doesn't start; when you picked the voice in Conduit, it says which one to change. It never switches to another voice or to the API key.
 - **API key · billed per minute**: the call uses the public GPT-Live API (`gpt-live-1`, the same one Hermes desktop's voice mode uses) on the server's OpenAI API key. OpenAI bills that key per minute of call time, separately from any ChatGPT plan. It has its own voices (marin, cedar, …) and needs the Hermes notifier plugin 0.22 or newer.
 
 The two are kept apart so nobody pays for the one they didn't pick:
@@ -167,4 +193,4 @@ If a reading skips part of a reply, Diagnostics & logs (Last connection) shows t
 
 ## Dictate into the composer
 
-The composer has two buttons on the right of its bottom row. The plain mic dictates: tap it and the words appear in the draft as you speak, after anything already typed. Nothing is sent until you send it: while you dictate, a wide Stop takes Send's place (and the mic's); tap it to stop. Send comes back once the words are in the draft, so you can read them over or fix them first. With Return sends on, Return stops the dictation too. To talk and send in one go, use Voice message or Voice instead. The waveform button (in the same spot Send takes) opens Voice. On a Mac, and on an iPad whose chat has the room, the composer stays expanded and the chat's big voice button stays beside it instead: it does what you chose for it, and the row leaves out the waveform button, and the mic too when the big button dictates. Recognition uses Apple's speech recognizer, on the device when the language supports it. Settings > Voice > Dictation picks the engine (Apple, Apple's new model, or Hermes). Voice messages use the same one unless you pick another on the Voice message row there, so dictation can stay on the iPhone while the transcript Hermes reads with each voice message comes from Hermes, or the other way round. Dictation is unavailable while a voice conversation has the microphone. A phone call, Siri, an audio route change or a voice conversation taking the microphone ends dictation, keeping the words so far. With Hermes as the dictation engine, the recording stays on the iPhone until its words are in the draft: an upload that fails on a dropped connection is tried again a few times over about two minutes, and one that still can't go is offered above the composer (in chats and group rooms) with Retry and Delete, after Conduit restarts too. Retry puts the words in the draft of the chat or room you tapped it in. Kept recordings are deleted once two weeks old (the next time Conduit opens or a recording is delivered or deleted), and never backed up.
+The composer has two buttons on the right of its bottom row. The plain mic dictates: tap it and the words appear in the draft as you speak, after anything already typed. Nothing is sent until you send it: while you dictate, a wide Stop takes Send's place (and the mic's); tap it to stop. Send comes back once the words are in the draft, so you can read them over or fix them first. With Return sends on, Return stops the dictation too. To talk and send in one go, use Voice message or Voice instead. The waveform button (in the same spot Send takes) opens Voice. On a Mac, and on an iPad whose chat has the room, the composer stays expanded and the chat's big voice button stays beside it instead: it does what you chose for it, and the row leaves out the waveform button, and the mic too when the big button dictates. On a Mac a live call is always in the chat's top bar, where a minimised call shows in gold, so the big button stays beside the composer only when it records a voice message or dictates. Recognition uses Apple's speech recognizer, on the device when the language supports it. Settings > Voice > Dictation picks the engine (Apple, Apple's new model, or Hermes). Voice messages use the same one unless you pick another on the Voice message row there, so dictation can stay on the iPhone while the transcript Hermes reads with each voice message comes from Hermes, or the other way round. Dictation is unavailable while a voice conversation has the microphone. A phone call, Siri, an audio route change or a voice conversation taking the microphone ends dictation, keeping the words so far. With Hermes as the dictation engine, the recording stays on the iPhone until its words are in the draft: an upload that fails on a dropped connection is tried again a few times over about two minutes, and one that still can't go is offered above the composer (in chats and group rooms) with Retry and Delete, after Conduit restarts too. Retry puts the words in the draft of the chat or room you tapped it in. Kept recordings are deleted once two weeks old (the next time Conduit opens or a recording is delivered or deleted), and never backed up.

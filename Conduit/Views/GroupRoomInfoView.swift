@@ -17,8 +17,14 @@ struct GroupRoomInfoSheet: View {
     @State private var roomID: String?
     /// The member a Take Out asks about.
     @State private var takingOut: GroupMember?
+    /// The person a Block asks about.
+    @State private var blocking: RoomBlockTarget?
     @State private var confirmingLeave = false
     @State private var working = false
+    /// What each of your agents may do here, by profile, read when Group
+    /// Info opens and again when you come back from its choices: shown on
+    /// its row, so nobody has to guess why a bot won't look something up.
+    @State private var agentTools: [String: RoomChoices] = [:]
     /// A refusal's title and the plugin's words.
     @State private var refusal: (title: String, message: String)?
     /// Whether the sheet is still up, for a room chat that fails after Done.
@@ -39,11 +45,12 @@ struct GroupRoomInfoSheet: View {
                     memberSection(room)
                 }
                 roomChatSection
+                blockSection
                 if appState.canLeaveActiveRoom {
                     Button(role: .destructive) {
                         confirmingLeave = true
                     } label: {
-                        Label(AppLocalization.string("Leave Room"), systemImage: "rectangle.portrait.and.arrow.right")
+                        Label(AppLocalization.string("Leave Room", table: .rooms), systemImage: "rectangle.portrait.and.arrow.right")
                     }
                     .buttonStyle(.settingsDestructive)
                     .disabled(working)
@@ -55,21 +62,38 @@ struct GroupRoomInfoSheet: View {
                 titleVisibility: .visible,
                 presenting: takingOut
             ) { member in
-                Button(AppLocalization.string("Take Out"), role: .destructive) {
+                Button(AppLocalization.string("Take Out", table: .rooms), role: .destructive) {
                     takeOut(member)
                 }
                 Button(AppLocalization.string("Cancel"), role: .cancel) {}
             } message: { member in
                 Text(verbatim: takeOutMessage(member))
             }
+            .confirmationDialog(
+                blocking.map { RoomBlock.title($0.name) } ?? "",
+                isPresented: Binding(get: { blocking != nil }, set: { if !$0 { blocking = nil } }),
+                titleVisibility: .visible,
+                presenting: blocking
+            ) { target in
+                Button(AppLocalization.string("Block", table: .rooms), role: .destructive) {
+                    block(target)
+                }
+                Button(AppLocalization.string("Cancel"), role: .cancel) {}
+            } message: { target in
+                Text(verbatim: RoomBlock.message(target.name))
+            }
+            // A Block asked for on one dashboard isn't confirmed on another.
+            .onChange(of: appState.activeDashboardID) { _, _ in blocking = nil }
             .confirmationDialog(RoomLeaveText.leaveTitle, isPresented: $confirmingLeave, titleVisibility: .visible) {
-                Button(AppLocalization.string("Leave Room"), role: .destructive) {
+                Button(AppLocalization.string("Leave Room", table: .rooms), role: .destructive) {
                     leave()
                 }
                 Button(AppLocalization.string("Cancel"), role: .cancel) {}
             } message: {
                 if let copy = appState.activeRoomSurface?.copy {
-                    Text(verbatim: RoomLeaveText.leaveMessage(copy))
+                    // Just me has no bots to speak of: its own words.
+                    Text(verbatim: appState.activeRoomOwnHermes == true && !copy.justMe
+                         ? RoomLeaveText.leaveOwnMessage : RoomLeaveText.leaveMessage(copy))
                 }
             }
             .alert(
@@ -80,7 +104,7 @@ struct GroupRoomInfoSheet: View {
             } message: {
                 Text(verbatim: refusal?.message ?? "")
             }
-            .navigationTitle(appState.activeRoomSurface?.room.name ?? AppLocalization.string("Group Info"))
+            .navigationTitle(appState.activeRoomSurface?.room.name ?? AppLocalization.string("Group Info", table: .rooms))
             .navigationBarTitleDisplayMode(.inline)
             .onAppear { presence.shown = true }
             .onDisappear { presence.shown = false }
@@ -105,9 +129,13 @@ struct GroupRoomInfoSheet: View {
     private func memberSection(_ room: GroupRoom) -> some View {
         // Named as the bots are now, as in the room, with their owners.
         let members = GroupRoomTurns.members(appState.activeRoomMembers, namedBy: appState.botRoster)
-        // Choices matter only beside other people's agents.
-        let offersChoices = appState.canSetRoomChoices && members.contains(where: \.isPeer)
-        ConduitSettingsSection(title: AppLocalization.string("Members"), symbol: "person.3", tint: .conduitAccent) {
+        // Choices matter only beside other people's agents: not in a room of only your own Hermes.
+        let offersChoices = GroupRoomTurns.offersChoices(
+            canSet: appState.canSetRoomChoices, members: members, ownHermes: appState.activeRoomOwnHermes)
+        let choiceProfiles = offersChoices
+            ? Array(Set(members.filter { !$0.isPeer && $0.out == nil }.compactMap(\.profile).filter { !$0.isEmpty })).sorted()
+            : []
+        ConduitSettingsSection(title: AppLocalization.string("Members", table: .rooms), symbol: "person.3", tint: .conduitAccent) {
             ForEach(members, id: \.identityKey) { member in
                 let canTakeOut = appState.canTakeOut(member) && !working
                 HStack(spacing: 8) {
@@ -120,8 +148,16 @@ struct GroupRoomInfoSheet: View {
                             )
                         } label: {
                             HStack {
-                                GroupRoomMemberRow(member: member, route: nil)
+                                GroupRoomMemberRow(member: member, route: nil,
+                                                   ownHermes: appState.activeRoomOwnHermes == true)
                                 Spacer(minLength: 8)
+                                if let tools = agentTools[profile].map({ RoomInviteChoicesView.toolsLabel($0.tools) }),
+                                   !tools.isEmpty {
+                                    Text(tools)
+                                        .scaledFont(.footnote)
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(1)
+                                }
                                 SettingsChevron()
                             }
                             .contentShape(Rectangle())
@@ -130,7 +166,8 @@ struct GroupRoomInfoSheet: View {
                     } else {
                         GroupRoomMemberRow(
                             member: member,
-                            route: member.out == nil ? appState.activeRoomDriverStatus?.routeStatus(for: member) : nil
+                            route: member.out == nil ? appState.activeRoomDriverStatus?.routeStatus(for: member) : nil,
+                            ownHermes: appState.activeRoomOwnHermes == true
                         )
                         Spacer(minLength: 8)
                     }
@@ -139,7 +176,7 @@ struct GroupRoomInfoSheet: View {
                             Button(role: .destructive) {
                                 takingOut = member
                             } label: {
-                                Label(AppLocalization.string("Take Out"), systemImage: "person.badge.minus")
+                                Label(AppLocalization.string("Take Out", table: .rooms), systemImage: "person.badge.minus")
                             }
                         } label: {
                             Image(systemName: "ellipsis.circle")
@@ -148,7 +185,7 @@ struct GroupRoomInfoSheet: View {
                                 .frame(width: 44, height: 44)
                                 .contentShape(Rectangle())
                         }
-                        .accessibilityLabel(Text(AppLocalization.string("Take Out")))
+                        .accessibilityLabel(Text(AppLocalization.string("Take Out", table: .rooms)))
                     }
                 }
                 .frame(minHeight: 44)
@@ -156,15 +193,91 @@ struct GroupRoomInfoSheet: View {
                     takingOut = member
                 })
             }
+            // People in it with none of their agents ("Just me").
+            if !appState.activeRoomJustMe.isEmpty {
+                Text(AppLocalization.string("Also here without their bots: \(appState.activeRoomJustMe.formatted(.list(type: .and).locale(AppLocalization.formattingLocale)))", table: .rooms))
+                    .settingsCaption()
+            }
             if offersChoices {
-                Text(AppLocalization.string("Tap one of your agents to choose what it may do and share here."))
+                Text(AppLocalization.string("Tap one of your agents to choose what it may do and share here. Other people choose for theirs.", table: .rooms))
+                    .settingsCaption()
+            } else if appState.activeRoomOwnHermes == true {
+                Text(AppLocalization.string("Every Hermes here is yours, so each bot works as it does at home, with its own tools and memory.", table: .rooms))
                     .settingsCaption()
             }
         }
+        // Read on each appearance (so again on coming back from an agent's
+        // choices) and when the agents that offer choices change. Leaving
+        // cancels a read, so an older one never lands over a newer one.
+        .task(id: choiceProfiles) {
+            guard !choiceProfiles.isEmpty else { return }
+            await loadAgentTools(roomID: room.roomID, profiles: choiceProfiles)
+        }
+    }
+
+    /// Each agent's choices for the room, one read each; one that fails
+    /// shows no line rather than a wrong one.
+    private func loadAgentTools(roomID: String, profiles: [String]) async {
+        let client = appState.roomChoicesClient
+        // All at once, not one after another (issue 2359): a room holds at
+        // most six agents.
+        var read: [String: RoomChoices] = [:]
+        await withTaskGroup(of: (String, RoomChoices?).self) { group in
+            for profile in profiles {
+                group.addTask { @MainActor in (profile, try? await client.choices(roomID: roomID, profile: profile)) }
+            }
+            for await (profile, choices) in group {
+                if let choices { read[profile] = choices }
+            }
+        }
+        // Left (or a newer read started), or another room opened meanwhile.
+        guard !Task.isCancelled, appState.activeRoomSurface?.room.roomID == roomID else { return }
+        if read != agentTools { agentTools = read }
     }
 }
 
 extension GroupRoomInfoSheet {
+    /// The people here you're linked with, each of whom Block unlinks
+    /// (RoomBlock: there's no report, since nobody but the two of you sees it).
+    @ViewBuilder
+    private var blockSection: some View {
+        let targets = appState.activeRoomBlockTargets
+        if !targets.isEmpty {
+            ConduitSettingsSection(title: AppLocalization.string("People"), symbol: "person.2", tint: .conduitAccent) {
+                ForEach(targets) { target in
+                    Button(role: .destructive) {
+                        blocking = target
+                    } label: {
+                        Label(RoomBlock.button(target.name), systemImage: "hand.raised")
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .buttonStyle(.settingsDestructive)
+                    .disabled(working)
+                }
+                Text(AppLocalization.string("Blocking unlinks them: nothing more from them reaches your Hermes, and the rooms you share with them stop.", table: .rooms))
+                    .settingsCaption()
+            }
+        }
+    }
+
+    private func block(_ target: RoomBlockTarget) {
+        guard !working else { return }
+        working = true
+        Task {
+            defer { working = false }
+            do {
+                _ = try await appState.block(target)
+                Haptics.success()
+                dismiss()
+            } catch {
+                guard !(error is CancellationError) else { return }
+                Haptics.error()
+                refusal = (title: RoomBlock.refusalTitle(target.name),
+                           message: RoomLinksClient.message(for: error))
+            }
+        }
+    }
+
     /// Each of your agents in a room with other people's opens a private
     /// chat about it, or asks there for its notes (C5b).
     @ViewBuilder
@@ -214,6 +327,9 @@ extension GroupRoomInfoSheet {
 
     private func takeOutMessage(_ member: GroupMember) -> String {
         let name = GroupRoomTurns.displayName(of: member)
+        if appState.activeRoomOwnHermes == true {
+            return RoomLeaveText.takeOutOwnMessage(name)
+        }
         if let copy = appState.activeRoomSurface?.copy {
             return RoomLeaveText.takeOutMessage(name, in: copy)
         }
@@ -225,7 +341,7 @@ extension GroupRoomInfoSheet {
         Task { @MainActor in
             let result = await appState.takeOut(member)
             working = false
-            show(result, refusedTitle: AppLocalization.string("Could not take this agent out"))
+            show(result, refusedTitle: AppLocalization.string("Could not take this agent out", table: .rooms))
         }
     }
 
@@ -234,7 +350,7 @@ extension GroupRoomInfoSheet {
         Task { @MainActor in
             let result = await appState.leaveActiveRoom()
             working = false
-            show(result, refusedTitle: AppLocalization.string("Could not leave this room"))
+            show(result, refusedTitle: AppLocalization.string("Could not leave this room", table: .rooms))
         }
     }
 
@@ -264,7 +380,7 @@ private struct TakeOutActions: ViewModifier {
             content
                 .contextMenu {
                     Button(role: .destructive, action: action) {
-                        Label(AppLocalization.string("Take Out"), systemImage: "person.badge.minus")
+                        Label(AppLocalization.string("Take Out", table: .rooms), systemImage: "person.badge.minus")
                     }
                 }
         } else {
@@ -279,13 +395,15 @@ private struct TakeOutActions: ViewModifier {
 private struct GroupRoomMemberRow: View {
     let member: GroupMember
     let route: GroupPeerRoute.Status?
+    /// A room of only your own Hermes: a far bot's line says it's yours.
+    var ownHermes = false
 
     private var trouble: (text: String, symbol: String)? {
         switch route {
         case .cutOff:
-            return (AppLocalization.string("Cut off: its Hermes no longer accepts this room"), "exclamationmark.triangle")
+            return (AppLocalization.string("Cut off: its Hermes no longer accepts this room", table: .rooms), "exclamationmark.triangle")
         case .unreachable:
-            return (AppLocalization.string("Can't be reached. Hermes keeps trying."), "wifi.exclamationmark")
+            return (AppLocalization.string("Can't be reached. Hermes keeps trying.", table: .rooms), "wifi.exclamationmark")
         case .ready, .other, nil:
             return nil
         }
@@ -298,7 +416,7 @@ private struct GroupRoomMemberRow: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text(name)
                     .lineLimit(1)
-                Text(GroupRoomTurns.ownerLine(of: member))
+                Text(GroupRoomTurns.ownerLine(of: member, ownHermes: ownHermes))
                     .scaledFont(.footnote)
                     .foregroundStyle(.secondary)
                 if let trouble {
@@ -342,29 +460,29 @@ struct RoomAgentChoicesView: View {
         SettingsDetailContainer {
             if let choices, loadedKey == key {
                 if !choices.saved {
-                    Text(AppLocalization.string("These are \(name)'s defaults. A change here applies to this room only."))
+                    Text(AppLocalization.string("These are \(name)'s defaults. A change here applies to this room only.", table: .rooms))
                         .settingsCaption()
                 }
                 toolsSection(choices)
                 shareSection(choices)
                 SettingsCard {
-                    Toggle(AppLocalization.string("Search my past chats"), isOn: Binding(
+                    Toggle(AppLocalization.string("Search my past chats", table: .rooms), isOn: Binding(
                         get: { self.choices?.searchChats ?? false },
                         set: { on in change("search_chats", to: on) { $0.searchChats = on } }
                     ))
                     .tint(.conduitAccent)
-                    Text(AppLocalization.string("It can search your other chats to answer here, other people's messages in them included."))
+                    Text(AppLocalization.string("It can search your other chats to answer here, other people's messages in them included.", table: .rooms))
                         .settingsCaption()
                 }
                 // A plugin without Run work sends no run_work.
                 if choices.runWork != nil {
                     SettingsCard {
-                        Toggle(AppLocalization.string("Run work"), isOn: Binding(
+                        Toggle(AppLocalization.string("Run work", table: .rooms), isOn: Binding(
                             get: { self.choices?.runWork ?? false },
                             set: { on in change("run_work", to: on) { $0.runWork = on } }
                         ))
                         .tint(.conduitAccent)
-                        Text(AppLocalization.string("It can start work for this room, like research or code. Before each start, and before it sends the work more, it asks you on your phone: Start, Change it or Don't start. What the work finds reaches the room only as your share choices allow."))
+                        Text(AppLocalization.string("It can start work for this room, like research or code. Before each start, and before it sends the work more, it asks you on your phone: Start, Change it or Don't start. What the work finds reaches the room only as your share choices allow.", table: .rooms))
                             .settingsCaption()
                     }
                 }
@@ -396,21 +514,21 @@ struct RoomAgentChoicesView: View {
 
     private func toolsSection(_ choices: RoomChoices) -> some View {
         var tools: [(id: String, title: String)] = [
-            (id: "talk", title: AppLocalization.string("Talk only")),
-            (id: "look", title: AppLocalization.string("Look things up")),
+            (id: "talk", title: AppLocalization.string("Talk only", table: .rooms)),
+            (id: "look", title: AppLocalization.string("Look things up", table: .rooms)),
         ]
         // Offered where the plugin shares when you're busy; else shown while it's the choice.
         if RoomChoices.offersUseMyData(freeBusy: appState.canShareFreeBusy, current: [choices.tools]) {
-            tools.append((id: "data", title: AppLocalization.string("Use my data")))
+            tools.append((id: "data", title: AppLocalization.string("Use my data", table: .rooms)))
         }
         if choices.tools == "custom" {
             tools.append((id: "custom", title: AppLocalization.string("Custom")))
         }
-        return ConduitSettingsSection(title: AppLocalization.string("What it can do"), symbol: "wrench.and.screwdriver", tint: .conduitAccent) {
+        return ConduitSettingsSection(title: AppLocalization.string("What it can do", table: .rooms), symbol: "wrench.and.screwdriver", tint: .conduitAccent) {
             ConduitMenuPicker(value: choices.tools, choices: tools, onSelect: { picked in
                 change("tools", to: picked) { $0.tools = picked }
             }) {
-                Text(AppLocalization.string("What it can do")).foregroundStyle(.secondary)
+                Text(AppLocalization.string("What it can do", table: .rooms)).foregroundStyle(.secondary)
             }
             Text(Self.toolsDetail(choices, freeBusy: appState.canShareFreeBusy))
                 .settingsCaption()
@@ -418,11 +536,11 @@ struct RoomAgentChoicesView: View {
     }
 
     private func shareSection(_ choices: RoomChoices) -> some View {
-        ConduitSettingsSection(title: AppLocalization.string("What it may share"), symbol: "hand.raised", tint: .conduitAccent) {
+        ConduitSettingsSection(title: AppLocalization.string("What it may share", table: .rooms), symbol: "hand.raised", tint: .conduitAccent) {
             ConduitMenuPicker(value: choices.share, choices: RoomInviteChoicesView.shareChoices, onSelect: { picked in
                 change("share", to: picked) { $0.share = picked }
             }) {
-                Text(AppLocalization.string("What it may share")).foregroundStyle(.secondary)
+                Text(AppLocalization.string("What it may share", table: .rooms)).foregroundStyle(.secondary)
             }
             Text(Self.shareDetail(choices.share))
                 .settingsCaption()
@@ -430,9 +548,9 @@ struct RoomAgentChoicesView: View {
     }
 
     private func noteSection(_ choices: RoomChoices) -> some View {
-        ConduitSettingsSection(title: AppLocalization.string("Note for this room"), symbol: "note.text", tint: .conduitAccent) {
+        ConduitSettingsSection(title: AppLocalization.string("Note for this room", table: .rooms), symbol: "note.text", tint: .conduitAccent) {
             TextField(
-                AppLocalization.string("Anything it should keep in mind here"),
+                AppLocalization.string("Anything it should keep in mind here", table: .rooms),
                 text: $noteDraft,
                 axis: .vertical
             )
@@ -455,9 +573,9 @@ struct RoomAgentChoicesView: View {
                 }
             }
             VStack(alignment: .leading, spacing: 4) {
-                Text(AppLocalization.string("\(name) reads this on each of its turns here. It isn't posted to the room."))
+                Text(AppLocalization.string("\(name) reads this on each of its turns here. It isn't posted to the room.", table: .rooms))
                 // RoomChoicesClient.noteLimit: past it, typing stops.
-                Text(AppLocalization.string("A note holds up to 1,000 characters."))
+                Text(AppLocalization.string("A note holds up to 1,000 characters.", table: .rooms))
             }
             .settingsCaption()
         }
@@ -467,16 +585,16 @@ struct RoomAgentChoicesView: View {
     static func toolsDetail(_ choices: RoomChoices, freeBusy: Bool) -> String {
         switch choices.tools {
         case "talk":
-            return AppLocalization.string("It answers from what it knows, without tools.")
+            return AppLocalization.string("It answers from what it knows, without tools.", table: .rooms)
         case "data" where freeBusy:
-            return AppLocalization.string("It can search the web and X, read web pages and look at images, and say when you're busy from the calendar you share with Hermes: only the times, never what, where or with whom, as What it may share allows.")
+            return AppLocalization.string("It can search the web and X, read web pages and look at images, and say when you're busy from the calendar you share with Hermes: only the times, never what, where or with whom, as What it may share allows.", table: .rooms)
         case "look", "data":
-            return AppLocalization.string("It can search the web and X, read web pages and look at images.")
+            return AppLocalization.string("It can search the web and X, read web pages and look at images.", table: .rooms)
         case "custom" where choices.customTools.isEmpty:
-            return AppLocalization.string("No tools are picked for it on your Hermes.")
+            return AppLocalization.string("No tools are picked for it on your Hermes.", table: .rooms)
         case "custom":
             let tools = choices.customTools.joined(separator: ", ")
-            return AppLocalization.string("Only the tools picked on your Hermes: \(tools)")
+            return AppLocalization.string("Only the tools picked on your Hermes: \(tools)", table: .rooms)
         default:
             return ""
         }
@@ -485,11 +603,11 @@ struct RoomAgentChoicesView: View {
     static func shareDetail(_ share: String) -> String {
         switch share {
         case "helps":
-            return AppLocalization.string("What helps the room, but nothing sensitive: no health, money, passwords, or what others told you in private.")
+            return AppLocalization.string("What helps the room, but nothing sensitive: no health, money, passwords, or what others told you in private.", table: .rooms)
         case "ask":
-            return AppLocalization.string("Before it shares anything personal, it asks you in Conduit.")
+            return AppLocalization.string("Before it shares anything personal, it asks you in Conduit.", table: .rooms)
         case "nothing":
-            return AppLocalization.string("It shares nothing personal about you, even when asked.")
+            return AppLocalization.string("It shares nothing personal about you, even when asked.", table: .rooms)
         default:
             return ""
         }

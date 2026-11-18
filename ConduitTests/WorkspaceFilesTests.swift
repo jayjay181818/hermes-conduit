@@ -129,6 +129,48 @@ extension HermesVoiceGatewayTimeoutTests {
         XCTAssertEqual(result.matches.first?.lines, [.init(number: 12, text: "    print('hello')", matchStart: 11, matchLength: 5)])
     }
 
+    /// Copy, then Paste into another folder (issue 1438): the copy names
+    /// the folder; a plain Duplicate doesn't. A drag to a folder moves only
+    /// somewhere new, never a folder into itself; a drag to the chat puts
+    /// the paths in the draft, one with a space in inline code.
+    func testAPastedCopyNamesItsFolderAndADragMovesOnlySomewhereNew() async throws {
+        var bodies: [[String: Any]] = []
+        let client = workspaceClient(answer: { _, _, _ in ["ok": true, "entry": ["name": "a.md", "path": "/w/out/a.md"]] },
+                                     requests: { _, _, body in bodies.append(body ?? [:]) })
+        _ = try await client.duplicate(root: "/w", path: "/w/docs/a.md", into: "/w/out")
+        _ = try await client.duplicate(root: "/w", path: "/w/docs/a.md")
+        XCTAssertEqual(bodies.first?["to"] as? String, "/w/out")
+        XCTAssertNil(bodies.last?["to"])
+
+        XCTAssertTrue(WorkspaceExplorer.canMove("/w/docs/a.md", into: "/w/out"))
+        XCTAssertTrue(WorkspaceExplorer.canMove("/w/docs", into: "/w/docs2"), "a sibling sharing its start")
+        XCTAssertFalse(WorkspaceExplorer.canMove("/w/docs/a.md", into: "/w/docs"), "already there")
+        XCTAssertFalse(WorkspaceExplorer.canMove("/w/docs", into: "/w/docs"))
+        XCTAssertFalse(WorkspaceExplorer.canMove("/w/docs", into: "/w/docs/sub"), "into itself")
+        // A Windows host's paths, with backslashes.
+        XCTAssertTrue(WorkspaceExplorer.canMove(#"C:\dev\Site\a.md"#, into: #"C:\dev\Site\out"#))
+        XCTAssertFalse(WorkspaceExplorer.canMove(#"C:\dev\Site\docs"#, into: #"C:\dev\Site\docs\sub"#), "into itself")
+        XCTAssertTrue(AppState.workspacePath(#"C:\dev\Site\a.md"#, isIn: #"C:\dev\Site"#))
+        XCTAssertFalse(AppState.workspacePath(#"C:\dev\Site2\a.md"#, isIn: #"C:\dev\Site"#))
+        XCTAssertFalse(AppState.workspacePath(#"/w/odd\name"#, isIn: "/w/odd"), "a POSIX name may hold a backslash")
+        XCTAssertEqual(AppState.workspaceName(#"C:\dev\Site\a.md"#), "a.md")
+        XCTAssertEqual(AppState.workspaceName(#"/w/odd\name"#), #"odd\name"#)
+        XCTAssertEqual(AppState.workspaceName(#"/w/notes\"#), #"notes\"#, "a POSIX name may end in a backslash")
+        XCTAssertEqual(AppState.normalizedWorkspacePath(#"/w/notes\"#), #"/w/notes\"#, "only slashes are trimmed on POSIX")
+        XCTAssertEqual(AppState.normalizedWorkspacePath("/w/notes/"), "/w/notes")
+        XCTAssertEqual(AppState.normalizedWorkspacePath(#"C:\dev\"#), #"C:\dev"#)
+
+        XCTAssertEqual(WorkspaceDrag.reference(to: ["/w/a.md", "/w/My Notes/b.md"]), "/w/a.md `/w/My Notes/b.md`")
+        XCTAssertEqual(WorkspaceDrag.appending("/w/a.md", to: "Read"), "Read /w/a.md")
+        XCTAssertEqual(WorkspaceDrag.appending("/w/a.md", to: "Read "), "Read /w/a.md")
+        XCTAssertEqual(WorkspaceDrag.appending("/w/a.md", to: ""), "/w/a.md")
+        let provider = WorkspaceDrag.provider(for: WorkspaceEntry(name: "a.md", path: "/w/a.md", isDirectory: false))
+        XCTAssertTrue(WorkspaceDrag.isEntry(provider))
+        XCTAssertFalse(AttachmentDrop.takes(provider), "a Folder drag is never staged as an upload")
+        let path = await WorkspaceDrag.path(from: provider)
+        XCTAssertEqual(path, "/w/a.md")
+    }
+
     func testWorkspaceAnswerWithoutOKIsRefused() async {
         let client = workspaceClient(answer: { _, _, _ in ["entries": []] })
         do {
@@ -175,6 +217,74 @@ extension HermesVoiceGatewayTimeoutTests {
 
         try await client.save(root: "/w", path: "/w/a.txt", content: "new", readAt: nil)
         XCTAssertNil(sent?["expected_mtime"], "Replace It saves over whatever is there")
+    }
+
+    /// An upload, and a save past 64 KB, are encoded off the main thread
+    /// and sent without the page (issue 2356); a small save goes the usual
+    /// way.
+    func testAnUploadAndABigSaveAreSentEncoded() async throws {
+        var asked: [String] = []
+        var encoded: [(path: String, body: [String: Any])] = []
+        let client = WorkspaceFilesClient(profile: "work", request: { path, _, _ in
+            asked.append(path)
+            return ["ok": true]
+        }, sendEncoded: { path, body in
+            encoded.append((path, try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])))
+            return ["ok": true, "entry": ["name": "a.bin", "path": "/w/a.bin", "isDirectory": false]]
+        })
+
+        let entry = try await client.upload(root: "/w", in: "/w", name: "a.bin", data: Data([1, 2, 3]))
+        XCTAssertEqual(entry?.path, "/w/a.bin")
+        XCTAssertEqual(encoded.count, 1)
+        XCTAssertTrue(encoded[0].path.hasPrefix("/api/plugins/conduit_push/workspace/upload"), encoded[0].path)
+        XCTAssertEqual(encoded[0].body["data"] as? String, Data([1, 2, 3]).base64EncodedString())
+        XCTAssertEqual(encoded[0].body["name"] as? String, "a.bin")
+        XCTAssertEqual(encoded[0].body["overwrite"] as? Bool, false)
+        XCTAssertTrue(asked.isEmpty)
+
+        try await client.save(root: "/w", path: "/w/a.txt", content: "small", readAt: nil)
+        XCTAssertEqual(asked.count, 1, "a small save goes the usual way")
+        let big = String(repeating: "x", count: WorkspaceFilesClient.encodedSaveBytes + 1)
+        try await client.save(root: "/w", path: "/w/a.txt", content: big, readAt: Date(timeIntervalSince1970: 1_700_000_000))
+        XCTAssertEqual(encoded.count, 2)
+        XCTAssertEqual(encoded[1].body["content"] as? String, big)
+        XCTAssertEqual(encoded[1].body["expected_mtime"] as? Double, 1_700_000_000)
+    }
+
+    /// The editor colors a file from tokens found off the main thread
+    /// (issue 2354): the same colors the chat's code takes.
+    func testTheEditorsTokensColorAsTheChatsCode() throws {
+        let source = "let x = 42 // done\nprint(\"héllo\") /* a\nb */ if"
+        let tokens = try XCTUnwrap(SyntaxHighlighter.coloredTokens(in: source))
+        let text = source as NSString
+        let named = tokens.map { (text.substring(with: $0.range), $0.kind) }
+        XCTAssertEqual(named.map(\.0), ["let", "42", "// done", "\"héllo\"", "/* a\nb */", "if"])
+        XCTAssertEqual(named.map(\.1), [.keyword, .number, .comment, .string, .comment, .keyword])
+        let highlighted = SyntaxHighlighter.highlight(source, language: "swift")
+        for token in tokens {
+            let range = try XCTUnwrap(Range(token.range, in: source))
+            let start = try XCTUnwrap(AttributedString.Index(range.lowerBound, within: highlighted))
+            XCTAssertEqual(highlighted[start...].runs.first?.foregroundColor, token.kind.color)
+        }
+    }
+
+    /// The gutter numbers lines from an index found once per change, a
+    /// wrapped line once and the line after a final newline too.
+    func testTheEditorsLineIndexNumbersLines() {
+        let index = WorkspaceLineIndex()
+        let text = NSMutableString(string: "one\ntwo\n\nfour")
+        XCTAssertEqual(index.count(in: text), 4)
+        XCTAssertEqual(index.line(at: 0, in: text), 1)
+        XCTAssertEqual(index.line(at: 3, in: text), 1, "the newline ends its own line")
+        XCTAssertEqual(index.line(at: 4, in: text), 2)
+        XCTAssertEqual(index.line(at: 8, in: text), 3)
+        XCTAssertEqual(index.line(at: 9, in: text), 4)
+        text.append("\n")
+        XCTAssertEqual(index.count(in: text), 4, "kept until the text changes")
+        index.invalidate()
+        XCTAssertEqual(index.count(in: text), 5)
+        XCTAssertEqual(index.line(at: text.length, in: text), 5)
+        XCTAssertEqual(WorkspaceLineIndex().count(in: NSMutableString()), 1)
     }
 
     func testCodeThatNamesAPathLinksToTheFile() throws {
@@ -290,6 +400,9 @@ extension HermesVoiceGatewayTimeoutTests {
         XCTAssertNil(appState.workspaceReveal, "nothing to open")
         // Said above the composer, which shows while the chat is connected.
         XCTAssertEqual(appState.composerNotice?.hasPrefix("gone.xlsx isn"), true, appState.composerNotice ?? "")
+        // A POSIX host's relative name keeps its backslash (issue 2303).
+        appState.showWorkspaceLookup(.success(nil), for: #"out/odd\name.md"#, line: nil)
+        XCTAssertEqual(appState.composerNotice?.hasPrefix(#"odd\name.md isn"#), true, appState.composerNotice ?? "")
 
         appState.showWorkspaceLookup(.failure(URLError(.timedOut)), for: "docs/a.md", line: nil)
         XCTAssertEqual(appState.workspaceReveal?.path, "/home/me/app/docs/a.md", "a failed lookup keeps the chat's folder")
@@ -350,6 +463,24 @@ extension HermesVoiceGatewayTimeoutTests {
         XCTAssertNil(AppState.parentWorkspacePath("C:\\"))
         XCTAssertNil(AppState.parentWorkspacePath(""))
         XCTAssertEqual(AppState.parentWorkspacePath("/home/me/a\\b"), "/home/me", "a backslash in a POSIX name isn't a separator")
+    }
+
+    func testAFolderThatMayStillBeMadeIsListedAgainOnlyWhereItWasAskedFor() {
+        // Notifier issue 834: the host stopped waiting (504), and the folder may be there.
+        let slow = DashboardTicketBridgeError.http(status: 504, detail: "")
+        let after = ProjectFolderPickerSheet.afterFailedNewFolder(slow, in: "/w", showing: "/w")
+        XCTAssertTrue(after.relists && after.saysSo)
+        let refused = ProjectFolderPickerSheet.afterFailedNewFolder(DashboardTicketBridgeError.http(status: 409, detail: ""), in: "/w", showing: "/w")
+        XCTAssertTrue(!refused.relists && refused.saysSo)
+        // The user went to another folder meanwhile: it isn't moved back, and isn't told of the other's failure.
+        let left = ProjectFolderPickerSheet.afterFailedNewFolder(slow, in: "/w", showing: "/w/app")
+        XCTAssertTrue(!left.relists && !left.saysSo)
+        // A folder tapped while New Folder was out counts as moved on, though its listing isn't in yet.
+        let tapped = ProjectFolderPickerSheet.afterFailedNewFolder(slow, in: "/w", showing: "/w", openedSince: 1)
+        XCTAssertTrue(!tapped.relists && !tapped.saysSo)
+        let tappedAfterRefusal = ProjectFolderPickerSheet.afterFailedNewFolder(
+            DashboardTicketBridgeError.http(status: 409, detail: ""), in: "/w", showing: "/w", openedSince: 1)
+        XCTAssertFalse(tappedAfterRefusal.saysSo)
     }
 
     func testProjectFolderPickerStartsInTheChatsFolderElseHomes() throws {

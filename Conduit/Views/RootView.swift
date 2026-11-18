@@ -42,25 +42,27 @@ struct RootView: View {
         .animation(.easeInOut(duration: 0.2), value: appState.showLogin)
         // A sign-in code link asks here, above both the sign-in screen and
         // the app, so it survives the sign-in screen giving way to the app
-        // while a saved dashboard connects at launch.
-        .sheet(item: $appState.pendingConnectLink) { link in
+        // while a saved dashboard connects at launch. These four show over a
+        // sheet that's already up (sheetAboveAll), rather than waiting
+        // unseen until it closes.
+        .sheetAboveAll(item: $appState.pendingConnectLink) { link in
             ConnectLinkSheet(link: link)
                 .environmentObject(appState)
         }
         // A Link invite, the same way: it waits there for Conduit to
         // connect when it opened Conduit.
-        .sheet(item: $appState.pendingRoomLink) { invite in
+        .sheetAboveAll(item: $appState.pendingRoomLink) { invite in
             RoomLinkOpenedSheet(invite: invite)
                 .environmentObject(appState)
         }
         // An invite to a room whose notification was tapped: its join card.
-        .sheet(item: $appState.presentedRoomInvite) { invite in
+        .sheetAboveAll(item: $appState.presentedRoomInvite) { invite in
             RoomInviteSheet(invite: invite)
                 .environmentObject(appState)
         }
         // An approval in a room hosted elsewhere whose notification was
         // tapped: its card.
-        .sheet(item: $appState.presentedRoomApproval) { approval in
+        .sheetAboveAll(item: $appState.presentedRoomApproval) { approval in
             RoomApprovalSheet(approval: approval)
                 .environmentObject(appState)
         }
@@ -116,7 +118,7 @@ struct RootView: View {
                 #if targetEnvironment(macCatalyst)
                 macHandledPhase = newPhase
                 #endif
-                appState.handleScenePhase(newPhase)
+                appState.noteScenePhase(newPhase, scene: AppState.mainWindowScene)
             }
         }
         .onAppear {
@@ -127,6 +129,17 @@ struct RootView: View {
             if ConduitWindowClaimKeeper.claimPrimaryWindow() {
                 isPrimaryWindow = true
                 appState.startWakeListeningLifecycle()
+                // A main window reopened (beside a chat window, or after
+                // every window closed) counts from its first frame, not from
+                // its next phase change. At launch nothing has been heard
+                // yet: its phase is counted without running a change's
+                // steps, which its phase changes run as before, so a chat
+                // window closing later never leaves the app's phase without it.
+                if appState.mergedScenePhase != nil {
+                    appState.noteScenePhase(scenePhase, scene: AppState.mainWindowScene)
+                } else {
+                    appState.countScenePhaseBeforeAnyHeard(scenePhase, scene: AppState.mainWindowScene)
+                }
             } else {
                 // Environment-scoped dismissal: close THIS duplicate window
                 // only. ID-scoped dismissal targets the WindowGroup and
@@ -136,6 +149,11 @@ struct RootView: View {
         }
         .onDisappear {
             if isPrimaryWindow {
+                // A chat window left open alone decides the app's phase. The
+                // main window counts as gone to the background first, so the
+                // last window closing still runs the background steps.
+                appState.noteScenePhase(.background, scene: AppState.mainWindowScene)
+                appState.noteScenePhase(nil, scene: AppState.mainWindowScene)
                 ConduitWindowClaimKeeper.releaseClaim()
             }
         }
@@ -565,10 +583,11 @@ struct MainView: View {
     @ViewBuilder
     private var sidebarLayoutContent: some View {
         if useV2Shell {
-            // V2 opens on the Chats list (Eric, 2026-10-15), or on the chat
-            // iOS closed it on in the background (#1559); a chat a
+            // V2 opens on its first tab (Bots, until the user reorders the
+            // tabs, issue 2084), or on the chat iOS closed it on in the
+            // background (#1559); a chat a
             // notification or widget opens is pushed over it.
-            V2Shell(conversationOnLeave: $conversationOnLeave, reopening: conversationToReopen)
+            V2Shell(conversationOnLeave: $conversationOnLeave, reopening: conversationToReopen, showsPulse: appState.showsPulseScreen)
         } else if isPersistentSidebarActive {
             HStack(spacing: 0) {
                 SidebarView(

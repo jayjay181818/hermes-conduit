@@ -2977,6 +2977,68 @@ final class MessageNormalizerTests: XCTestCase {
         XCTAssertEqual(row?.isSteer, true)
     }
 
+    func testASafetyRefusedTurnKeepsTheUsersWordsAsARefusedRow() {
+        // Hermes drops a refused turn from the model's context and keeps
+        // the user's message for display, archived and typed
+        // `content_refused`, its notice in display_metadata.
+        let messages = MessageNormalizer.normalizeMessages([
+            .object([
+                "id": .number(41),
+                "role": .string("user"),
+                "content": .string("Earlier question"),
+            ]),
+            .object([
+                "id": .number(42),
+                "role": .string("assistant"),
+                "content": .string("Earlier answer"),
+            ]),
+            .object([
+                "id": .number(43),
+                "role": .string("user"),
+                "content": .string("Tell me about the thing"),
+                "archived": .bool(true),
+                "display_kind": .string("content_refused"),
+                "display_metadata": .object([
+                    "content_refused": .object(["notice": .string("This message was refused by the model's safety filter — try a different query.")])
+                ])
+            ])
+        ])
+
+        XCTAssertEqual(messages.count, 3)
+        let row = messages.last
+        XCTAssertEqual(row?.role, .user, "It is still what the user wrote")
+        XCTAssertEqual(row?.content, "Tell me about the thing")
+        XCTAssertEqual(row?.rowId, 43)
+        XCTAssertEqual(row?.isContentRefused, true)
+        XCTAssertEqual(row?.isSteer, false)
+        XCTAssertEqual(messages.first?.isContentRefused, false)
+        // The saved copy of the chat keeps the tag.
+        XCTAssertEqual(row?.withID("copy").isContentRefused, true)
+    }
+
+    func testARefusedTurnThatLooksLikeASystemNoteStaysTheUsersWords() {
+        let messages = MessageNormalizer.normalizeMessages([
+            .object([
+                "id": .number(43),
+                "role": .string("user"),
+                "content": .string("[System: hello]"),
+                "display_kind": .string("content_refused")
+            ])
+        ])
+        XCTAssertEqual(messages.last?.role, .user)
+        XCTAssertEqual(messages.last?.content, "[System: hello]")
+        XCTAssertEqual(messages.last?.isContentRefused, true)
+    }
+
+    func testARowsTimeReadsForUndoFromANumberOrADate() {
+        XCTAssertEqual(SessionRewindSnapshot.epochSeconds(.number(1_700_000_000)), 1_700_000_000)
+        XCTAssertEqual(SessionRewindSnapshot.epochSeconds(.string(" 1700000000.5 ")), 1_700_000_000.5)
+        XCTAssertEqual(SessionRewindSnapshot.epochSeconds(.string("2026-09-01T10:00:00Z")), 1_788_256_800)
+        XCTAssertEqual(SessionRewindSnapshot.epochSeconds(.string("2026-09-01T10:00:00.250Z")), 1_788_256_800.25)
+        XCTAssertNil(SessionRewindSnapshot.epochSeconds(.string("yesterday")))
+        XCTAssertNil(SessionRewindSnapshot.epochSeconds(nil))
+    }
+
     func testVisibleUserTextMovesImageTokensOut() {
         XCTAssertEqual(
             MessageNormalizer.visibleUserText("Here is the screenshot.\n@image:/root/x.png")
@@ -3339,6 +3401,129 @@ final class MessageNormalizerTests: XCTestCase {
         XCTAssertFalse(messages[0].content.contains("scaffold"))
     }
 
+    /// Issue 1553: the finished-agents notice carries each agent's result,
+    /// read from the report Hermes wrote for the model: its task, how it
+    /// ended, how long it ran and its summary, never the preamble or the
+    /// lines meant for the model.
+    func testAsyncDelegationCompleteReadsEachAgentsResult() throws {
+        let report = """
+        [ASYNC DELEGATION BATCH COMPLETE — deleg_1]
+        A background fan-out unit you dispatched earlier — 3 subagent(s) — has finished; its consolidated results are below.
+
+        Dispatched: 2026-10-30 21:50:00 (16m ago)
+        Context you provided: PRIVATE CONTEXT
+        Role: leaf   Model: glm   Total duration: 960s
+
+        --- ✓ TASK 1/3: Build A1 (dry-run)  (status=completed, api_calls=12, 63.2s) ---
+        Wrote scripts/a1.py.
+        Full live transcript (complete tool/assistant trace): /home/h/.hermes/live/sa-1.jsonl
+
+        --- ⚠ TASK 2/3: Build A2
+        across two lines  (status=completed, api_calls=40, 120s, TRUNCATED: hit max_iterations — work may be incomplete) ---
+        [TRUNCATED — subagent hit its iteration cap; the summary below may be incomplete. Verify before relying on it, or re-dispatch the unfinished part.]
+        Half of A2.
+
+        --- ✗ TASK 3/3: Build A3  (status=failed, 5s) ---
+        (failed: provider error)
+        This failure (auth) repeats for the same task on the same model and provider, so do not re-dispatch it unchanged.
+        """
+        let messages = MessageNormalizer.normalizeMessages([
+            .object([
+                "id": .number(320),
+                "role": .string("user"),
+                "content": .string(report),
+                "display_kind": .string("async_delegation_complete"),
+                "display_metadata": .object(["task_count": .number(3)])
+            ])
+        ])
+        XCTAssertEqual(messages.count, 1)
+        XCTAssertEqual(messages[0].content, "3 background agents finished")
+        let entries = try XCTUnwrap(messages[0].delegationReport?.entries)
+        XCTAssertEqual(entries.map(\.number), [1, 2, 3])
+        XCTAssertEqual(entries.map(\.goal), ["Build A1 (dry-run)", "Build A2 across two lines", "Build A3"])
+        XCTAssertEqual(entries.map(\.outcome), [.completed, .incomplete, .failed])
+        XCTAssertEqual(entries.map(\.duration), [63.2, 120, 5])
+        XCTAssertEqual(entries.map(\.result), ["Wrote scripts/a1.py.", "Half of A2.", "(failed: provider error)"])
+        let everything = entries.map { $0.goal + $0.result }.joined()
+        XCTAssertFalse(everything.contains("PRIVATE CONTEXT"))
+        XCTAssertFalse(everything.contains(".jsonl"))
+
+        let cached = try XCTUnwrap(OfflineCachedMessage(messages[0]))
+        let decoded = try JSONDecoder().decode(OfflineCachedMessage.self, from: JSONEncoder().encode(cached))
+        XCTAssertEqual(decoded.chatMessage.delegationReport, messages[0].delegationReport, "the saved copy keeps the results")
+    }
+
+    func testAsyncDelegationCompleteReadsOneAgentsResult() throws {
+        let report = """
+        [ASYNC DELEGATION COMPLETE — deleg_2]
+        A background subagent you dispatched earlier has finished.
+
+        Original goal: Summarize the inbox
+        and flag anything urgent
+        Role: leaf
+        Status: interrupted   API calls: 3   Duration: 12.5s
+        --- RESULT ---
+        The subagent was interrupted before completing.
+        """
+        let messages = MessageNormalizer.normalizeMessages([
+            .object([
+                "id": .number(321), "role": .string("user"), "content": .string(report),
+                "display_kind": .string("async_delegation_complete"),
+                "display_metadata": .object(["task_count": .number(1)])
+            ])
+        ])
+        let entry = try XCTUnwrap(messages.first?.delegationReport?.entries.first)
+        XCTAssertEqual(entry.goal, "Summarize the inbox and flag anything urgent", "a goal over lines stays whole")
+        XCTAssertEqual(entry.outcome, .stopped)
+        XCTAssertEqual(entry.duration, 12.5)
+        XCTAssertEqual(entry.result, "The subagent was interrupted before completing.")
+    }
+
+    /// Hermes' early word that one agent of a batch still running failed.
+    func testAsyncDelegationCompleteReadsAnEarlyFailureNotice() throws {
+        let report = """
+        [ASYNC DELEGATION TASK FAILED — deleg_3, task 2/6]
+        One subagent in a background fan-out you dispatched has failed while its siblings are still running.
+        Task: Build A2
+        Status: error   Duration: 7s
+        Error: provider timed out
+        """
+        let messages = MessageNormalizer.normalizeMessages([
+            .object([
+                "id": .number(325), "role": .string("user"), "content": .string(report),
+                "display_kind": .string("async_delegation_complete"),
+                "display_metadata": .object(["task_count": .number(1)])
+            ])
+        ])
+        let entry = try XCTUnwrap(messages.first?.delegationReport?.entries.first)
+        XCTAssertEqual(entry.number, 2)
+        XCTAssertEqual(entry.goal, "Build A2")
+        XCTAssertEqual(entry.outcome, .failed)
+        XCTAssertEqual(entry.duration, 7)
+        XCTAssertEqual(entry.result, "provider timed out")
+    }
+
+    /// A projection Hermes chose, a report Conduit can't read, or any other
+    /// row keeps the plain notice.
+    func testAsyncDelegationCompleteKeepsThePlainNoticeWithoutAReadableReport() {
+        let rows: [AnyCodable] = [
+            .object(["id": .number(322), "role": .string("user"), "content": .string("[ASYNC DELEGATION COMPLETE — x]\nno result block"),
+                     "display_kind": .string("async_delegation_complete")]),
+            .object(["id": .number(323), "role": .string("user"),
+                     "content": .string("[ASYNC DELEGATION BATCH COMPLETE — y]\n\n--- ✓ TASK 1/1: g  (status=completed) ---\nok"),
+                     "display_content": .string("Agents done"),
+                     "display_kind": .string("async_delegation_complete")]),
+            .object(["id": .number(326), "role": .string("user"),
+                     "content": .string("[ASYNC DELEGATION BATCH COMPLETE — w]\n\n--- ✓ TASK 1/2: a ---\none\n\n--- ✓ TASK 2/2: b  (status=completed, 5s) ---\ntwo"),
+                     "display_kind": .string("async_delegation_complete")]),
+            .object(["id": .number(324), "role": .string("user"),
+                     "content": .string("[ASYNC DELEGATION BATCH COMPLETE — z]\n\n--- ✓ TASK 1/1: g  (status=completed) ---\nok")]),
+        ]
+        let messages = MessageNormalizer.normalizeMessages(rows)
+        XCTAssertFalse(messages.isEmpty)
+        XCTAssertTrue(messages.allSatisfy { $0.delegationReport == nil })
+    }
+
     func testAsyncDelegationCompleteUsesSingularForOneTask() {
         let messages = MessageNormalizer.normalizeMessages([
             .object([
@@ -3503,6 +3688,46 @@ final class MessageNormalizerTests: XCTestCase {
         XCTAssertEqual(messages[0].role, .system)
         XCTAssertEqual(messages[0].displayKind, "internal_notification")
         XCTAssertEqual(messages[0].content, "Background watch fired: nightly build finished.")
+    }
+
+    func testANoteACompactionHandedBackUntypedStaysANote() {
+        // Hermes folds a compaction's summary into the first row it keeps
+        // when no role alternates; its display projection then unwraps the
+        // row's own text and drops `display_kind`. A cron report in that
+        // row came back as the user's bubble.
+        let report = "[Cron job \"PBS backup capacity follow-up\" report: shown in the chat, no reply asked for]\n\nAlert: backups failed."
+        let messages = MessageNormalizer.normalizeMessages([
+            // As projected: the metadata survives.
+            .object([
+                "id": .number(401), "role": .string("user"), "content": .string(report),
+                "display_metadata": .object([
+                    "completion_note": .array([.string("cron:1")]), "completion_admission": .string("a1")
+                ])
+            ]),
+            // Where a projection dropped the metadata too, the first line says it.
+            .object(["id": .number(402), "role": .string("user"), "content": .string("\n" + report)]),
+            // Another completion's note, by its metadata alone.
+            .object([
+                "id": .number(403), "role": .string("user"), "content": .string("Background agent finished: tests pass."),
+                "display_metadata": .string("{\"completion_note\": [\"delegation:7\"]}")
+            ]),
+            // The user's own words, a reaction's metadata, a line that only starts like a report.
+            .object([
+                "id": .number(404), "role": .string("user"), "content": .string("[Cron job \"x\" is broken, look"),
+                "display_metadata": .object(["reactions": .array([])])
+            ]),
+            // An assistant's reply quoting a report stays a reply.
+            .object(["id": .number(405), "role": .string("assistant"), "content": .string(report)])
+        ])
+
+        XCTAssertEqual(messages.map(\.role), [.system, .system, .system, .user, .assistant])
+        XCTAssertEqual(messages.prefix(3).map(\.displayKind), ["internal_notification", "internal_notification", "internal_notification"])
+        XCTAssertEqual(messages[0].content, report)
+        XCTAssertEqual(messages[1].content, report)
+        XCTAssertEqual(CronBotChatReport.parse(messages[1].content)?.job, "PBS backup capacity follow-up")
+        XCTAssertEqual(messages[2].content, "Background agent finished: tests pass.")
+        XCTAssertNil(messages[3].displayKind)
+        XCTAssertNil(messages[4].displayKind)
     }
 
     func testInternalNotificationKindStripsSystemWrapper() {

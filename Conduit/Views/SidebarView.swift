@@ -150,7 +150,7 @@ struct SidebarView: View {
                         case .cron:
                             CronList()
                         case .kanban:
-                            KanbanView()
+                            SidebarKanbanView(appState: appState)
                         }
                     }
                     .transition(.opacity.combined(with: .move(edge: .bottom)))
@@ -173,6 +173,21 @@ struct SidebarView: View {
             // Explicitly migrate removed raw values such as Capabilities.
             selectedTabRaw = SidebarTab.migrated(rawValue: selectedTabRaw).rawValue
         }
+    }
+}
+
+/// The drawer's board takes each AppState change as it comes: it shows only
+/// while its tab is picked, so nothing holds the changes back.
+private struct SidebarKanbanView: View {
+    @StateObject private var updates: V2ShownUpdates
+
+    init(appState: AppState) {
+        _updates = StateObject(wrappedValue: V2ShownUpdates(appState))
+    }
+
+    var body: some View {
+        KanbanView()
+            .environmentObject(updates)
     }
 }
 
@@ -286,36 +301,29 @@ struct SessionList: View {
                         Label(AppLocalization.string("New voice call"), systemImage: "waveform")
                     }
                     .accessibilityLabel(AppLocalization.string("New voice call"))
-                    .accessibilityHint(appState.phoneVoiceUnavailableReason ?? AppLocalization.string("Starts a voice call that isn't tied to a chat"))
+                    .accessibilityHint(appState.phoneVoiceUnavailableReason ?? AppLocalization.string("Starts a voice call that isn't tied to a chat", table: .chat))
                 }
 
                 Menu {
-                    if appState.servesNeedsYou {
-                        Button {
-                            Haptics.selection()
-                            showNeedsYou = true
-                        } label: {
-                            Label(AppLocalization.string("Needs you"), systemImage: "exclamationmark.bubble")
-                        }
-                    }
+                    NeedsYouMenuEntry(store: appState.needsYou) { showNeedsYou = true }
                     Button {
                         Haptics.selection()
                         showFilterOrder = true
                     } label: {
-                        Label(AppLocalization.string("Reorder filters"), systemImage: "arrow.left.arrow.right")
+                        Label(AppLocalization.string("Reorder filters", table: .chat), systemImage: "arrow.left.arrow.right")
                     }
 
                     Button {
                         Haptics.selection()
                         showArchivedSessions = true
                     } label: {
-                        Label(AppLocalization.string("Archived conversations"), systemImage: "archivebox")
+                        Label(AppLocalization.string("Archived conversations", table: .chat), systemImage: "archivebox")
                     }
                     Button {
                         Haptics.selection()
                         showPinnedReplies = true
                     } label: {
-                        Label(AppLocalization.string("Pinned replies"), systemImage: "pin")
+                        Label(AppLocalization.string("Pinned replies", table: .chat), systemImage: "pin")
                     }
 
                     Button {
@@ -371,7 +379,7 @@ struct SessionList: View {
                 }
                 .buttonStyle(.plain)
                 .conduitGlassControl(cornerRadius: 14, tint: showingProjects ? .conduitAccent.opacity(0.14) : .clear)
-                .accessibilityLabel(showingProjects ? AppLocalization.string("Show sessions") : AppLocalization.string("Browse projects"))
+                .accessibilityLabel(showingProjects ? AppLocalization.string("Show sessions") : AppLocalization.string("Browse projects", table: .chat))
             }
             .padding(.horizontal, 14)
             .padding(.top, 8)
@@ -418,10 +426,10 @@ struct SessionList: View {
                             filteredOutRows: !appState.listedSessions.isEmpty || !appState.listedCronSessions.isEmpty
                         ),
                         emptyTitle: statusFilter?.emptyTitle
-                            ?? (selectedSource == nil ? AppLocalization.string("No Sessions") : AppLocalization.string("No \(selectedSource!.label) Sessions")),
+                            ?? (selectedSource == nil ? AppLocalization.string("No Sessions", table: .chat) : AppLocalization.string("No \(selectedSource!.label) Sessions", table: .chat)),
                         emptyDescription: searchText.isEmpty
-                            ? statusFilter?.emptyDescription ?? AppLocalization.string("Sessions will appear here once created.")
-                            : AppLocalization.string("Try a different search."),
+                            ? statusFilter?.emptyDescription ?? AppLocalization.string("Sessions will appear here once created.", table: .chat)
+                            : AppLocalization.string("Try a different search.", table: .chat),
                         emptySystemImage: statusFilter?.emptySystemImage ?? "tray",
                         retry: { Task { await appState.refreshSessionCatalog() } }
                     )
@@ -448,7 +456,7 @@ struct SessionList: View {
                     }
                 }
             }
-            .searchable(text: $searchText, prompt: showingProjects ? AppLocalization.string("Search projects and pinned chats") : AppLocalization.string("Search sessions"))
+            .searchable(text: $searchText, prompt: showingProjects ? AppLocalization.string("Search projects and pinned chats", table: .chat) : AppLocalization.string("Search sessions", table: .chat))
             .scrollContentBackground(.hidden)
             .listStyle(.plain)
             .refreshable {
@@ -528,8 +536,8 @@ struct SessionList: View {
         }
         .sheet(item: $projectPendingRename) { project in
             RenameSheet(
-                title: AppLocalization.string("Rename project"),
-                placeholder: AppLocalization.string("Project name"),
+                title: AppLocalization.string("Rename project", table: .chat),
+                placeholder: AppLocalization.string("Project name", table: .chat),
                 initialText: project.title,
                 normalize: { SessionRenameOperation.normalizedTitle($0, currentTitle: project.title) }
             ) { name in
@@ -547,7 +555,7 @@ struct SessionList: View {
             }
             Button("Cancel", role: .cancel) { projectPendingDeletion = nil }
         } message: {
-            Text(AppLocalization.string("This removes \(projectPendingDeletion?.title ?? "") from Hermes. Its folders, files and conversations are kept."))
+            Text(AppLocalization.string("This removes \(projectPendingDeletion?.title ?? "") from Hermes. Its folders, files and conversations are kept.", table: .chat))
         }
         .alert("Delete conversation?", isPresented: Binding(
             get: { sessionPendingDeletion != nil },
@@ -654,11 +662,11 @@ struct SessionList: View {
             EmptyView()
         } else if displayedProjects.isEmpty {
             ContentUnavailableView(
-                isSearching ? AppLocalization.string("No Matching Projects") : AppLocalization.string("No Projects"),
+                isSearching ? AppLocalization.string("No Matching Projects", table: .chat) : AppLocalization.string("No Projects", table: .chat),
                 systemImage: "folder",
                 description: Text(!isSearching
-                    ? AppLocalization.string("Projects you make here or in Hermes Desktop show here.")
-                    : AppLocalization.string("Try a different search."))
+                    ? AppLocalization.string("Projects you make here or in Hermes Desktop show here.", table: .chat)
+                    : AppLocalization.string("Try a different search.", table: .chat))
             )
         } else {
             Section("Projects") {
@@ -673,8 +681,8 @@ struct SessionList: View {
                     .buttonStyle(.plain)
                     .accessibilityValue(unreadProjects.contains(project.id) ? AppLocalization.string("Unread") : "")
                     .accessibilityHint(appState.isProjectEditable(project)
-                        ? AppLocalization.string("Opens the conversations in this project. Swipe or touch and hold to rename or delete it.")
-                        : AppLocalization.string("Opens the conversations in this project."))
+                        ? AppLocalization.string("Opens the conversations in this project. Swipe or touch and hold to rename or delete it.", table: .chat)
+                        : AppLocalization.string("Opens the conversations in this project.", table: .chat))
                     .projectActionsMenu(isEnabled: appState.isProjectEditable(project)) {
                         Button {
                             Haptics.selection()
@@ -836,7 +844,7 @@ struct SessionList: View {
                 Haptics.selection()
                 showFilterOrder = true
             } label: {
-                Label(AppLocalization.string("Reorder filters"), systemImage: "arrow.left.arrow.right")
+                Label(AppLocalization.string("Reorder filters", table: .chat), systemImage: "arrow.left.arrow.right")
             }
         }
     }
@@ -1146,7 +1154,7 @@ struct ArchivedSessionsSheet: View {
                             .listRowSeparator(.hidden)
                     } else if displayedSessions.isEmpty {
                         ContentUnavailableView(
-                            searchText.isEmpty ? AppLocalization.string("Nothing archived") : AppLocalization.string("No matching conversations"),
+                            searchText.isEmpty ? AppLocalization.string("Nothing archived", table: .chat) : AppLocalization.string("No matching conversations", table: .chat),
                             systemImage: "archivebox",
                             description: Text("Archived conversations stay here until you restore or permanently delete them.")
                         )
@@ -1197,14 +1205,14 @@ struct ArchivedSessionsSheet: View {
                         }
                     }
                 }
-                .searchable(text: $searchText, prompt: AppLocalization.string("Search archived conversations"))
+                .searchable(text: $searchText, prompt: AppLocalization.string("Search archived conversations", table: .chat))
                 .scrollContentBackground(.hidden)
                 .listStyle(.plain)
                 .refreshable { await refresh() }
             }
             .toolbar(.hidden, for: .navigationBar)
             .safeAreaInset(edge: .top, spacing: 0) {
-                ConduitSheetHeader(title: AppLocalization.string("Archived conversations"), close: { dismiss() })
+                ConduitSheetHeader(title: AppLocalization.string("Archived conversations", table: .chat), close: { dismiss() })
             }
         }
         .task { await refresh() }
@@ -1406,7 +1414,7 @@ struct SessionActionMenuItems: View {
                 // Next turn, as Rename: the sheet waits for the menu to close.
                 DispatchQueue.main.async { onReorderPinned() }
             } label: {
-                Label(AppLocalization.string("Reorder pinned chats"), systemImage: "arrow.up.arrow.down")
+                Label(AppLocalization.string("Reorder pinned chats", table: .chat), systemImage: "arrow.up.arrow.down")
             }
         }
 
@@ -1416,7 +1424,7 @@ struct SessionActionMenuItems: View {
                 Haptics.light()
                 appState.toggleSessionStarred(session)
             } label: {
-                Label(appState.isSessionStarred(session) ? AppLocalization.string("Unstar") : AppLocalization.string("Star"), systemImage: appState.isSessionStarred(session) ? "star.slash" : "star")
+                Label(appState.isSessionStarred(session) ? AppLocalization.string("Unstar", table: .chat) : AppLocalization.string("Star", table: .chat), systemImage: appState.isSessionStarred(session) ? "star.slash" : "star")
             }
         }
 
@@ -1477,14 +1485,14 @@ struct ReadStateToggleButton: View {
             }
         } label: {
             Label(
-                isUnread ? AppLocalization.string("Mark as read") : AppLocalization.string("Mark as unread"),
+                isUnread ? AppLocalization.string("Mark as read", table: .chat) : AppLocalization.string("Mark as unread", table: .chat),
                 systemImage: isUnread ? "envelope.open" : "envelope.badge"
             )
         }
         if nest != nil {
             // A parent's read toggle speaks its wider scope: this clears
             // the whole nest, not just the row.
-            button.accessibilityHint(AppLocalization.string("Marks this conversation and its sessions as read"))
+            button.accessibilityHint(AppLocalization.string("Marks this conversation and its sessions as read", table: .chat))
         } else {
             button
         }
@@ -1504,7 +1512,7 @@ enum SessionStatusFilter: String, CaseIterable, Identifiable {
 
     var title: String {
         switch self {
-        case .needsInput: return AppLocalization.string("Needs input")
+        case .needsInput: return AppLocalization.string("Needs input", table: .chat)
         case .working: return AppLocalization.string("Working")
         case .unread: return AppLocalization.string("Unread")
         }
@@ -1520,25 +1528,25 @@ enum SessionStatusFilter: String, CaseIterable, Identifiable {
 
     var accessibilityHint: String {
         switch self {
-        case .needsInput: return AppLocalization.string("Shows only chats waiting on your answer or approval")
-        case .working: return AppLocalization.string("Shows only chats where Hermes is working")
-        case .unread: return AppLocalization.string("Shows only chats with replies you haven't seen")
+        case .needsInput: return AppLocalization.string("Shows only chats waiting on your answer or approval", table: .chat)
+        case .working: return AppLocalization.string("Shows only chats where Hermes is working", table: .chat)
+        case .unread: return AppLocalization.string("Shows only chats with replies you haven't seen", table: .chat)
         }
     }
 
     var emptyTitle: String {
         switch self {
-        case .needsInput: return AppLocalization.string("Nothing Needs You")
-        case .working: return AppLocalization.string("Nothing Running")
-        case .unread: return AppLocalization.string("No Unread Chats")
+        case .needsInput: return AppLocalization.string("Nothing Needs You", table: .chat)
+        case .working: return AppLocalization.string("Nothing Running", table: .chat)
+        case .unread: return AppLocalization.string("No Unread Chats", table: .chat)
         }
     }
 
     var emptyDescription: String {
         switch self {
-        case .needsInput: return AppLocalization.string("No chat is waiting on your answer.")
-        case .working: return AppLocalization.string("No chat has a reply in progress.")
-        case .unread: return AppLocalization.string("You're all caught up.")
+        case .needsInput: return AppLocalization.string("No chat is waiting on your answer.", table: .chat)
+        case .working: return AppLocalization.string("No chat has a reply in progress.", table: .chat)
+        case .unread: return AppLocalization.string("You're all caught up.", table: .chat)
         }
     }
 
@@ -1576,7 +1584,7 @@ struct MoveToProjectMenu: View {
                     }
                 }
             } label: {
-                Label(AppLocalization.string("Move to Project"), systemImage: "folder")
+                Label(AppLocalization.string("Move to Project", table: .chat), systemImage: "folder")
             }
             // `moveSession` refuses while ANY conversation mutation runs.
             .disabled(appState.sessionMutationID != nil)
@@ -1641,6 +1649,10 @@ private struct ProjectSessionsSheet: View {
     /// sheet is open (CarPlay, a widget) doesn't rename them.
     @State private var detailProfile: String?
     @State private var isLoading = true
+    /// A read that failed with nothing to keep: the sheet says so and offers a
+    /// retry, rather than drawing an empty list. A failed re-read keeps what
+    /// the sheet already lists and leaves this alone.
+    @State private var loadFailed = false
     @State private var sessionPendingDeletion: SessionSummary?
     @State private var sessionPendingRename: SessionSummary?
 
@@ -1664,6 +1676,20 @@ private struct ProjectSessionsSheet: View {
                             .frame(maxWidth: .infinity, minHeight: 140)
                             .listRowBackground(Color.clear)
                             .listRowSeparator(.hidden)
+                    } else if loadFailed, detail == nil {
+                        ContentUnavailableView {
+                            Label(AppLocalization.string("Conversations unavailable"), systemImage: "exclamationmark.triangle")
+                        } description: {
+                            Text(AppLocalization.string("Couldn't load this project's conversations."))
+                        } actions: {
+                            Button(AppLocalization.string("Try Again")) {
+                                Task { await load() }
+                            }
+                            // Offline it couldn't run; reconnecting reloads.
+                            .disabled(!appState.isConnected)
+                        }
+                        .listRowBackground(Color.clear)
+                        .listRowSeparator(.hidden)
                     } else if let detail, detail.lanes.isEmpty {
                         ContentUnavailableView {
                             Label(AppLocalization.string("No Conversations"), systemImage: "tray")
@@ -1803,7 +1829,12 @@ private struct ProjectSessionsSheet: View {
     private func load() async {
         guard appState.isConnected else { return }
         isLoading = true
+        loadFailed = false
         await loadDetail()
+        // Nothing listed and nothing read: say so, and offer the retry. A read
+        // that failed after an earlier one listed the project keeps those rows
+        // (loadDetail leaves them) and isn't a failure to show.
+        loadFailed = detail == nil
         isLoading = false
     }
 
@@ -1880,12 +1911,12 @@ struct ProjectCreateSheet: View {
                     // profile whose projects the list shows, so it shows
                     // there at once (issue 1661).
                     LabeledContent(AppLocalization.string("Profile"), value: appState.profileDisplayName(madeProjectProfile ?? appState.activeProfile))
-                    Text(AppLocalization.string("New projects go to the profile in use. To make one in another profile, switch to it first."))
+                    Text(AppLocalization.string("New projects go to the profile in use. To make one in another profile, switch to it first.", table: .chat))
                         .scaledFont(.footnote)
                         .foregroundStyle(.secondary)
                 }
 
-                ConduitSettingsSection(title: AppLocalization.string("Folders"), symbol: "folder", tint: .blue) {
+                ConduitSettingsSection(title: AppLocalization.string("Folders", table: .chat), symbol: "folder", tint: .blue) {
                     if folders.isEmpty {
                         Text("No folders added yet.")
                             .foregroundStyle(.secondary)
@@ -1915,23 +1946,23 @@ struct ProjectCreateSheet: View {
                     Button {
                         validationMessage = nil
                         guard !appState.projectFolderPickerRoot.isEmpty else {
-                            validationMessage = AppLocalization.string("Open a chat with a workspace before choosing a project folder.")
+                            validationMessage = AppLocalization.string("Open a chat with a workspace before choosing a project folder.", table: .chat)
                             return
                         }
                         showFolderPicker = true
                     } label: {
-                        Label(AppLocalization.string("Add folder"), systemImage: "plus")
+                        Label(AppLocalization.string("Add folder", table: .chat), systemImage: "plus")
                     }
                     .buttonStyle(.settings)
                     .disabled(madeProjectID != nil || isCreating)
                 }
 
-                ConduitSettingsSection(title: AppLocalization.string("Idea (optional)"), symbol: "lightbulb", tint: .yellow) {
+                ConduitSettingsSection(title: AppLocalization.string("Idea (optional)", table: .chat), symbol: "lightbulb", tint: .yellow) {
                     TextField("", text: $idea, axis: .vertical)
                         .textFieldStyle(.roundedBorder)
                         .lineLimit(5...12)
-                        .accessibilityLabel(Text(AppLocalization.string("Idea (optional)")))
-                    Text(AppLocalization.string("Saved as IDEA.md in the first folder, as in Hermes Desktop, unless the folder already has one."))
+                        .accessibilityLabel(Text(AppLocalization.string("Idea (optional)", table: .chat)))
+                    Text(AppLocalization.string("Saved as IDEA.md in the first folder, as in Hermes Desktop, unless the folder already has one.", table: .chat))
                         .scaledFont(.footnote)
                         .foregroundStyle(.secondary)
                 }
@@ -1959,7 +1990,7 @@ struct ProjectCreateSheet: View {
                         if isCreating {
                             ProgressView()
                         } else if madeProjectID != nil {
-                            Text(AppLocalization.string("Save Idea"))
+                            Text(AppLocalization.string("Save Idea", table: .chat))
                         } else {
                             Text("Create")
                         }
@@ -2010,7 +2041,7 @@ struct ProjectCreateSheet: View {
             madeProjectDashboard = dashboard
             validationMessage = message
         case .failed(let message):
-            validationMessage = message ?? AppLocalization.string("Hermes could not create this project.")
+            validationMessage = message ?? AppLocalization.string("Hermes could not create this project.", table: .chat)
         }
     }
 }
@@ -2018,11 +2049,14 @@ struct ProjectCreateSheet: View {
 /// Hermes' folders, from where the chat works (or Home's): into a folder,
 /// out to the one holding it, and a new folder with the plugin (issue 1661).
 /// The folders are the Hermes host's, so it browses them rather than the
-/// device's own.
-private struct ProjectFolderPickerSheet: View {
+/// device's own. The Folder's Open Folder… uses it too, for the open
+/// chat's profile (issue 1438).
+struct ProjectFolderPickerSheet: View {
     @EnvironmentObject private var appState: AppState
     @Environment(\.dismiss) private var dismiss
     let rootPath: String
+    /// Whose folders: the profile in use when nil.
+    var profile: String? = nil
     let onChoose: (String) -> Void
     @State private var currentPath = ""
     @State private var entries: [WorkspaceEntry] = []
@@ -2030,6 +2064,10 @@ private struct ProjectFolderPickerSheet: View {
     @State private var errorMessage: String?
     @State private var asksFolderName = false
     @State private var newFolderName = ""
+    /// Counts the folders opened: a listing that comes back after a later
+    /// one was asked for is dropped, so the picker never moves back to a
+    /// folder the user left.
+    @State private var opened = 0
 
     private var parentPath: String? {
         currentPath.isEmpty ? nil : AppState.parentWorkspacePath(currentPath)
@@ -2069,7 +2107,7 @@ private struct ProjectFolderPickerSheet: View {
                             Button {
                                 Task { await open(parentPath) }
                             } label: {
-                                Label(AppLocalization.string("Enclosing Folder"), systemImage: "arrow.turn.left.up")
+                                Label(AppLocalization.string("Enclosing Folder", table: .chat), systemImage: "arrow.turn.left.up")
                             }
                             .foregroundStyle(.primary)
                         }
@@ -2086,7 +2124,7 @@ private struct ProjectFolderPickerSheet: View {
                                 newFolderName = ""
                                 asksFolderName = true
                             } label: {
-                                Label(AppLocalization.string("New Folder"), systemImage: "folder.badge.plus")
+                                Label(AppLocalization.string("New Folder", table: .chat), systemImage: "folder.badge.plus")
                             }
                         }
                     }
@@ -2107,7 +2145,7 @@ private struct ProjectFolderPickerSheet: View {
                     .disabled(currentPath.isEmpty || isLoading)
                 }
             }
-            .alert(AppLocalization.string("New Folder"), isPresented: $asksFolderName) {
+            .alert(AppLocalization.string("New Folder", table: .chat), isPresented: $asksFolderName) {
                 TextField(AppLocalization.string("Name"), text: $newFolderName)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
@@ -2125,28 +2163,59 @@ private struct ProjectFolderPickerSheet: View {
 
     /// On a failure the picker stays on the folder it showed.
     private func open(_ path: String) async {
+        opened += 1
+        let mine = opened
         isLoading = true
         errorMessage = nil
         do {
-            let listed = try await appState.workspaceDirectoryEntries(at: path)
+            let listed = if let profile {
+                try await appState.workspaceDirectoryEntries(at: path, profile: profile)
+            } else {
+                try await appState.workspaceDirectoryEntries(at: path)
+            }
+            guard mine == opened else { return }
             currentPath = path
             entries = listed
         } catch {
+            guard mine == opened else { return }
             if currentPath.isEmpty { entries = [] }
             errorMessage = UserFacingError.message(for: error)
         }
         isLoading = false
     }
 
+    /// What a failed New Folder does to the picker. The host stopped
+    /// waiting (504) and the folder may still be made: the folder it was
+    /// made in is listed again, so a made one shows rather than being asked
+    /// for twice (notifier issue 834). Neither that nor the error reaches a
+    /// picker that has moved to another folder since.
+    /// A folder opened since New Folder was asked for (`openedSince`)
+    /// counts as moved on even while its listing is still out, since the
+    /// folder shown changes only once that listing is in.
+    static func afterFailedNewFolder(_ error: Error, in folder: String, showing: String,
+                                     openedSince: Int = 0) -> (relists: Bool, saysSo: Bool) {
+        guard showing == folder, openedSince == 0 else { return (false, false) }
+        if case DashboardTicketBridgeError.http(status: 504, _) = error { return (true, true) }
+        return (false, true)
+    }
+
     /// Made inside the folder shown, then opened, ready to choose.
     private func makeFolder(_ name: String) async {
         let folder = currentPath
+        let asked = opened
         do {
-            if let made = try await appState.makeProjectFolder(named: name, in: folder) {
+            if let made = try await appState.makeProjectFolder(named: name, in: folder, profile: profile) {
                 await open(made)
             }
         } catch {
-            errorMessage = UserFacingError.message(for: error)
+            let after = Self.afterFailedNewFolder(error, in: folder, showing: currentPath, openedSince: opened - asked)
+            if after.relists { await open(folder) }
+            // Asked again after the listing (the one open this made set
+            // aside): the user may have moved on during it.
+            let since = opened - asked - (after.relists ? 1 : 0)
+            if Self.afterFailedNewFolder(error, in: folder, showing: currentPath, openedSince: since).saysSo {
+                errorMessage = UserFacingError.message(for: error)
+            }
         }
     }
 }
@@ -2180,7 +2249,7 @@ struct CronList: View {
                         Text("\(appState.cronJobs.count) configured").scaledFont(.caption).foregroundStyle(.secondary)
                     } else {
                         // Two counts, so two plurals: each agrees with its own number.
-                        Text(verbatim: AppLocalization.string("\(activeJobCount) active") + " · " + AppLocalization.string("\(inactiveJobCount) inactive"))
+                        Text(verbatim: AppLocalization.string("\(activeJobCount) active", table: .chat) + " · " + AppLocalization.string("\(inactiveJobCount) inactive", table: .chat))
                             .scaledFont(.caption).foregroundStyle(.secondary)
                     }
                 }
@@ -2278,10 +2347,18 @@ struct CronList: View {
                 }
             }
         }
-        .searchable(text: $searchText, prompt: AppLocalization.string("Search scheduled jobs"))
+        .searchable(text: $searchText, prompt: AppLocalization.string("Search scheduled jobs", table: .chat))
         .scrollContentBackground(.hidden)
         .listStyle(.plain)
-        .task(id: "\(appState.activeDashboardID?.uuidString ?? "")|\(appState.activeProfile)") { await appState.refreshCronContent() }
+        // A reconnect reads the jobs again: the id carries the connection, so
+        // a socket that dropped and came back refills a list it left unread.
+        // Only while connected, so a drop doesn't read against a dead socket
+        // and put its failure in the banner. The Sessions list's first read
+        // keys on the connection for the same reason.
+        .task(id: "\(appState.activeDashboardID?.uuidString ?? "")|\(appState.activeProfile)|\(appState.isConnected)") {
+            guard appState.isConnected else { return }
+            await appState.refreshCronContent()
+        }
         // The plugin's capability report can land after the tab opened.
         .task(id: appState.supportsCronNotifications) {
             if appState.supportsCronNotifications { await appState.refreshCronNotifications() }
@@ -2330,7 +2407,7 @@ enum CronJobFilter: String, CaseIterable, Identifiable {
     var title: String {
         switch self {
         case .active: AppLocalization.string("Active")
-        case .inactive: AppLocalization.string("Inactive")
+        case .inactive: AppLocalization.string("Inactive", table: .chat)
         case .all: AppLocalization.string("All")
         }
     }
@@ -2380,18 +2457,18 @@ enum CronJobFilter: String, CaseIterable, Identifiable {
     static func emptyState(filter: CronJobFilter, hasJobs: Bool, isSearching: Bool) -> (title: String, description: String) {
         if hasJobs && isSearching {
             let hint = filter == .all
-                ? AppLocalization.string("Try a different search.")
-                : AppLocalization.string("Try a different search or filter.")
-            return (AppLocalization.string("No Matching Jobs"), hint)
+                ? AppLocalization.string("Try a different search.", table: .chat)
+                : AppLocalization.string("Try a different search or filter.", table: .chat)
+            return (AppLocalization.string("No Matching Jobs", table: .chat), hint)
         }
         switch filter {
         case .active where hasJobs:
-            return (AppLocalization.string("No Active Jobs"), AppLocalization.string("Every scheduled job is paused or finished."))
+            return (AppLocalization.string("No Active Jobs", table: .chat), AppLocalization.string("Every scheduled job is paused or finished.", table: .chat))
         case .inactive where hasJobs:
-            return (AppLocalization.string("No Inactive Jobs"), AppLocalization.string("Every scheduled job is active."))
+            return (AppLocalization.string("No Inactive Jobs", table: .chat), AppLocalization.string("Every scheduled job is active.", table: .chat))
         default:
             // No jobs at all. All with jobs and no search always lists them.
-            return (AppLocalization.string("No Scheduled Jobs"), AppLocalization.string("Scheduled jobs from Hermes appear here."))
+            return (AppLocalization.string("No Scheduled Jobs", table: .chat), AppLocalization.string("Scheduled jobs from Hermes appear here.", table: .chat))
         }
     }
 }
@@ -2433,7 +2510,7 @@ private struct CronJobRow: View {
                 Image(systemName: "bell.slash")
                     .scaledFont(.caption)
                     .foregroundStyle(.secondary)
-                    .accessibilityLabel(AppLocalization.string("Notifications off"))
+                    .accessibilityLabel(AppLocalization.string("Notifications off", table: .chat))
             }
             Text(job.statusLabel).scaledFont(.caption2.weight(.semibold)).foregroundStyle(job.isActive ? .green : .secondary)
             Image(systemName: "chevron.right").scaledFont(.caption2.weight(.bold)).foregroundStyle(.conduitTertiary)
@@ -2478,8 +2555,8 @@ struct CronJobDetailSheet: View {
                         ConduitSettingsSection(title: job.displayName, symbol: "clock.fill", tint: .conduitAccent) {
                             SettingsMetricRow(label: AppLocalization.string("Status"), value: job.statusLabel)
                             SettingsMetricRow(label: AppLocalization.string("Schedule"), value: CronScheduleText.describe(job, zoneLabel: ProfileTimeZone.scheduleZoneLabel(profileSetting: appState.activeProfileTimeZoneSetting)) ?? "—")
-                            SettingsMetricRow(label: AppLocalization.string("Next run"), value: job.isFinished ? "—" : runTime(job.nextRunAt))
-                            SettingsMetricRow(label: AppLocalization.string("Last run"), value: runTime(job.lastRunAt))
+                            SettingsMetricRow(label: AppLocalization.string("Next run", table: .chat), value: job.isFinished ? "—" : runTime(job.nextRunAt))
+                            SettingsMetricRow(label: AppLocalization.string("Last run", table: .chat), value: runTime(job.lastRunAt))
                             SettingsMetricRow(label: AppLocalization.string("Delivery"), value: job.deliver ?? AppLocalization.string("Local"))
                             if let model = job.modelSummary(in: appState.keptModelProviders(), withProvider: true) {
                                 SettingsMetricRow(label: AppLocalization.string("Model"), value: model)
@@ -2492,8 +2569,8 @@ struct CronJobDetailSheet: View {
                                     set: { notify in Task { await appState.setCronJobNotifies(notify, for: job) } }
                                 )) {
                                     VStack(alignment: .leading, spacing: 2) {
-                                        Text(AppLocalization.string("Notify me when it runs")).scaledFont(.subheadline.weight(.medium))
-                                        Text(AppLocalization.string("Runs that answer [SILENT] never notify.")).scaledFont(.caption).foregroundStyle(.secondary)
+                                        Text(AppLocalization.string("Notify me when it runs", table: .chat)).scaledFont(.subheadline.weight(.medium))
+                                        Text(AppLocalization.string("Runs that answer [SILENT] never notify.", table: .chat)).scaledFont(.caption).foregroundStyle(.secondary)
                                     }
                                 }
                                 .tint(.conduitAccent)
@@ -2527,14 +2604,14 @@ struct CronJobDetailSheet: View {
                         }
                         .scaledFont(.subheadline.weight(.semibold))
                         Button { editing = true } label: {
-                            Label(AppLocalization.string("Edit job"), systemImage: "pencil").frame(maxWidth: .infinity)
+                            Label(AppLocalization.string("Edit job", table: .chat), systemImage: "pencil").frame(maxWidth: .infinity)
                         }
                         .disabled(appState.cronJobActionID != nil || appState.dashboardTicketBridge == nil)
                         .frame(minHeight: 48)
                         .conduitGlassControl(cornerRadius: 16)
                         .scaledFont(.subheadline.weight(.semibold))
                         Button(role: .destructive) { confirmingDelete = true } label: {
-                            Label(AppLocalization.string("Delete job"), systemImage: "trash").frame(maxWidth: .infinity)
+                            Label(AppLocalization.string("Delete job", table: .chat), systemImage: "trash").frame(maxWidth: .infinity)
                         }
                         .foregroundStyle(.red)
                         .disabled(appState.cronJobActionID != nil)
@@ -2544,12 +2621,12 @@ struct CronJobDetailSheet: View {
                         if let prompt = job.prompt, !prompt.isEmpty {
                             ConduitSettingsSection(title: AppLocalization.string("Prompt"), symbol: "text.quote", tint: .conduitAura) { Text(prompt).textSelection(.enabled).scaledFont(.callout) }
                         }
-                        ConduitSettingsSection(title: AppLocalization.string("Run history"), symbol: "clock.arrow.circlepath", tint: .conduitAura) {
+                        ConduitSettingsSection(title: AppLocalization.string("Run history", table: .chat), symbol: "clock.arrow.circlepath", tint: .conduitAura) {
                             if appState.cronRunsJobID == job.id, let failure = appState.cronRunsFailure {
                                 Text(failure).scaledFont(.footnote).foregroundStyle(.secondary)
                             } else if !appState.cronRunsLoaded || appState.cronRunsJobID != job.id {
                                 ProgressView().frame(maxWidth: .infinity, alignment: .leading)
-                                    .accessibilityLabel(AppLocalization.string("Loading \(AppLocalization.string("Run history"))…"))
+                                    .accessibilityLabel(AppLocalization.string("Loading \(AppLocalization.string("Run history", table: .chat))…"))
                             } else if appState.cronRuns.isEmpty {
                                 Text("This job has not run yet.").scaledFont(.footnote).foregroundStyle(.secondary)
                             }
@@ -2621,6 +2698,22 @@ enum SidebarSourceRows {
             return chats.filter { category($0) == source }
         }
     }
+
+    /// The chat sources (not Cron) whose filter lists any row: `rows` for
+    /// each is not empty. One walk, for the filter menu, which otherwise
+    /// listed every source's rows to see which had any.
+    static func sourcesWithRows(
+        sessions: [SessionSummary],
+        category: (SessionSummary) -> SessionSource,
+        hasVoiceCalls: (SessionSummary) -> Bool = { _ in false }
+    ) -> Set<SessionSource> {
+        var sources: Set<SessionSource> = []
+        for chat in sessions where !chat.isArchived {
+            sources.insert(category(chat))
+            if hasVoiceCalls(chat) { sources.insert(.voice) }
+        }
+        return sources
+    }
 }
 
 /// The Projects view's Pinned section (#338): every non-archived pinned chat
@@ -2684,7 +2777,7 @@ struct SessionListPlaceholderView: View {
                 .frame(maxWidth: .infinity, minHeight: 140)
         case .failed(let message):
             ContentUnavailableView {
-                Label(AppLocalization.string("Couldn’t Load Chats"), systemImage: "exclamationmark.triangle")
+                Label(AppLocalization.string("Couldn’t Load Chats", table: .chat), systemImage: "exclamationmark.triangle")
             } description: {
                 Text(message)
             } actions: {
@@ -2737,7 +2830,7 @@ struct RenameSheet: View {
     static func conversation(_ session: SessionSummary, onRename: @escaping @MainActor (String) -> Void) -> RenameSheet {
         RenameSheet(
             title: AppLocalization.string("Rename"),
-            placeholder: AppLocalization.string("Conversation title"),
+            placeholder: AppLocalization.string("Conversation title", table: .chat),
             initialText: session.title,
             normalize: { SessionRenameOperation.normalizedTitle($0, currentTitle: session.title) },
             onRename: onRename

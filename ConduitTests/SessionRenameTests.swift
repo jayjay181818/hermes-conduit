@@ -571,6 +571,300 @@ final class SessionRenameTests: XCTestCase {
         XCTAssertNotEqual(appState.errorMessage, AppLocalization.string("Connect to Hermes to start a conversation."))
     }
 
+    // MARK: - New Chat leaves a chat mid-reply (all-live stage 2)
+
+    /// New Chat while the open chat's turn runs with no words yet (just
+    /// sent, or a tool step) follows that chat's reply, as an open or a
+    /// profile switch does, though the turn reads synchronizing by the time
+    /// the new chat is adopted. A New Chat that starts nothing lets go of it.
+    func testANewChatFollowsARunningTurnWithNoWordsYet() async {
+        let appState = makeConnectedAppState { _, _ in }
+        appState.savedDashboardRegistry.activeDashboardID = UUID()
+        appState.sessions = [makeSession(id: "a", alternateIDs: [], title: "Story")]
+        var createFails = true
+        guard let creator = appState.widgetSessionCreatorOverride else {
+            return XCTFail("The harness creates chats through the override")
+        }
+        appState.widgetSessionCreatorOverride = { client, cwd in
+            if createFails { throw URLError(.notConnectedToInternet) }
+            return try await creator(client, cwd)
+        }
+        appState.setActiveSessionState(id: "a")
+        appState.messages = [ChatMessage(id: "u1", role: .user, content: "Tell me a story", timestamp: "1")]
+        appState.turnState = .running
+
+        await appState.createNewSession()
+        XCTAssertEqual(appState.activeSessionId, "a")
+        XCTAssertTrue(appState.backgroundChats.isEmpty, "No chat started: the one on screen isn't left")
+
+        appState.turnState = .running
+        createFails = false
+        let created = await appState.createNewSession()
+        XCTAssertEqual(created, "created-runtime")
+        XCTAssertEqual(appState.backgroundChats.first?.sessionIDs.contains("a"), true)
+        appState.handleStreamEvent(.messageDelta(sessionId: "a", text: "Once upon a time"))
+        XCTAssertEqual(appState.backgroundChats.first?.rows.last?.content, "Once upon a time")
+        XCTAssertFalse(appState.messages.contains { $0.content == "Once upon a time" },
+                       "The new chat never takes the left chat's words")
+    }
+
+    /// Words the left chat streams while New Chat's create is out stay in
+    /// its followed copy, under its own title: the create's adoption
+    /// doesn't follow it again from the screen's rows, which stopped at the
+    /// tap (issue 2523). A repeated completion for the reply finalizes its
+    /// row in place rather than adding a twin (issue 2511).
+    func testWordsStreamedDuringANewChatsCreateStayInTheFollowedCopy() async throws {
+        let appState = makeConnectedAppState { _, _ in }
+        appState.savedDashboardRegistry.activeDashboardID = UUID()
+        appState.sessions = [makeSession(id: "a", alternateIDs: [], title: "Story")]
+        guard let creator = appState.widgetSessionCreatorOverride else {
+            return XCTFail("The harness creates chats through the override")
+        }
+        var waiting: CheckedContinuation<Void, Never>?
+        appState.widgetSessionCreatorOverride = { client, cwd in
+            await withCheckedContinuation { waiting = $0 }
+            return try await creator(client, cwd)
+        }
+        appState.setActiveSessionState(id: "a", title: "Story")
+        appState.messages = [ChatMessage(id: "u1", role: .user, content: "Tell me a story", timestamp: "1")]
+        appState.turnState = .running
+        appState.handleStreamEvent(.messageDelta(sessionId: "a", text: "Once upon"))
+
+        let create = Task { await appState.createNewSession() }
+        for _ in 0..<2000 where waiting == nil { await Task.yield() }
+        guard let barrier = waiting else {
+            create.cancel()
+            return XCTFail("The create reaches Hermes")
+        }
+        appState.handleStreamEvent(.messageDelta(sessionId: "a", text: " a time"))
+        barrier.resume()
+        let created = await create.value
+        XCTAssertEqual(created, "created-runtime")
+
+        let followed = try XCTUnwrap(appState.followedChat(answering: ["a"]))
+        XCTAssertEqual(followed.title, "Story")
+        XCTAssertEqual(followed.rows.last?.content, "Once upon a time")
+
+        appState.handleStreamEvent(.messageComplete(sessionId: "a", messageId: "r1", content: "Once upon a time.", reasoning: nil))
+        appState.handleStreamEvent(.messageComplete(sessionId: "a", messageId: "r1", content: "Once upon a time, the end.", reasoning: nil))
+        let finished = try XCTUnwrap(appState.followedChat(answering: ["a"]))
+        XCTAssertEqual(finished.rows.map(\.content), ["Tell me a story", "Once upon a time, the end."])
+    }
+
+    /// Two New Chats that overlap (a widget's beside the button's) and
+    /// start nothing: the first to finish keeps the follow, since the other
+    /// still leaves the chat, and the last lets go of it, though it followed
+    /// nothing itself (the turn already read synchronizing).
+    func testOverlappingNewChatsThatStartNothingLetGoOfTheFollowTogether() async {
+        let appState = makeConnectedAppState { _, _ in }
+        appState.savedDashboardRegistry.activeDashboardID = UUID()
+        appState.sessions = [makeSession(id: "a", alternateIDs: [], title: "Story")]
+        var waiting: [CheckedContinuation<Void, Never>] = []
+        appState.widgetSessionCreatorOverride = { _, _ in
+            await withCheckedContinuation { waiting.append($0) }
+            throw URLError(.notConnectedToInternet)
+        }
+        appState.setActiveSessionState(id: "a")
+        appState.messages = [ChatMessage(id: "u1", role: .user, content: "Tell me a story", timestamp: "1")]
+        appState.turnState = .running
+
+        func waitForCreations(_ count: Int) async {
+            for _ in 0..<2000 where waiting.count < count { await Task.yield() }
+            XCTAssertEqual(waiting.count, count, "Both creations reach Hermes")
+        }
+        let first = Task { await appState.createNewSession() }
+        await waitForCreations(1)
+        let second = Task { await appState.createNewSession() }
+        await waitForCreations(2)
+        guard waiting.count == 2 else { return }
+        XCTAssertEqual(appState.backgroundChats.count, 1)
+
+        waiting[0].resume()
+        _ = await first.value
+        XCTAssertEqual(appState.backgroundChats.count, 1, "Another New Chat still leaves it")
+        waiting[1].resume()
+        _ = await second.value
+        XCTAssertEqual(appState.activeSessionId, "a")
+        XCTAssertTrue(appState.backgroundChats.isEmpty, "No chat started: the one on screen isn't left")
+    }
+
+    /// A lone New Chat that fails while a followed chat's open is still
+    /// landing (the turn reads synchronizing, the copy on screen) leaves the
+    /// follow alone: the open still relies on it if it fails or is overtaken.
+    func testAFailedNewChatDuringAnOpenKeepsTheFollow() async {
+        let appState = makeConnectedAppState { _, _ in }
+        appState.savedDashboardRegistry.activeDashboardID = UUID()
+        appState.sessions = [makeSession(id: "a", alternateIDs: [], title: "Story"), makeSession(id: "b", alternateIDs: [], title: "Other")]
+        appState.widgetSessionCreatorOverride = { _, _ in throw URLError(.notConnectedToInternet) }
+        appState.setActiveSessionState(id: "a")
+        appState.messages = [ChatMessage(id: "u1", role: .user, content: "Tell me a story", timestamp: "1")]
+        appState.turnState = .running
+        appState.handleStreamEvent(.messageDelta(sessionId: "a", text: "Once upon"))
+        appState.setActiveSessionState(id: "b")
+        appState.messages = []
+        appState.clearStreamingText()
+        appState.turnState = .idle
+        guard let followed = appState.followedChat(answering: ["a"]) else {
+            return XCTFail("Chat a is followed once left mid-reply")
+        }
+
+        // Opening a again: its copy shows while the open lands.
+        appState.setActiveSessionState(id: "a")
+        appState.messages = []
+        XCTAssertTrue(appState.presentBackgroundChat(followed, openedAs: "a"))
+        appState.turnState = .synchronizing
+
+        await appState.createNewSession()
+        XCTAssertEqual(appState.activeSessionId, "a")
+        XCTAssertNotNil(appState.followedChat(answering: ["a"]), "The open still landing keeps its follow")
+    }
+
+    /// Issue 2505: two overlapping New Chats that both fail while a
+    /// followed chat's open is still landing leave the follow alone, since
+    /// neither of them followed it: the open still relies on it.
+    func testOverlappingFailedNewChatsDuringAnOpenKeepTheFollow() async {
+        let appState = makeConnectedAppState { _, _ in }
+        appState.savedDashboardRegistry.activeDashboardID = UUID()
+        appState.sessions = [makeSession(id: "a", alternateIDs: [], title: "Story"), makeSession(id: "b", alternateIDs: [], title: "Other")]
+        var waiting: [CheckedContinuation<Void, Never>] = []
+        appState.widgetSessionCreatorOverride = { _, _ in
+            await withCheckedContinuation { waiting.append($0) }
+            throw URLError(.notConnectedToInternet)
+        }
+        appState.setActiveSessionState(id: "a")
+        appState.messages = [ChatMessage(id: "u1", role: .user, content: "Tell me a story", timestamp: "1")]
+        appState.turnState = .running
+        appState.handleStreamEvent(.messageDelta(sessionId: "a", text: "Once upon"))
+        appState.setActiveSessionState(id: "b")
+        appState.messages = []
+        appState.clearStreamingText()
+        appState.turnState = .idle
+        guard let followed = appState.followedChat(answering: ["a"]) else {
+            return XCTFail("Chat a is followed once left mid-reply")
+        }
+        appState.setActiveSessionState(id: "a")
+        appState.messages = []
+        XCTAssertTrue(appState.presentBackgroundChat(followed, openedAs: "a"))
+        appState.turnState = .synchronizing
+
+        func waitForCreations(_ count: Int) async {
+            for _ in 0..<2000 where waiting.count < count { await Task.yield() }
+            XCTAssertEqual(waiting.count, count, "Both creations reach Hermes")
+        }
+        let first = Task { await appState.createNewSession() }
+        await waitForCreations(1)
+        let second = Task { await appState.createNewSession() }
+        await waitForCreations(2)
+        guard waiting.count == 2 else { return }
+        waiting[0].resume()
+        _ = await first.value
+        waiting[1].resume()
+        _ = await second.value
+
+        XCTAssertEqual(appState.activeSessionId, "a")
+        XCTAssertNotNil(appState.followedChat(answering: ["a"]), "The open still landing keeps its follow")
+    }
+
+    /// Issue 2577: a New Chat tapped again during the first one's create
+    /// keeps the copy the first one followed, which took words the screen
+    /// never got, rather than a second snapshot of the screen.
+    func testASecondNewChatDuringACreateKeepsTheFollowedCopy() async {
+        let appState = makeConnectedAppState { _, _ in }
+        appState.savedDashboardRegistry.activeDashboardID = UUID()
+        appState.sessions = [makeSession(id: "a", alternateIDs: [], title: "Story")]
+        var waiting: [CheckedContinuation<Void, Never>] = []
+        appState.widgetSessionCreatorOverride = { _, _ in
+            await withCheckedContinuation { waiting.append($0) }
+            throw URLError(.notConnectedToInternet)
+        }
+        appState.setActiveSessionState(id: "a")
+        appState.messages = [ChatMessage(id: "u1", role: .user, content: "Tell me a story", timestamp: "1")]
+        appState.turnState = .running
+        appState.handleStreamEvent(.messageDelta(sessionId: "a", text: "Once upon"))
+
+        func waitForCreations(_ count: Int) async {
+            for _ in 0..<2000 where waiting.count < count { await Task.yield() }
+            XCTAssertEqual(waiting.count, count, "Both creations reach Hermes")
+        }
+        let first = Task { await appState.createNewSession() }
+        await waitForCreations(1)
+        guard let followed = appState.followedChat(answering: ["a"]) else {
+            waiting.forEach { $0.resume() }
+            return XCTFail("The first New Chat follows the chat it leaves")
+        }
+        // Words only the followed copy took after the first create began.
+        followed.state.streamingBuffer += " a time"
+        let second = Task { await appState.createNewSession() }
+        await waitForCreations(2)
+        XCTAssertEqual(appState.followedChat(answering: ["a"])?.state.streamingBuffer, "Once upon a time",
+                       "The second New Chat keeps the copy the first one followed")
+        waiting.forEach { $0.resume() }
+        _ = await first.value
+        _ = await second.value
+    }
+
+    /// A New Chat that fails after the user reopened the chat it left (its
+    /// followed copy on screen while that open lands) leaves the follow to
+    /// the open, which still relies on it.
+    func testAFailedNewChatLeavesTheFollowToAReopenDuringItsCreate() async {
+        let appState = makeConnectedAppState { _, _ in }
+        appState.savedDashboardRegistry.activeDashboardID = UUID()
+        appState.sessions = [makeSession(id: "a", alternateIDs: [], title: "Story")]
+        var waiting: [CheckedContinuation<Void, Never>] = []
+        appState.widgetSessionCreatorOverride = { _, _ in
+            await withCheckedContinuation { waiting.append($0) }
+            throw URLError(.notConnectedToInternet)
+        }
+        appState.setActiveSessionState(id: "a")
+        appState.messages = [ChatMessage(id: "u1", role: .user, content: "Tell me a story", timestamp: "1")]
+        appState.turnState = .running
+        appState.handleStreamEvent(.messageDelta(sessionId: "a", text: "Once upon"))
+
+        let create = Task { await appState.createNewSession() }
+        for _ in 0..<2000 where waiting.isEmpty { await Task.yield() }
+        guard let followed = appState.followedChat(answering: ["a"]) else {
+            waiting.forEach { $0.resume() }
+            return XCTFail("The New Chat follows the chat it leaves")
+        }
+        // Reopened during the create: its copy shows while that open lands.
+        appState.setActiveSessionState(id: "a")
+        appState.messages = []
+        XCTAssertTrue(appState.presentBackgroundChat(followed, openedAs: "a"))
+        waiting.forEach { $0.resume() }
+        _ = await create.value
+
+        XCTAssertEqual(appState.activeSessionId, "a")
+        XCTAssertNotNil(appState.followedChat(answering: ["a"]), "The reopen still landing keeps the copy the run followed")
+    }
+
+    /// #2612's review: a New Chat's reconcile takes no rebound id routed
+    /// for the chat it leaves.
+    func testANewChatTakesNoReboundIDRoutedForTheChatItLeaves() async {
+        let appState = makeConnectedAppState { _, _ in }
+        appState.sessions = [makeSession(id: "a", alternateIDs: [], title: "Story")]
+        var waiting: [CheckedContinuation<Void, Never>] = []
+        let (creating, createStarted) = AsyncStream<Void>.makeStream()
+        appState.widgetSessionCreatorOverride = { _, _ in
+            createStarted.yield(())
+            await withCheckedContinuation { waiting.append($0) }
+            throw URLError(.notConnectedToInternet)
+        }
+        appState.setActiveSessionState(id: "a")
+        appState.reconciliation = AppState.Reconciliation(
+            token: UUID(), requestedSessionId: "a", acceptedSessionIDs: ["a", "rt-a"], reboundSessionIDs: ["rt-a": "a"],
+            movedOnSessionIDs: ["rt-b"]
+        )
+
+        let create = Task { await appState.createNewSession() }
+        // The create's own signal that it's under way (issue 2619).
+        for await _ in creating { break }
+        XCTAssertEqual(appState.reconciliation?.reboundSessionIDs, [:], "Chat a's rebound id stays with chat a")
+        XCTAssertEqual(appState.reconciliation?.movedOnSessionIDs, [], "…and turns away none chat a's open let go")
+        XCTAssertFalse(waiting.isEmpty, "The create is under way")
+        waiting.forEach { $0.resume() }
+        _ = await create.value
+    }
+
     // MARK: - A new chat in the list (issue 1454)
 
     func testANewChatStaysListedWhileOpenUntilHermesListsIt() async {

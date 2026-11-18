@@ -28,6 +28,13 @@ final class WorkspaceExplorer: ObservableObject {
     /// Why the latest search failed; a folder's failure is `error`.
     @Published private(set) var searchError: String?
     @Published private(set) var searching = false
+    /// What to do when the open folder's profile has the plugin turned off
+    /// (Hermes answers its routes "Plugin not found", issue 1438): the
+    /// folder browses through Hermes' own listing meanwhile, with no search
+    /// or changes, though the dashboard's own profile reports the routes.
+    @Published private(set) var pluginOff: String?
+    /// What Copy picked, for Paste into a folder of the open one.
+    @Published var copied: WorkspaceEntry?
 
     // The file being viewed.
     @Published private(set) var viewed: WorkspaceEntry?
@@ -35,6 +42,15 @@ final class WorkspaceExplorer: ObservableObject {
     @Published private(set) var preview: WorkspaceFilePreview?
     @Published private(set) var previewError: String?
     @Published private(set) var previewLoading = false
+    /// The files opened since the folder did, one tab each (issue 1438),
+    /// the viewed one among them; the oldest goes past `openFilesLimit`.
+    @Published private(set) var openFiles: [WorkspaceEntry] = []
+    static let openFilesLimit = 12
+    /// Open files with unsaved changes, which a new tab never pushes out.
+    var keepsOpen: Set<String> = []
+    /// Bumped when the viewed file's tab went with no other left: the
+    /// reader closes rather than show a file that isn't there.
+    @Published private(set) var viewedGone = 0
 
     private weak var appState: AppState?
     /// Where the open folder's listing and recent files are kept: on the
@@ -45,13 +61,39 @@ final class WorkspaceExplorer: ObservableObject {
     private var showsKeptRoot = false
     /// Bumped by every change of scope: an answer asked before it is stale.
     private var generation = 0
+    /// Bumped by each read that asks the plugin: only the latest one says
+    /// whether it's on for the profile, so an older read's refusal landing
+    /// after a newer answer doesn't turn it off again.
+    private var pluginAsk = 0
     private var previewRequest: UUID?
+    /// Each open tab's text as last read, so going back to a tab shows it
+    /// at once instead of reading the file again (issue 2355), with the
+    /// date its folder listed it at then. A refresh keeps one only while
+    /// its folder, read again in full, still lists the file at that date.
+    private var previews: [String: (preview: WorkspaceFilePreview, modified: Date?)] = [:]
+    /// Texts past this many bytes aren't kept for their tab, and all kept
+    /// together stay under `previewsByteBudget`.
+    static let keptPreviewBytes = 2 * 1024 * 1024
+    static let previewsByteBudget = 8 * 1024 * 1024
     private var searchRequest: UUID?
 
     var root: String? { scope?.root }
 
-    /// Whether the plugin serves search, recent files and file actions.
-    var canChange: Bool { appState?.supportsWorkspaceFiles ?? false }
+    /// Whether the plugin serves search, recent files and file actions for
+    /// the open folder's profile.
+    var canChange: Bool { (appState?.supportsWorkspaceFiles ?? false) && pluginOff == nil }
+
+    /// Whether the plugin pastes a copy into another folder.
+    var canCopy: Bool { canChange && (appState?.notifierPlugin.reports(WorkspaceFilesClient.copyCapability) ?? false) }
+
+    /// Whether `source` may go into `folder`: not where it already is, and
+    /// a folder never into itself or a folder inside it.
+    static func canMove(_ source: String, into folder: String) -> Bool {
+        let from = AppState.normalizedWorkspacePath(source)
+        let to = AppState.normalizedWorkspacePath(folder)
+        guard to != from, !AppState.workspacePath(to, isIn: from) else { return false }
+        return AppState.parentWorkspacePath(from).map(AppState.normalizedWorkspacePath) != to
+    }
 
     func attach(_ appState: AppState) {
         self.appState = appState
@@ -74,6 +116,11 @@ final class WorkspaceExplorer: ObservableObject {
         search = nil
         searchError = nil
         searching = false
+        pluginOff = nil
+        copied = nil
+        openFiles = []
+        keepsOpen = []
+        previews = [:]
         closeFile()
         let answers = appState.screenAnswers(profile: profile)
         self.answers = answers
@@ -109,6 +156,11 @@ final class WorkspaceExplorer: ObservableObject {
         recent = []
         search = nil
         searchError = nil
+        pluginOff = nil
+        copied = nil
+        openFiles = []
+        keepsOpen = []
+        previews = [:]
         closeFile()
     }
 
@@ -116,14 +168,41 @@ final class WorkspaceExplorer: ObservableObject {
     /// pull to refresh, or a change made here.
     func refresh() async {
         guard let scope else { return }
-        askPluginIfUnanswered()
-        let folders = [scope.root] + expanded.sorted()
-        for folder in folders {
-            // Another folder opened meanwhile: the rest belongs to the old one.
-            guard self.scope == scope else { return }
-            await load(folder)
+        // A reply link's read from before this refresh may hold text from
+        // before the change it follows, and an open, during the refresh or
+        // after, would pair it with the date the refresh lists: it goes now,
+        // before any folder's new listing shows, and the open reads again.
+        if let kept = prefetchedText {
+            kept.read.cancel()
+            prefetchedText = nil
         }
+        askPluginIfUnanswered()
+        var folders = [scope.root] + expanded.sorted()
+        // Every open folder is read at once, not one after another (issue
+        // 2355), as `reveal` reads its folders. While the plugin was off,
+        // the root goes first: its answer says whether the plugin is back,
+        // and so which listing the other folders read.
+        var first: Set<String> = []
+        if pluginOff != nil {
+            folders.removeFirst()
+            if await load(scope.root) { first.insert(scope.root) }
+            // Another folder opened meanwhile: its folders aren't these.
+            guard self.scope == scope else { return }
+        }
+        let listed = await withTaskGroup(of: (String, Bool).self) { group -> Set<String> in
+            for folder in folders {
+                group.addTask { (folder, await self.load(folder)) }
+            }
+            var listed = first
+            for await (folder, read) in group where read {
+                listed.insert(folder)
+            }
+            return listed
+        }
+        // Another folder opened meanwhile: what was read belongs to the old one.
         guard self.scope == scope else { return }
+        dropStalePreviews(read: listed)
+        dropGoneTabs(read: listed)
         await loadRecent()
         if let query = search?.query, !query.isEmpty {
             await runSearch(query)
@@ -177,8 +256,7 @@ final class WorkspaceExplorer: ObservableObject {
     /// Whether `path` is in the open folder.
     func contains(_ path: String) -> Bool {
         guard let root else { return false }
-        let base = AppState.normalizedWorkspacePath(root)
-        return path == base || path.hasPrefix(base.hasSuffix("/") ? base : base + "/")
+        return AppState.workspacePath(path, isIn: root)
     }
 
     // MARK: - Reading
@@ -203,11 +281,32 @@ final class WorkspaceExplorer: ObservableObject {
         do {
             let listed: [WorkspaceEntry]
             var cut = false
-            if appState.supportsWorkspaceFiles {
-                let listing = try await appState.workspaceFilesClient(profile: scope.profile)
-                    .list(root: scope.root, path: folder, keptIn: answers)
-                listed = listing.entries
-                cut = listing.truncated
+            // Whether this read says if the plugin is on for the profile:
+            // its answer for the open folder, or its refusal for any folder.
+            var askedPlugin = false
+            var remedy: String?
+            var ask = 0
+            // With the plugin off for this profile, a folder in the tree
+            // reads Hermes' listing straight away; the open folder asks the
+            // plugin again each time, so turning it on shows on a refresh.
+            if appState.supportsWorkspaceFiles, pluginOff == nil || folder == scope.root {
+                pluginAsk &+= 1
+                ask = pluginAsk
+                do {
+                    let listing = try await appState.workspaceFilesClient(profile: scope.profile)
+                        .list(root: scope.root, path: folder, keptIn: answers)
+                    listed = listing.entries
+                    cut = listing.truncated
+                    askedPlugin = folder == scope.root
+                } catch let refused where DashboardTicketBridgeError.pluginOffDetail(of: refused) != nil {
+                    guard isCurrent(ticket, owner, scope.profile) else { return false }
+                    askedPlugin = true
+                    remedy = DashboardTicketBridgeError.pluginOffDetail(of: refused)
+                    // Said even when Hermes' own listing then fails too, so
+                    // no change is offered on a profile that refuses them.
+                    if ask == pluginAsk { markPluginOff(remedy) }
+                    listed = try await appState.workspaceDirectoryEntries(at: folder, profile: scope.profile)
+                }
             } else if folder == scope.root, showsKeptRoot,
                       appState.notifierPlugin.mayServe(WorkspaceFilesClient.capability) {
                 // The kept listing waits for the plugin's word, as kept
@@ -222,6 +321,7 @@ final class WorkspaceExplorer: ObservableObject {
             // re-check also covers a switch landing between that answer and
             // this resumption, so no other dashboard's listing merges in.
             guard isCurrent(ticket, owner, scope.profile) else { return false }
+            if askedPlugin, ask == pluginAsk { markPluginOff(remedy) }
             entries[folder] = listed
             if cut { truncated.insert(folder) } else { truncated.remove(folder) }
             if folder == scope.root { showsKeptRoot = false }
@@ -241,13 +341,26 @@ final class WorkspaceExplorer: ObservableObject {
         }
     }
 
+    /// Whether the open folder's profile has the plugin off (`remedy`) or
+    /// on again (nil).
+    private func markPluginOff(_ remedy: String?) {
+        guard remedy != pluginOff else { return }
+        pluginOff = remedy
+        guard remedy != nil else { return }
+        // Nothing the plugin gave for this profile still shows.
+        recent = []
+        search = nil
+        searchError = nil
+        copied = nil
+    }
+
     private func loadRecent() async {
-        guard let appState, let scope, appState.supportsWorkspaceFiles else { return }
+        guard let appState, let scope, canChange else { return }
         let ticket = generation
         let owner = appState.currentDashboardRuntimeOwner()
         guard let found = try? await appState.workspaceFilesClient(profile: scope.profile)
                 .recent(root: scope.root, keptIn: answers),
-              isCurrent(ticket, owner, scope.profile) else { return }
+              isCurrent(ticket, owner, scope.profile), pluginOff == nil else { return }
         recent = found
     }
 
@@ -255,7 +368,7 @@ final class WorkspaceExplorer: ObservableObject {
     /// the search. Only the latest search's answer shows.
     func runSearch(_ query: String) async {
         let words = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let appState, let scope, appState.supportsWorkspaceFiles, !words.isEmpty else {
+        guard let appState, let scope, canChange, !words.isEmpty else {
             searchRequest = nil
             search = nil
             searchError = nil
@@ -295,6 +408,28 @@ final class WorkspaceExplorer: ObservableObject {
         previewRequest = request
         viewed = entry
         viewedLine = line
+        if let index = openFiles.firstIndex(where: { $0.path == entry.path }) {
+            openFiles[index] = entry
+        } else {
+            openFiles.append(entry)
+            while openFiles.count > Self.openFilesLimit,
+                  let oldest = openFiles.firstIndex(where: { $0.path != entry.path && !keepsOpen.contains($0.path) }) {
+                previews[openFiles.remove(at: oldest).path] = nil
+            }
+        }
+        if scope?.profile == profile, let kept = previews[entry.path], kept.modified == entry.modified {
+            // Read already for its tab, and unchanged since as far as its
+            // folder's listing says: the entry opened carries the date its
+            // save checks, so text kept from another date is read again.
+            // A reply link's read of it started with the tap goes too: left
+            // behind, a later open within its lifetime would take that read
+            // under a date the file may have moved to since.
+            takePrefetchedText(entry.path, profile: profile)?.cancel()
+            preview = kept.preview
+            previewError = nil
+            previewLoading = false
+            return
+        }
         preview = nil
         previewError = nil
         previewLoading = true
@@ -310,6 +445,7 @@ final class WorkspaceExplorer: ObservableObject {
             guard previewRequest == request, ticket == generation,
                   owner.map(appState.ownsDashboardRuntime) ?? true else { return }
             preview = text
+            keepPreview(text, for: entry)
         } catch is CancellationError {
             return
         } catch {
@@ -379,14 +515,16 @@ final class WorkspaceExplorer: ObservableObject {
     /// A path a reply named, or a search match: its folders expand in the
     /// tree when it's in the open folder, and the file opens.
     func reveal(_ path: String) async -> WorkspaceEntry {
-        let name = (path as NSString).lastPathComponent
+        // Split as the rest of the Folder splits: a POSIX name may hold a
+        // backslash (issue 2303).
+        let name = AppState.workspaceName(path)
         var entry = WorkspaceEntry(name: name.isEmpty ? path : name, path: path, isDirectory: false)
         guard let root, contains(path), path != AppState.normalizedWorkspacePath(root) else { return entry }
         var folders: [String] = []
-        var folder = (path as NSString).deletingLastPathComponent
-        while contains(folder), folder != AppState.normalizedWorkspacePath(root), !folder.isEmpty {
-            folders.insert(folder, at: 0)
-            folder = (folder as NSString).deletingLastPathComponent
+        var folder = AppState.parentWorkspacePath(path)
+        while let current = folder, contains(current), current != AppState.normalizedWorkspacePath(root) {
+            folders.insert(current, at: 0)
+            folder = AppState.parentWorkspacePath(current)
         }
         // Every unlisted folder on the way is read at once, not one after
         // another (issue 1964). A folder that fails stays closed, and so do
@@ -406,19 +544,26 @@ final class WorkspaceExplorer: ObservableObject {
         if let failedAt {
             expanded.subtract(folders[failedAt...].filter(opening.contains))
         }
-        let parent = (path as NSString).deletingLastPathComponent
-        if let listed = entries[parent == AppState.normalizedWorkspacePath(root) ? root : parent]?.first(where: { $0.path == path }) {
-            entry = listed
-        }
+        if let listed = listed(path) { entry = listed }
         return entry
+    }
+
+    /// `path` as its folder's listing has it, with its modified date.
+    func listed(_ path: String) -> WorkspaceEntry? {
+        guard let root else { return nil }
+        guard let parent = AppState.parentWorkspacePath(path) else { return nil }
+        return entries[parent == AppState.normalizedWorkspacePath(root) ? root : parent]?.first(where: { $0.path == path })
     }
 
     // MARK: - Changing
 
     /// Runs a change through the plugin and reads the folders again. A
-    /// refusal is shown, and returned for the caller (a stale save).
+    /// refusal is shown, and returned for the caller (a stale save); one
+    /// the host gave up waiting on reads the folders again too.
+    /// With `refreshing` false the caller reads them once its changes are
+    /// done (an upload of several files, issue 2355).
     @discardableResult
-    func change(_ action: (WorkspaceFilesClient, String) async throws -> Void) async -> Error? {
+    func change(refreshing: Bool = true, _ action: (WorkspaceFilesClient, String) async throws -> Void) async -> Error? {
         guard let appState, let scope else { return nil }
         let ticket = generation
         let owner = appState.currentDashboardRuntimeOwner()
@@ -426,17 +571,80 @@ final class WorkspaceExplorer: ObservableObject {
             try await action(appState.workspaceFilesClient(profile: scope.profile), scope.root)
             guard isCurrent(ticket, owner, scope.profile) else { return nil }
             Haptics.success()
-            await refresh()
+            if refreshing { await refresh() }
             return nil
         } catch {
             guard isCurrent(ticket, owner, scope.profile) else { return nil }
+            // The host stopped waiting (504), but the change may still land
+            // there: the folders are read again, so what shows is what the
+            // host has rather than a guess to repeat (notifier issue 834).
+            // A refusal changed nothing, and a stale save keeps its date.
+            if refreshing, case DashboardTicketBridgeError.http(status: 504, _) = error {
+                await refresh()
+                // Another folder opened meanwhile: this failure isn't its.
+                guard isCurrent(ticket, owner, scope.profile) else { return nil }
+            }
             Haptics.error()
             return error
         }
     }
 
+    /// After a refresh (a change, pull to refresh, the agent's edits): a
+    /// tab, or the copied entry, whose folder was just read in full and no
+    /// longer lists it goes, so it never opens a file that isn't there. A
+    /// tab with unsaved changes stays; the reader moves off a tab that goes.
+    private func dropGoneTabs(read: Set<String>) {
+        guard let root else { return }
+        let base = AppState.normalizedWorkspacePath(root)
+        // Gone when a folder on its way up, just read in full, no longer
+        // lists the part below it (the file, or a folder holding it).
+        func gone(_ path: String) -> Bool {
+            var child = path
+            while let parent = AppState.parentWorkspacePath(child), contains(parent) {
+                let atTop = AppState.normalizedWorkspacePath(parent) == base
+                let folder = atTop ? root : parent
+                if read.contains(folder), !truncated.contains(folder), let listed = entries[folder],
+                   !listed.contains(where: { $0.path == child }) {
+                    return true
+                }
+                if atTop { break }
+                child = parent
+            }
+            return false
+        }
+        openFiles.removeAll { gone($0.path) && !keepsOpen.contains($0.path) }
+        let open = Set(openFiles.map(\.path))
+        previews = previews.filter { open.contains($0.key) }
+        if let copied, gone(copied.path) { self.copied = nil }
+        if let viewed, !openFiles.contains(where: { $0.path == viewed.path }) {
+            if let next = openFiles.last {
+                // Dropped if another folder opened, or the tab went, first.
+                let ticket = generation
+                Task {
+                    guard ticket == generation, openFiles.contains(where: { $0.path == next.path }) else { return }
+                    await view(next)
+                }
+            } else {
+                viewedGone += 1
+            }
+        }
+    }
+
+    /// Takes `path`'s tab away; the sheet shows another or closes.
+    func closeTab(_ path: String) {
+        openFiles.removeAll { $0.path == path }
+        previews[path] = nil
+    }
+
     /// The viewed file after a save, its new date the next save checks.
     func saved(_ entry: WorkspaceEntry, text: String) {
+        if let index = openFiles.firstIndex(where: { $0.path == entry.path }) { openFiles[index] = entry }
+        if var kept = previews[entry.path] {
+            kept.preview.text = text
+            kept.preview.byteSize = text.utf8.count
+            kept.modified = entry.modified
+            previews[entry.path] = kept
+        }
         guard viewed?.path == entry.path else { return }
         viewed = entry
         if var preview {
@@ -445,4 +653,40 @@ final class WorkspaceExplorer: ObservableObject {
             self.preview = preview
         }
     }
+
+    /// Keeps `text` for `entry`'s tab, the oldest kept going past the
+    /// budget. One its folder listed with no date can't be checked after a
+    /// refresh, so it is kept only until then.
+    private func keepPreview(_ text: WorkspaceFilePreview, for entry: WorkspaceEntry) {
+        guard openFiles.contains(where: { $0.path == entry.path }), text.byteSize <= Self.keptPreviewBytes else {
+            previews[entry.path] = nil
+            return
+        }
+        previews[entry.path] = (text, entry.modified)
+        let open = Set(openFiles.map(\.path))
+        previews = previews.filter { open.contains($0.key) }
+        var total = previews.values.reduce(0) { $0 + $1.preview.byteSize }
+        for file in openFiles where total > Self.previewsByteBudget && file.path != entry.path {
+            guard let dropped = previews.removeValue(forKey: file.path) else { continue }
+            total -= dropped.preview.byteSize
+        }
+    }
+
+    /// After a refresh: a tab's kept text stays only when its folder was
+    /// just read in full and lists the file at the date it was read at.
+    private func dropStalePreviews(read: Set<String>) {
+        guard let root else { return }
+        let base = AppState.normalizedWorkspacePath(root)
+        previews = previews.filter { path, kept in
+            guard let modified = kept.modified, let parent = AppState.parentWorkspacePath(path) else { return false }
+            let folder = AppState.normalizedWorkspacePath(parent) == base ? root : parent
+            guard read.contains(folder), !truncated.contains(folder) else { return false }
+            return entries[folder]?.first(where: { $0.path == path })?.modified == modified
+        }
+    }
+
+    /// Whether `path`'s text is kept for its tab. Readable for tests.
+    func keepsPreview(of path: String) -> Bool { previews[path] != nil }
+    /// Whether a reply link's read waits to be taken up. Readable for tests.
+    var keepsPrefetchedText: Bool { prefetchedText != nil }
 }

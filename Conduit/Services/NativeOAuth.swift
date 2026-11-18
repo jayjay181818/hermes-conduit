@@ -34,6 +34,54 @@ struct NativeOAuthTokenSet: Codable, Equatable {
     func needsRefresh(now: Date = Date(), skewSeconds: TimeInterval = 60) -> Bool {
         expiresAt <= 0 || now.timeIntervalSince1970 >= expiresAt - skewSeconds
     }
+
+    // MARK: Session token sign-in (issue 2442)
+
+    /// Hermes' provider for its deployment session token
+    /// (`HERMES_DASHBOARD_SESSION_TOKEN`), as `/api/status` names it.
+    static let sessionTokenProvider = "session-token"
+    /// The header Hermes takes that token in. It takes a native sign-in's
+    /// tokens only as `Authorization: Bearer`.
+    static let sessionTokenHeader = "X-Hermes-Session-Token"
+
+    /// A sign-in with Hermes' session token: no refresh token, and nothing
+    /// to refresh before Hermes itself refuses it (2100-01-01).
+    static func sessionToken(_ token: String) -> NativeOAuthTokenSet {
+        NativeOAuthTokenSet(
+            accessToken: token,
+            refreshToken: "",
+            expiresAt: 4_102_444_800,
+            provider: sessionTokenProvider,
+            userID: "deployment-token"
+        )
+    }
+
+    var isSessionToken: Bool { provider == Self.sessionTokenProvider }
+
+    /// The header this sign-in's requests carry: `Authorization: Bearer`
+    /// for a native sign-in's access token, Hermes' own header for its
+    /// session token, which leaves `Authorization` to a proxy in front of
+    /// the dashboard.
+    var requestHeader: (name: String, value: String) {
+        isSessionToken ? (Self.sessionTokenHeader, accessToken) : ("Authorization", "Bearer \(accessToken)")
+    }
+
+    /// Puts `requestHeader` on `request`. A session token replaces no
+    /// `Authorization` header already there (a proxy's extra header).
+    func authorize(_ request: inout URLRequest) {
+        let header = requestHeader
+        request.setValue(header.value, forHTTPHeaderField: header.name)
+    }
+
+    /// The access token `request` was sent with, when it carried this kind
+    /// of sign-in's header.
+    func sentAccessToken(in request: URLRequest?) -> String? {
+        if isSessionToken { return request?.value(forHTTPHeaderField: Self.sessionTokenHeader) }
+        guard let header = request?.value(forHTTPHeaderField: "Authorization"), header.hasPrefix("Bearer ") else {
+            return nil
+        }
+        return String(header.dropFirst("Bearer ".count))
+    }
 }
 
 struct NativeOAuthLoginResult {
@@ -66,17 +114,17 @@ enum NativeOAuthError: LocalizedError, Equatable {
 
     var errorDescription: String? {
         switch self {
-        case .invalidURL: return AppLocalization.string("The dashboard returned an invalid sign-in URL.")
-        case .randomGenerationFailed: return AppLocalization.string("Could not prepare a secure sign-in request.")
-        case .listenerFailed: return AppLocalization.string("Could not start the secure sign-in callback.")
-        case .callbackMalformed: return AppLocalization.string("The dashboard returned an invalid sign-in response.")
-        case .callbackRejected: return AppLocalization.string("The identity provider did not complete sign-in.")
-        case .stateMismatch: return AppLocalization.string("The sign-in response failed its security check.")
-        case .tokenResponseMalformed: return AppLocalization.string("The dashboard returned invalid authentication tokens.")
-        case .tokenStorageFailed: return AppLocalization.string("Could not save this dashboard.")
-        case .timedOut: return AppLocalization.string("Sign-in timed out. Please try again.")
-        case .browserFailed: return AppLocalization.string("The sign-in page couldn’t open. Please try again.")
-        case .requestFailed(let status): return AppLocalization.string("Dashboard sign-in failed (HTTP \(String(status))).")
+        case .invalidURL: return AppLocalization.string("The dashboard returned an invalid sign-in URL.", table: .connection)
+        case .randomGenerationFailed: return AppLocalization.string("Could not prepare a secure sign-in request.", table: .connection)
+        case .listenerFailed: return AppLocalization.string("Could not start the secure sign-in callback.", table: .connection)
+        case .callbackMalformed: return AppLocalization.string("The dashboard returned an invalid sign-in response.", table: .connection)
+        case .callbackRejected: return AppLocalization.string("The identity provider did not complete sign-in.", table: .connection)
+        case .stateMismatch: return AppLocalization.string("The sign-in response failed its security check.", table: .connection)
+        case .tokenResponseMalformed: return AppLocalization.string("The dashboard returned invalid authentication tokens.", table: .connection)
+        case .tokenStorageFailed: return AppLocalization.string("Could not save this dashboard.", table: .connection)
+        case .timedOut: return AppLocalization.string("Sign-in timed out. Please try again.", table: .connection)
+        case .browserFailed: return AppLocalization.string("The sign-in page couldn’t open. Please try again.", table: .connection)
+        case .requestFailed(let status): return AppLocalization.string("Dashboard sign-in failed (HTTP \(String(status))).", table: .connection)
         }
     }
 }
@@ -285,6 +333,7 @@ final class NativeOAuthAPIClient {
         body: [String: Any]? = nil,
         encodedBody: Data? = nil,
         accessToken: String,
+        asSessionToken: Bool = false,
         timeoutMilliseconds: Int = 12_000,
         maxResponseBytes: Int = DataURLLimits.maxJSONResponseBytes
     ) async throws -> [String: Any] {
@@ -292,7 +341,13 @@ final class NativeOAuthAPIClient {
         request.httpMethod = method
         request.timeoutInterval = TimeInterval(max(1_000, timeoutMilliseconds)) / 1_000
         request.setValue("application/json", forHTTPHeaderField: "Accept")
-        request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        if asSessionToken {
+            // Hermes' own header: an `Authorization` extra header for a
+            // proxy stays on the request.
+            request.setValue(accessToken, forHTTPHeaderField: NativeOAuthTokenSet.sessionTokenHeader)
+        } else {
+            request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        }
         if let encodedBody {
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
             request.httpBody = encodedBody
@@ -320,7 +375,7 @@ final class NativeOAuthAPIClient {
             }
             throw DashboardTicketBridgeError.http(
                 status: http.statusCode,
-                detail: Self.errorDetail(data) ?? AppLocalization.string("Dashboard request failed (\(String(http.statusCode))).")
+                detail: Self.errorDetail(data) ?? AppLocalization.string("Dashboard request failed (\(String(http.statusCode))).", table: .connection)
             )
         }
         guard !data.isEmpty else { return [:] }
@@ -330,11 +385,12 @@ final class NativeOAuthAPIClient {
         return ["value": value]
     }
 
-    func mintTicket(accessToken: String) async throws -> String {
+    func mintTicket(accessToken: String, asSessionToken: Bool = false) async throws -> String {
         let response = try await requestJSON(
             path: "/api/auth/ws-ticket",
             method: "POST",
-            accessToken: accessToken
+            accessToken: accessToken,
+            asSessionToken: asSessionToken
         )
         guard let ticket = response["ticket"] as? String, !ticket.isEmpty else {
             throw DashboardTicketBridgeError.requestFailed(DashboardTicketBridgeError.noSessionTicketDetail)
@@ -445,6 +501,7 @@ final class NativeOAuthSession {
                 body: body,
                 encodedBody: encodedBody,
                 accessToken: tokens.accessToken,
+                asSessionToken: tokens.isSessionToken,
                 timeoutMilliseconds: timeoutMilliseconds,
                 maxResponseBytes: maxResponseBytes
             )
@@ -469,13 +526,14 @@ final class NativeOAuthSession {
                     body: body,
                     encodedBody: encodedBody,
                     accessToken: tokens.accessToken,
+                    asSessionToken: tokens.isSessionToken,
                     timeoutMilliseconds: timeoutMilliseconds,
                     maxResponseBytes: maxResponseBytes
                 )
                 guard !isInvalidated else { throw CancellationError() }
                 return response
             } catch DashboardTicketBridgeError.signInRequired {
-                if !isInvalidated {
+                if !isInvalidated, !tokens.isSessionToken {
                     KeychainHelper.clearNativeOAuthTokens(dashboardID: dashboardID)
                 }
                 throw DashboardTicketBridgeError.signInRequired
@@ -493,14 +551,14 @@ final class NativeOAuthSession {
     /// refresh past that token, as `requestJSON` does on a 401.
     func authorizedRequest(path: String, replacing rejected: URLRequest? = nil) async throws -> URLRequest {
         guard !isInvalidated else { throw CancellationError() }
-        if let header = rejected?.value(forHTTPHeaderField: "Authorization"), header.hasPrefix("Bearer ") {
-            try await refresh(rejectedAccessToken: String(header.dropFirst("Bearer ".count)))
+        if let rejectedAccessToken = tokens.sentAccessToken(in: rejected) {
+            try await refresh(rejectedAccessToken: rejectedAccessToken)
         } else if tokens.needsRefresh() {
             try await refresh()
         }
         guard !isInvalidated else { throw CancellationError() }
         var request = try client.endpointRequest(path: path)
-        request.setValue("Bearer \(tokens.accessToken)", forHTTPHeaderField: "Authorization")
+        tokens.authorize(&request)
         return request
     }
 
@@ -516,10 +574,20 @@ final class NativeOAuthSession {
         return tokens.accessToken
     }
 
+    /// `upgradeBearer`, put on a dashboard WebSocket upgrade the way this
+    /// sign-in's requests carry it: `Authorization: Bearer` in place of any
+    /// Authorization header already there, or, for a session token, Hermes'
+    /// own header beside a proxy's.
+    func authorizeUpgrade(_ request: inout URLRequest) async throws {
+        _ = try await upgradeBearer()
+        tokens.authorize(&request)
+    }
+
     /// Forgets a grant the server rejected again right after a refresh, as
     /// `requestJSON`'s replay does.
+    /// A session token is kept, as `refresh` keeps it (issue 2481).
     func discardRejectedGrant() {
-        guard !isInvalidated else { return }
+        guard !isInvalidated, !tokens.isSessionToken else { return }
         KeychainHelper.clearNativeOAuthTokens(dashboardID: dashboardID)
     }
 
@@ -547,7 +615,13 @@ final class NativeOAuthSession {
             return
         }
         guard !tokens.refreshToken.isEmpty else {
-            KeychainHelper.clearNativeOAuthTokens(dashboardID: dashboardID)
+            // A session token is kept through a 401 (issue 2481): Conduit
+            // can't tell Hermes' refusal from a proxy's in front of it, the
+            // token never rotates and the host's environment is the only
+            // other copy. The next connect mints a ticket with it again.
+            if !tokens.isSessionToken {
+                KeychainHelper.clearNativeOAuthTokens(dashboardID: dashboardID)
+            }
             throw DashboardTicketBridgeError.signInRequired
         }
         let current = tokens
@@ -717,11 +791,11 @@ final class NativeOAuthLoopbackServer: @unchecked Sendable {
                 self.queue.async { self.processRequest(request, on: connection) }
             } catch NativeOAuthHTTPReadError.tooLarge {
                 self.queue.async {
-                    self.sendResponse(on: connection, status: "431 Request Header Fields Too Large", message: AppLocalization.string("The sign-in response was too large."))
+                    self.sendResponse(on: connection, status: "431 Request Header Fields Too Large", message: AppLocalization.string("The sign-in response was too large.", table: .connection))
                 }
             } catch {
                 self.queue.async {
-                    self.sendResponse(on: connection, status: "400 Bad Request", message: AppLocalization.string("The sign-in response was incomplete."))
+                    self.sendResponse(on: connection, status: "400 Bad Request", message: AppLocalization.string("The sign-in response was incomplete.", table: .connection))
                 }
             }
         }
@@ -751,21 +825,21 @@ final class NativeOAuthLoopbackServer: @unchecked Sendable {
     private func processRequest(_ request: Data, on connection: NWConnection) {
         guard let requestText = String(data: request, encoding: .utf8),
               let requestLine = requestText.components(separatedBy: "\r\n").first else {
-            sendResponse(on: connection, status: "400 Bad Request", message: AppLocalization.string("The sign-in response was invalid."))
+            sendResponse(on: connection, status: "400 Bad Request", message: AppLocalization.string("The sign-in response was invalid.", table: .connection))
             return
         }
         let parts = requestLine.split(separator: " ", omittingEmptySubsequences: true)
         guard parts.count == 3, parts[0] == "GET" else {
-            sendResponse(on: connection, status: "405 Method Not Allowed", message: AppLocalization.string("Only GET callbacks are accepted."))
+            sendResponse(on: connection, status: "405 Method Not Allowed", message: AppLocalization.string("Only GET callbacks are accepted.", table: .connection))
             return
         }
         guard let port else {
-            sendResponse(on: connection, status: "503 Service Unavailable", message: AppLocalization.string("The sign-in callback is not ready."))
+            sendResponse(on: connection, status: "503 Service Unavailable", message: AppLocalization.string("The sign-in callback is not ready.", table: .connection))
             finish(.failure(NativeOAuthError.listenerFailed))
             return
         }
         guard let expectedState else {
-            sendResponse(on: connection, status: "503 Service Unavailable", message: AppLocalization.string("The sign-in callback is not ready."))
+            sendResponse(on: connection, status: "503 Service Unavailable", message: AppLocalization.string("The sign-in callback is not ready.", table: .connection))
             return
         }
         if relaysCallback {
@@ -778,19 +852,19 @@ final class NativeOAuthLoopbackServer: @unchecked Sendable {
                 expectedState: expectedState,
                 expectedPort: port
             )
-            sendResponse(on: connection, status: "200 OK", message: AppLocalization.string("✓ Signed in to Hermes. You can close this window and return to Conduit."))
+            sendResponse(on: connection, status: "200 OK", message: AppLocalization.string("✓ Signed in to Hermes. You can close this window and return to Conduit.", table: .connection))
             finish(.success(code))
         } catch NativeOAuthError.callbackRejected {
-            sendResponse(on: connection, status: "400 Bad Request", message: AppLocalization.string("Sign-in was not completed. You can return to Conduit."))
+            sendResponse(on: connection, status: "400 Bad Request", message: AppLocalization.string("Sign-in was not completed. You can return to Conduit.", table: .connection))
             finish(.failure(NativeOAuthError.callbackRejected))
         } catch NativeOAuthError.stateMismatch {
             // A different local process must not be able to terminate the
             // pending login without knowing the high-entropy state value.
-            sendResponse(on: connection, status: "400 Bad Request", message: AppLocalization.string("The sign-in response failed its security check."))
+            sendResponse(on: connection, status: "400 Bad Request", message: AppLocalization.string("The sign-in response failed its security check.", table: .connection))
         } catch {
             // Ignore malformed probes and keep listening for the real browser
             // callback until cancellation or the bounded timeout.
-            sendResponse(on: connection, status: "400 Bad Request", message: AppLocalization.string("The sign-in response was invalid."))
+            sendResponse(on: connection, status: "400 Bad Request", message: AppLocalization.string("The sign-in response was invalid.", table: .connection))
         }
     }
 
@@ -802,16 +876,16 @@ final class NativeOAuthLoopbackServer: @unchecked Sendable {
                 expectedPort: port
             )
             if values["error"]?.isEmpty == false {
-                sendResponse(on: connection, status: "200 OK", message: AppLocalization.string("Sign-in was not completed. You can return to Conduit."))
+                sendResponse(on: connection, status: "200 OK", message: AppLocalization.string("Sign-in was not completed. You can return to Conduit.", table: .connection))
             } else {
-                sendResponse(on: connection, status: "200 OK", message: AppLocalization.string("Finishing the sign-in. You can return to Conduit."))
+                sendResponse(on: connection, status: "200 OK", message: AppLocalization.string("Finishing the sign-in. You can return to Conduit.", table: .connection))
             }
             finish(.success(NativeOAuthFlow.encodedQuery(values)))
         } catch NativeOAuthError.stateMismatch {
-            sendResponse(on: connection, status: "400 Bad Request", message: AppLocalization.string("The sign-in response failed its security check."))
+            sendResponse(on: connection, status: "400 Bad Request", message: AppLocalization.string("The sign-in response failed its security check.", table: .connection))
         } catch {
             // A favicon or other probe: keep listening.
-            sendResponse(on: connection, status: "400 Bad Request", message: AppLocalization.string("The sign-in response was invalid."))
+            sendResponse(on: connection, status: "400 Bad Request", message: AppLocalization.string("The sign-in response was invalid.", table: .connection))
         }
     }
 
@@ -821,7 +895,7 @@ final class NativeOAuthLoopbackServer: @unchecked Sendable {
             .replacingOccurrences(of: "&", with: "&amp;")
             .replacingOccurrences(of: "<", with: "&lt;")
             .replacingOccurrences(of: ">", with: "&gt;")
-        let html = "<!doctype html><meta charset=\"utf-8\"><title>\(AppLocalization.string("Hermes sign-in"))</title><body style=\"font:15px system-ui;margin:3rem;text-align:center\"><p>\(escaped)</p>"
+        let html = "<!doctype html><meta charset=\"utf-8\"><title>\(AppLocalization.string("Hermes sign-in", table: .connection))</title><body style=\"font:15px system-ui;margin:3rem;text-align:center\"><p>\(escaped)</p>"
         let body = Data(html.utf8)
         let headers = "HTTP/1.1 \(status)\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: \(body.count)\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n"
         var response = Data(headers.utf8)
@@ -936,6 +1010,34 @@ final class NativeOAuthLoginModel: ObservableObject {
     func cancel() {
         server?.stop()
     }
+
+    /// Signs in with Hermes' session token (issue 2442): a ticket minted
+    /// with it proves Hermes takes it, then it is kept as this dashboard's
+    /// sign-in the way a native sign-in's tokens are. A token Hermes refuses
+    /// throws `DashboardTicketBridgeError.signInRequired` and keeps nothing.
+    static func signIn(
+        sessionToken: String,
+        baseURL: String,
+        cloudflareAccess: CloudflareAccessCredentials?,
+        dashboardID: UUID
+    ) async throws -> NativeOAuthLoginResult {
+        let client = NativeOAuthAPIClient(baseURL: baseURL, cloudflareAccess: cloudflareAccess)
+        let ticket = try await client.mintTicket(accessToken: sessionToken, asSessionToken: true)
+        // A sign-in cancelled while Hermes checked the token keeps nothing.
+        try Task.checkCancellation()
+        let tokens = NativeOAuthTokenSet.sessionToken(sessionToken)
+        let previousTokens = KeychainHelper.loadNativeOAuthTokens(dashboardID: dashboardID)
+        KeychainHelper.saveNativeOAuthTokens(tokens, dashboardID: dashboardID)
+        guard KeychainHelper.loadNativeOAuthTokens(dashboardID: dashboardID) == tokens else {
+            if let previousTokens {
+                KeychainHelper.saveNativeOAuthTokens(previousTokens, dashboardID: dashboardID)
+            } else {
+                KeychainHelper.clearNativeOAuthTokens(dashboardID: dashboardID)
+            }
+            throw NativeOAuthError.tokenStorageFailed
+        }
+        return NativeOAuthLoginResult(tokens: tokens, ticket: ticket, previousTokens: previousTokens)
+    }
 }
 
 /// Whether the native sign-in browser starts private (ephemeral) each time.
@@ -959,8 +1061,65 @@ struct NativeOAuthSignInSheet: View {
     let onError: (Error) -> Void
     @Environment(\.dismiss) private var dismiss
     @StateObject private var model = NativeOAuthLoginModel()
+    /// Whether Hermes takes its session token, asked only for a server with
+    /// an `Authorization` extra header; nil until it answers.
+    @State private var offersSessionToken: Bool? = nil
+
+    private enum Step { case checking, sessionToken, browser }
+
+    /// The session token's form when that is the sign-in discovery found, or
+    /// when a proxy in front of this server needs the `Authorization` header
+    /// a native sign-in would send its own in and Hermes takes the token
+    /// instead (issue 2442). Every other sign-in opens the browser at once,
+    /// as before.
+    private var step: Step {
+        if provider == NativeOAuthTokenSet.sessionTokenProvider { return .sessionToken }
+        guard CustomHeaderStore.shared.sendsAuthorization(toServerURL: baseURL) else { return .browser }
+        switch offersSessionToken {
+        case nil: return .checking
+        case true?: return .sessionToken
+        case false?: return .browser
+        }
+    }
 
     var body: some View {
+        switch step {
+        case .checking:
+            NavigationStack {
+                ProgressView()
+                    .accessibilityLabel(AppLocalization.string("Checking how this server signs in", table: .connection))
+                    .toolbar {
+                        ToolbarItem(placement: .cancellationAction) {
+                            Button(AppLocalization.string("Cancel")) { dismiss() }
+                        }
+                    }
+            }
+            .task {
+                // A status that can't be read leaves the browser sign-in.
+                let client = NativeAuthClient(baseURL: baseURL, cloudflareAccess: cloudflareAccess)
+                offersSessionToken = (try? await client.supportsSessionToken()) ?? false
+            }
+        case .sessionToken:
+            SessionTokenSignInForm(
+                baseURL: baseURL,
+                cloudflareAccess: cloudflareAccess,
+                dashboardID: dashboardID,
+                onSuccess: { result in
+                    onSuccess(result)
+                    dismiss()
+                },
+                onError: { error in
+                    onError(error)
+                    dismiss()
+                },
+                onCancel: { dismiss() }
+            )
+        case .browser:
+            browserSignIn
+        }
+    }
+
+    private var browserSignIn: some View {
         // Keep one representable alive while authorizeURL changes and the
         // browser covers this sheet. Visibility changes are not OAuth cancellation.
         WebAuthenticationView(
@@ -985,6 +1144,142 @@ struct NativeOAuthSignInSheet: View {
             onCancel: { dismiss() }
         )
         .ignoresSafeArea()
+    }
+}
+
+/// Where Hermes' session token is typed (issue 2442). A token Hermes refuses
+/// is said here and can be corrected; any other failure ends the sign-in
+/// the way a native sign-in's does.
+struct SessionTokenSignInForm: View {
+    let baseURL: String
+    let cloudflareAccess: CloudflareAccessCredentials?
+    let dashboardID: UUID
+    let onSuccess: (NativeOAuthLoginResult) -> Void
+    let onError: (Error) -> Void
+    let onCancel: () -> Void
+    @State private var token = ""
+    @State private var isWorking = false
+    @State private var problem: String?
+    /// The sign-in in flight. Cancelled when the form is cancelled or goes
+    /// away, so an abandoned sign-in neither connects nor reports a failure.
+    @State private var signInTask: Task<Void, Never>?
+
+    private var trimmedToken: String { token.trimmingCharacters(in: .whitespacesAndNewlines) }
+
+    /// What a refused token says. Behind a proxy that checks
+    /// `Authorization`, the proxy may be what refused it: its 401 reads the
+    /// same as Hermes' (issue 2481).
+    nonisolated static func refusalProblem(behindProxy: Bool) -> String {
+        behindProxy
+            ? AppLocalization.string("Hermes, or the proxy in front of it, refused this. Check the token, and the Authorization header in Extra headers.", table: .connection)
+            : AppLocalization.string("Hermes didn’t accept this token. Check it and try again.", table: .connection)
+    }
+
+    /// A sign-in Hermes answered: the result to connect with, or nil when
+    /// the form was cancelled meanwhile. Then the grant the token replaced
+    /// goes back into Keychain (none: the slot is emptied), as a sign-in
+    /// that never happened, and nothing connects or fails.
+    @discardableResult
+    static func keep(_ result: NativeOAuthLoginResult, cancelled: Bool, dashboardID: UUID) -> NativeOAuthLoginResult? {
+        guard cancelled else { return result }
+        if let previous = result.previousTokens {
+            if !KeychainHelper.saveNativeOAuthTokens(previous, dashboardID: dashboardID) {
+                // The new token stays in the slot; the next connect signs in
+                // with it rather than the one it replaced (#2628's review).
+                nativeOAuthLogger.error("Session token sign-in cancelled: the previous grant couldn't be put back")
+            }
+        } else {
+            KeychainHelper.clearNativeOAuthTokens(dashboardID: dashboardID)
+        }
+        return nil
+    }
+
+    /// What can't go in a header value, or nil.
+    nonisolated static func problem(with token: String) -> String? {
+        guard token.unicodeScalars.allSatisfy({ $0.value > 0x20 && $0.value < 0x7F }) else {
+            return AppLocalization.string("Enter the token exactly as it is set on the Hermes host, with no spaces or line breaks.", table: .connection)
+        }
+        return nil
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    SecureField(AppLocalization.string("Session token", table: .connection), text: $token)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .accessibilityIdentifier("session-token.field")
+                } footer: {
+                    Text(AppLocalization.string("The session token this Hermes was set up with (HERMES_DASHBOARD_SESSION_TOKEN). Conduit keeps it in Keychain and sends it only to this server.", table: .connection))
+                }
+                if let problem {
+                    Section {
+                        Text(problem)
+                            .foregroundStyle(.red)
+                            .accessibilityIdentifier("session-token.problem")
+                    }
+                }
+            }
+            .navigationTitle(AppLocalization.string("Session token", table: .connection))
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button(AppLocalization.string("Cancel")) {
+                        signInTask?.cancel()
+                        onCancel()
+                    }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    if isWorking {
+                        // Hermes is checking the token.
+                        ProgressView()
+                            .accessibilityLabel(AppLocalization.string("Checking the token", table: .connection))
+                    } else {
+                        Button(AppLocalization.string("Sign In")) {
+                            // One sign-in at a time: a second tap before the
+                            // first one marks itself working goes nowhere.
+                            guard signInTask == nil else { return }
+                            signInTask = Task {
+                                await signIn()
+                                signInTask = nil
+                            }
+                        }
+                        .disabled(trimmedToken.isEmpty)
+                        .accessibilityIdentifier("session-token.sign-in")
+                    }
+                }
+            }
+        }
+        .onDisappear { signInTask?.cancel() }
+    }
+
+    private func signIn() async {
+        let sessionToken = trimmedToken
+        guard !sessionToken.isEmpty, !isWorking else { return }
+        if let invalid = Self.problem(with: sessionToken) {
+            problem = invalid
+            return
+        }
+        problem = nil
+        isWorking = true
+        defer { isWorking = false }
+        do {
+            let result = try await NativeOAuthLoginModel.signIn(
+                sessionToken: sessionToken,
+                baseURL: baseURL,
+                cloudflareAccess: cloudflareAccess,
+                dashboardID: dashboardID
+            )
+            guard let kept = Self.keep(result, cancelled: Task.isCancelled, dashboardID: dashboardID) else { return }
+            onSuccess(kept)
+        } catch DashboardTicketBridgeError.signInRequired {
+            guard !Task.isCancelled else { return }
+            problem = Self.refusalProblem(behindProxy: CustomHeaderStore.shared.sendsAuthorization(toServerURL: baseURL))
+        } catch {
+            guard !Task.isCancelled else { return }
+            onError(error)
+        }
     }
 }
 

@@ -131,8 +131,10 @@ extension AppState {
               // A native sign-in's pass: its bearer token and no cookies. A
               // cookie pass may carry a proxy's own Authorization header,
               // which is left alone.
+              // A session token never rotates, so its pass is left too.
               pass.headers["Cookie"] == nil, pass.headers["Authorization"]?.hasPrefix("Bearer ") == true,
-              let tokens = KeychainHelper.loadNativeOAuthTokens(dashboardID: dashboardID), !tokens.accessToken.isEmpty
+              let tokens = KeychainHelper.loadNativeOAuthTokens(dashboardID: dashboardID), !tokens.accessToken.isEmpty,
+              !tokens.isSessionToken
         else { return }
         pass.headers["Authorization"] = "Bearer \(tokens.accessToken)"
         pass.expiresAt = tokens.expiresAt > 0 ? Date(timeIntervalSince1970: tokens.expiresAt) : nil
@@ -142,6 +144,22 @@ extension AppState {
         }
     }
 
+    /// Sign Out of a dashboard ends the host pass made from its sign-in
+    /// too (issue 2482): a session token's pass has no expiry and nothing
+    /// to revoke on the host, so it would keep background sends signed in.
+    /// Sharing stays bound, and the next sign-in's connect saves a new one.
+    /// What wasn't sent yet goes too: it would go under the next sign-in.
+    func forgetLocationHostPass(dashboardID: UUID) {
+        // Only a save for this dashboard is stood down: the pass is saved
+        // only for the dashboard sharing is bound to.
+        if LocationSharingController.shared.binding?.dashboardID == dashboardID {
+            locationHostPassGeneration &+= 1
+        }
+        LocationSharingController.shared.dropUnsent(boundTo: dashboardID)
+        guard LocationKeychain.loadHostPass()?.dashboardID == dashboardID else { return }
+        LocationKeychain.clearHostPass()
+    }
+
     /// Saves the host pass for the dashboard in use, when location sharing
     /// is bound to it: at each connect, and when a native sign-in rotates
     /// its tokens.
@@ -149,9 +167,14 @@ extension AppState {
         let controller = LocationSharingController.shared
         guard controller.binding?.dashboardID == dashboardID,
               activeDashboardID == dashboardID, let bridge = dashboardTicketBridge else { return }
-        // Removed or unbound while the pass was read: it isn't kept.
+        let generation = locationHostPassGeneration
         if let pass = await dashboardHostPass(bridge: bridge, dashboardID: dashboardID),
-           controller.binding?.dashboardID == pass.dashboardID,
+           Self.keepsReadHostPass(
+               pass,
+               readAtGeneration: generation,
+               generationNow: locationHostPassGeneration,
+               boundDashboardID: controller.binding?.dashboardID
+           ),
            !LocationKeychain.saveHostPass(pass) {
             // Logged by LocationKeychain. The previous pass (if any) stays;
             // the app still sends through the dashboard connection, but the
@@ -159,6 +182,18 @@ extension AppState {
             // next connect saves it.
             LocationSyncEngine.log.error("Couldn't store the location host pass; background sends use the previous one")
         }
+    }
+
+    /// Whether a host pass read during a connect is kept: not when the
+    /// dashboard was signed out (the generation moved on) or sharing was
+    /// unbound or bound elsewhere while it was read.
+    static func keepsReadHostPass(
+        _ pass: LocationHostPass,
+        readAtGeneration: Int,
+        generationNow: Int,
+        boundDashboardID: UUID?
+    ) -> Bool {
+        readAtGeneration == generationNow && boundDashboardID == pass.dashboardID
     }
 
     /// The headers this dashboard's requests carry, for sending without the
@@ -183,8 +218,11 @@ extension AppState {
             guard let tokens = KeychainHelper.loadNativeOAuthTokens(dashboardID: dashboardID), !tokens.accessToken.isEmpty else {
                 return nil
             }
-            headers["Authorization"] = "Bearer \(tokens.accessToken)"
-            if tokens.expiresAt > 0 { expiresAt = Date(timeIntervalSince1970: tokens.expiresAt) }
+            // A session token goes in Hermes' own header, beside a proxy's
+            // Authorization extra header.
+            let header = tokens.requestHeader
+            headers[header.name] = header.value
+            if tokens.expiresAt > 0, !tokens.isSessionToken { expiresAt = Date(timeIntervalSince1970: tokens.expiresAt) }
         } else {
             var cookies = DashboardCookiePersistence.mirroredCookies(dashboardID: dashboardID)
             if PhoneScenePresence.isInForeground, let live = await webKitCookies(bridge) { cookies += live }

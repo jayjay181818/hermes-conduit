@@ -30,6 +30,102 @@ extension ChatOnScreenTests {
         XCTAssertNil(NeedsYouItem(host: ["id": "x", "kind": "other", "session_ids": ["s"]], profile: "atlas"))
     }
 
+    /// Issue 2683: a card drawn from its row answers through the gateway
+    /// the list named, else the profile's pairing key, else the gateway the
+    /// host reported; and its answer is then sealed, never plaintext.
+    func testANeedsYouCardAnswersThroughItsProfilesGatewaySealed() throws {
+        let dashboard = UUID()
+        func key(_ gateway: String, profile: String?, installation: String = "inst", dashboardID: UUID? = nil,
+                 at: TimeInterval = 1, retired: Bool = false) -> E2EKeyRecord {
+            var record = E2EKeyRecord(kid: "kid-\(gateway)", secret: Data(repeating: 7, count: 32), installationID: installation,
+                                      gatewayID: gateway, dashboardID: (dashboardID ?? dashboard).uuidString, profile: profile,
+                                      createdAt: Date(timeIntervalSince1970: at))
+            if retired { record = record.retired(at: Date()) }
+            return record
+        }
+        func resolve(listed: String? = nil, records: [E2EKeyRecord], reported: String? = nil) -> String? {
+            AppState.needsYouCardGatewayID(listed: listed, dashboardID: dashboard, profile: "Atlas",
+                                           installationID: "inst", records: records, reported: reported)
+        }
+        let records = [
+            key("gw-old", profile: "atlas", at: 1),
+            key("gw-atlas", profile: "atlas", at: 2),
+            key("gw-retired", profile: "atlas", at: 3, retired: true),
+            key("gw-other-phone", profile: "atlas", installation: "other", at: 4),
+            key("gw-other-dashboard", profile: "atlas", dashboardID: UUID(), at: 5),
+            key("gw-default", profile: "default", at: 6),
+        ]
+        XCTAssertEqual(resolve(listed: "gw-listed", records: records, reported: "gw-reported"), "gw-listed")
+        XCTAssertEqual(resolve(records: records, reported: "gw-reported"), "gw-atlas", "the profile's newest current key")
+        XCTAssertEqual(resolve(records: [key("gw-default", profile: "default")], reported: "gw-reported"), "gw-reported")
+        XCTAssertNil(resolve(records: []))
+
+        let body = PushNotificationService.respondBody(requestID: "conduit-push-abc123def456", answer: "staging",
+                                                       relayGatewayID: resolve(records: records))
+        let sealed = try PushNotificationService.sealedRespondBody(body, requestID: "conduit-push-abc123def456",
+                                                                   installationID: "inst", records: records)
+        XCTAssertNotEqual(sealed["answer"], "staging", "an encrypted pairing never gets the answer in plaintext")
+        XCTAssertEqual(sealed["gateway_id"], "gw-atlas")
+    }
+
+    /// Issue 2683: the list's gateway reaches every row, an empty one none.
+    func testTheWaitingListsGatewayReachesItsRows() throws {
+        let rows = [needsYouWait("q1", "s1", at: 1, kind: "question"), needsYouWait("a1", "s2", at: 2)]
+        let items = try XCTUnwrap(NeedsYouItem.items(listed: ["waiting": rows, "gateway_id": " gw-1 "], profile: "atlas"))
+        XCTAssertEqual(items.map(\.relayGatewayID), ["gw-1", "gw-1"])
+        let older = try XCTUnwrap(NeedsYouItem.items(listed: ["waiting": rows], profile: "atlas"))
+        XCTAssertEqual(older.map(\.relayGatewayID), [nil, nil], "an older plugin names none")
+        XCTAssertEqual(NeedsYouItem.items(listed: ["waiting": rows, "gateway_id": "  "], profile: "atlas")?.map(\.relayGatewayID), [nil, nil])
+        XCTAssertNil(NeedsYouItem.items(listed: ["error": "boom"], profile: "atlas"), "an error body is a failed read")
+    }
+
+    /// Issue 2683: a row-drawn card's gateway outlives a relaunch only for
+    /// a pairing this iPhone holds a current key for, and then answers
+    /// sealed from the kept copy.
+    func testARowDrawnCardsGatewayIsKeptAcrossRelaunchOnlyWhenEncrypted() {
+        let current = E2EKeyRecord(kid: "k1", secret: Data(repeating: 3, count: 32), installationID: "inst", gatewayID: "gw-e2e",
+                                   dashboardID: nil, profile: nil, createdAt: Date())
+        XCTAssertTrue(PushNotificationService.keepsGatewayAcrossRelaunch("gw-e2e", installationID: "inst", records: [current]))
+        XCTAssertFalse(PushNotificationService.keepsGatewayAcrossRelaunch("gw-plain", installationID: "inst", records: [current]))
+        XCTAssertFalse(PushNotificationService.keepsGatewayAcrossRelaunch("gw-e2e", installationID: "other", records: [current]))
+        XCTAssertFalse(PushNotificationService.keepsGatewayAcrossRelaunch("gw-e2e", installationID: "inst",
+                                                                          records: [current.retired(at: Date())]))
+
+        let key = PushNotificationService.encryptedDecisionGatewaysKey
+        let saved = UserDefaults.standard.array(forKey: key)
+        defer { UserDefaults.standard.set(saved, forKey: key) }
+        PushNotificationService.persistEncryptedGatewayID("gw-e2e", requestID: "conduit-push-2683aaaaaaaa")
+        // The session map is empty for it after a relaunch; the kept copy answers.
+        XCTAssertEqual(PushNotificationService.shared.relayGatewayID(forRequestID: "conduit-push-2683aaaaaaaa"), "gw-e2e")
+    }
+
+    /// Issue 2556: a question's row carries its card as the push did, for
+    /// the chat to draw when Hermes drew none there.
+    func testAQuestionsRowCarriesItsCard() throws {
+        var row = needsYouWait("q1", "s2", at: 1, kind: "question")
+        XCTAssertNil(try XCTUnwrap(NeedsYouItem(host: row, profile: "atlas")).card, "an older plugin sends none")
+        row["decision"] = [
+            "kind": "clarify", "request_id": "conduit-push-abc", "question": "Which environment?",
+            "questions": [
+                ["qid": "q0", "question": "Which environment?", "choices": ["staging", "production"]],
+                ["qid": "q1", "question": "Anything else?"]
+            ]
+        ] as [String: Any]
+        guard case let .clarifyBatch(requestId, questions)? = try XCTUnwrap(NeedsYouItem(host: row, profile: "atlas")).card else {
+            return XCTFail("the batch's card")
+        }
+        XCTAssertEqual(requestId, "conduit-push-abc")
+        XCTAssertEqual(questions.map(\.id), ["q0", "q1"])
+        XCTAssertEqual(questions.first?.choices.map(\.value), ["staging", "production"])
+        // Only the plugin's own ids are answerable through the relay.
+        row["decision"] = ["kind": "clarify", "request_id": "native-1", "question": "Which?"]
+        XCTAssertNil(try XCTUnwrap(NeedsYouItem(host: row, profile: "atlas")).card)
+        // An approval is answered on its chat's own card.
+        var approval = needsYouWait("a1", "s1", at: 1)
+        approval["decision"] = ["kind": "approval", "session_key": "s1", "description": "Run it?", "choices": ["once", "deny"]] as [String: Any]
+        XCTAssertNil(try XCTUnwrap(NeedsYouItem(host: approval, profile: "atlas")).card)
+    }
+
     func testNeedsYouBannersOnlyANewWaitOutsideTheOpenChat() {
         let store = NeedsYouStore()
         let dashboard = UUID()
@@ -84,6 +180,82 @@ extension ChatOnScreenTests {
                                               matches: AppState.profilesMatch), 1)
         XCTAssertEqual(V2ProfileStrip.waiting(in: [], needsYou: store,
                                               matches: AppState.profilesMatch), 0)
+    }
+
+    /// Another combined dashboard's waits stay apart from this one's: the
+    /// list shows both, newest first, the chips count only this one's, a
+    /// new wait there banners, and one let go says nothing more.
+    func testAnotherCombinedDashboardsWaitsListApartAndBanner() {
+        let store = NeedsYouStore()
+        let here = UUID(), there = UUID()
+        store.apply([NeedsYouItem(waitID: "h1", profile: "default", kind: .question, sessionIDs: ["a"], since: Date(timeIntervalSince1970: 10))],
+                    profile: "default", dashboardID: here) { _ in false }
+        store.applyOther([NeedsYouItem(waitID: "t1", profile: "default", kind: .approval, sessionIDs: ["b"], since: Date(timeIntervalSince1970: 20))],
+                         profile: "default", dashboardID: there)
+        XCTAssertEqual(store.everyItem.map(\.waitID), ["t1", "h1"], "newest first, both")
+        XCTAssertEqual(store.count(for: "default", matches: AppState.profilesMatch), 1, "the chip counts this dashboard's")
+        XCTAssertNil(store.banner, "a first read there shows no banner")
+        XCTAssertNotEqual(store.everyItem[0].id, NeedsYouItem(waitID: "t1", profile: "default", kind: .approval, sessionIDs: ["b"]).id,
+                          "its id carries its dashboard")
+
+        store.applyOther([
+            NeedsYouItem(waitID: "t1", profile: "default", kind: .approval, sessionIDs: ["b"], since: Date(timeIntervalSince1970: 20)),
+            NeedsYouItem(waitID: "t2", profile: "default", kind: .question, sessionIDs: ["c"], since: Date(timeIntervalSince1970: 30)),
+        ], profile: "default", dashboardID: there)
+        XCTAssertEqual(store.banner?.waitID, "t2")
+        XCTAssertEqual(store.banner?.dashboardID, there)
+
+        // The one on screen's own reads never banner it again, nor take it.
+        store.apply([], profile: "default", dashboardID: here) { _ in false }
+        XCTAssertEqual(store.banner?.waitID, "t2")
+
+        store.forgetOtherDashboards(otherThan: [])
+        XCTAssertNil(store.banner, "let go: its banner goes")
+        XCTAssertEqual(store.everyItem.map(\.waitID), [], "and its rows")
+
+        // Read again later, it starts over: a first read, no banner.
+        store.applyOther([NeedsYouItem(waitID: "t3", profile: "default", kind: .question, sessionIDs: ["d"])], profile: "default", dashboardID: there)
+        XCTAssertNil(store.banner)
+        // Switched to: it's read as this dashboard's from then.
+        store.reset(dashboardID: there)
+        XCTAssertTrue(store.otherDashboards.isEmpty)
+    }
+
+    /// One Hermes saved at two addresses, both in the group: a wait both
+    /// list shows once, as this dashboard's, and banners once, from this
+    /// dashboard; one in the chat on screen banners from neither (issue 2631).
+    func testAWaitTwoDashboardsOfOneHermesListShowsOnce() throws {
+        let store = NeedsYouStore()
+        let here = UUID(), twin = UUID()
+        func wait(_ id: String, _ at: Double) -> NeedsYouItem {
+            NeedsYouItem(waitID: id, profile: "default", kind: .approval, sessionIDs: ["s-\(id)"],
+                         since: Date(timeIntervalSince1970: at))
+        }
+        store.apply([wait("w1", 10)], profile: "default", dashboardID: here) { _ in false }
+        store.applyOther([wait("w1", 10)], profile: "default", dashboardID: twin)
+        XCTAssertEqual(store.everyItem.map(\.waitID), ["w1"])
+        XCTAssertNil(store.everyItem.first?.dashboardID, "as this dashboard's")
+
+        store.apply([wait("w1", 10), wait("w2", 20)], profile: "default", dashboardID: here) { _ in false }
+        store.applyOther([wait("w1", 10), wait("w2", 20)], profile: "default", dashboardID: twin)
+        XCTAssertEqual(store.banner?.waitID, "w2")
+        XCTAssertNil(store.banner?.dashboardID, "the banner is this dashboard's copy")
+        XCTAssertEqual(store.everyItem.map(\.waitID), ["w2", "w1"])
+
+        // The twin's read lands first for a wait in the chat on screen.
+        store.applyOther([wait("w1", 10), wait("w2", 20), wait("w3", 30)], profile: "default", dashboardID: twin,
+                         isOpenChat: { $0.waitID == "w3" })
+        XCTAssertEqual(store.banner?.waitID, "w2", "no banner for the chat on screen")
+        XCTAssertEqual(store.everyItem.map(\.waitID), ["w3", "w2", "w1"])
+
+        // The twin's read banners a new wait first; once dismissed, this
+        // dashboard's own read of it banners nothing again.
+        store.applyOther([wait("w1", 10), wait("w2", 20), wait("w3", 30), wait("w4", 40)], profile: "default", dashboardID: twin)
+        let twinBanner = store.banner
+        XCTAssertEqual(twinBanner?.waitID, "w4")
+        store.dismissBanner(try XCTUnwrap(twinBanner))
+        store.apply([wait("w1", 10), wait("w2", 20), wait("w3", 30), wait("w4", 40)], profile: "default", dashboardID: here) { _ in false }
+        XCTAssertNil(store.banner, "its banner showed once, from the twin")
     }
 
     func testNeedsYouBannerIsDismissedOnlyForItsOwnWait() {
