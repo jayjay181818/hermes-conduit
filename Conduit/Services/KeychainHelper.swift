@@ -136,8 +136,8 @@ enum KeychainHelper {
     /// The record from before saved dashboards. Only the migrator reads it,
     /// and it rewrites it as a dashboard's own record (readable after the
     /// first unlock). Unreadable on a locked launch, it stays until a later
-    /// launch or the retry on screen can read it through the same verified
-    /// legacy recovery path as launch.
+    /// launch or the retry on screen can read it
+    /// (`SavedDashboardMigrator.adoptLeftoverCredentials`).
     static func saveCredentials(_ credentials: DashboardCredentials) {
         guard let data = try? JSONEncoder().encode(credentials) else { return }
         save(
@@ -467,18 +467,6 @@ enum KeychainHelper {
 
     static func clearConnection() {
         delete(account: key)
-        delete(account: dashboardCookieKey)
-    }
-
-    /// Removes only the pre-dashboard ticket record. Migration calls this
-    /// after the scoped copy is verified; the cookie mirror is independent.
-    static func clearLegacyConnectionTicket() {
-        delete(account: key)
-    }
-
-    /// Removes only the pre-dashboard cookie mirror, after its scoped copy is
-    /// verified against a confidently identified dashboard.
-    static func clearLegacyDashboardCookies() {
         delete(account: dashboardCookieKey)
     }
 

@@ -9298,7 +9298,7 @@ The Mac fork keeps its desktop behavior while taking changes from upstream.
 **Code**
 - Build: `scripts/mac-catalyst-build.sh`, `scripts/mac-catalyst/project.yml`, `scripts/mac-catalyst/ConduitMac.entitlements`.
 - Desktop: `Conduit/Services/RunsOnMac.swift`, `Conduit/Views/RootView.swift`, `Conduit/Services/SystemSettings.swift`.
-- Credentials: `Conduit/Services/KeychainFileBackend.swift`, `Conduit/Services/KeychainHelper.swift`, `Conduit/Services/SavedDashboardRegistry.swift`, `ConduitTests/DashboardRequestAuthorizerTests+FileBackend.swift`.
+- Credentials: `Conduit/Services/KeychainFileBackend.swift`, `Conduit/Services/KeychainHelper.swift`, `ConduitTests/DashboardRequestAuthorizerTests+FileBackend.swift`.
 - Mac updates: `Conduit/Services/CatalystUpdater.swift`, `ConduitTests/CatalystUpdaterTests.swift`, `scripts/mac-catalyst/package-release.py`, `scripts/mac-catalyst/publish-release.py`, `docs/MAC_RELEASES.md`.
 - Notifications: `Conduit/Services/MacAttention.swift`, `ConduitTests/NotificationE2ETests+MacAttention.swift`.
 - Procedure and CI: `docs/UPDATING_MAC_PORT.md`, `README.md`, `.github/workflows/mac-catalyst.yml`.
@@ -9307,6 +9307,7 @@ The Mac fork keeps its desktop behavior while taking changes from upstream.
 - The credentials directory is owner-only and excluded from backups on every save, including when it already exists. A failure to set the backup exclusion refuses the write; Catalyst tests verify the exact persisted Time Machine exclusion marker, and its removal and reapplication, in an isolated Application Support folder. The hosted Mac reports Foundation's resource Boolean as false even with that marker present.
 - Preserve the existing Catalyst port and the upstream behavior of iOS, iPadOS and watchOS. Desktop detection includes both Catalyst and an iPad app running on a Mac.
 - The Mac updater reads stable Mac releases from the fork. The app verifies the installer size and SHA-256 before handing it to Apple Installer. On upgrade, saved dashboards and their credentials come from the existing user sandbox.
+- Saved-dashboard migration is upstream's code, unchanged: the Mac port only swaps the storage backend (`KeychainHelper.backend`), so the fork takes upstream's migration rulings as they are.
 - Keep Release limited to the current architecture, remove unused code, and strip executable symbols while keeping the dSYM. Do not restore the reconnect and upload path on each Cmd-Tab.
 - Debug uses its own bundle ID and data container. Builds and tests never replace the installed Release app as part of an update PR.
 - Keep credentials, app data, generated projects, build products, logs and local agent files outside published source. Publish generic commit metadata rather than private test details or machine benchmarks.
@@ -9314,5 +9315,6 @@ The Mac fork keeps its desktop behavior while taking changes from upstream.
 **Open gaps**
 - Actual GUI checks and Release validation are recorded in the update PR; source checks alone do not prove desktop behavior.
 - No relay pushes, widgets, Watch app, CarPlay, ringing calls, live code scanner or location push in this ad-hoc signed Catalyst build.
+- Publishing a Mac release needs Developer ID Application and Installer identities and notarization, which the fork has not set up; until then Check for Updates finds no release, and Macs are updated by installing a locally built package.
 
-**Checked:** 2026-11-12, #1 (fork: Mac Catalyst upstream integration and credential backup-exclusion readback).
+**Checked:** 2026-11-18, update to upstream 2.4.1 build 278 (Check for Updates added; upstream's saved-dashboard migration kept unchanged); 2026-11-12, #1 (fork: Mac Catalyst upstream integration and credential backup-exclusion readback).

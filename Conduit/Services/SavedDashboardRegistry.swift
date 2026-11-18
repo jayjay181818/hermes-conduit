@@ -166,21 +166,15 @@ enum SavedDashboardRegistryStore {
 
     static func load() -> SavedDashboardRegistry? {
         guard let data = KeychainHelper.loadDashboardRegistryData(),
-              let registry = try? JSONDecoder().decode(SavedDashboardRegistry.self, from: data),
-              registry.schemaVersion == SavedDashboardRegistry.currentSchemaVersion else {
+              let registry = try? JSONDecoder().decode(SavedDashboardRegistry.self, from: data) else {
             return nil
         }
         return registry
     }
 
-    /// Returns true only when the committed representation can be read back.
-    /// Migration uses that readback as its destructive-cleanup boundary.
-    @discardableResult
-    static func save(_ registry: SavedDashboardRegistry) -> Bool {
-        guard registry.schemaVersion == SavedDashboardRegistry.currentSchemaVersion,
-              let data = try? JSONEncoder().encode(registry) else { return false }
+    static func save(_ registry: SavedDashboardRegistry) {
+        guard let data = try? JSONEncoder().encode(registry) else { return }
         KeychainHelper.saveDashboardRegistryData(data)
-        return load() == registry
     }
 }
 
@@ -202,41 +196,17 @@ struct LegacyDashboardState: Equatable {
         connection == nil && credentials == nil && cookieMirror == nil && cloudflare == nil
     }
 
-    /// An address identified by the old connection ticket and/or password.
-    /// If both exist they must agree; the remembered URL and Cloudflare token
-    /// cannot resolve a conflict between them.
-    var independentDashboardURL: String? {
-        let rawCandidates = [credentials?.baseURL, connection?.baseUrl].compactMap { $0 }
-        guard !rawCandidates.isEmpty else { return nil }
-        let candidates = rawCandidates.compactMap { try? ConnectionURLPolicy.normalizedBaseURL($0) }
-        guard candidates.count == rawCandidates.count, Set(candidates).count == 1 else { return nil }
-        return candidates.first
-    }
-
-    /// A migration address may come from matching connection/password state,
-    /// or from an explicitly origin-bound Cloudflare record by itself. An
-    /// originless token and the remembered UI URL never establish ownership.
+    /// The address the legacy dashboard was reached at. Password credentials
+    /// are the most authoritative (they were saved against a normalized
+    /// URL); the saved connection ticket and the Cloudflare origin follow;
+    /// the remembered dashboard URL is the last resort. Cookies alone can
+    /// never establish an address.
     var derivedDashboardURL: String? {
-        if connection != nil || credentials != nil { return independentDashboardURL }
-        guard let origin = cloudflare?.origin,
-              !origin.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
-        return try? ConnectionURLPolicy.normalizedBaseURL(origin)
-    }
-
-    /// Cloudflare can be copied only when its explicit origin matches the
-    /// target, or its originless legacy form accompanies an independent
-    /// connection/password address. A conflict makes it unowned.
-    func cloudflareCanBind(to dashboardURL: String) -> Bool {
-        guard let cloudflare else { return false }
-        let origin = cloudflare.origin.trimmingCharacters(in: .whitespacesAndNewlines)
-        if origin.isEmpty {
-            return independentDashboardURL == dashboardURL
-        }
-        guard (try? ConnectionURLPolicy.normalizedBaseURL(origin)) == dashboardURL else { return false }
-        if connection != nil || credentials != nil {
-            return independentDashboardURL == dashboardURL
-        }
-        return true
+        if let baseURL = credentials?.baseURL, !baseURL.isEmpty { return baseURL }
+        if let baseURL = connection?.baseUrl, !baseURL.isEmpty { return baseURL }
+        if let origin = cloudflare?.origin, !origin.isEmpty { return origin }
+        if let remembered = rememberedDashboardURL, !remembered.isEmpty { return remembered }
+        return nil
     }
 }
 
@@ -282,9 +252,6 @@ enum SavedDashboardMigration {
         /// No legacy state at all: commit an empty registry so clean installs
         /// never re-run migration.
         case cleanInstall
-        /// There is legacy data, but no trustworthy address to attach it to.
-        /// Keep it intact; a later launch may have enough state to migrate it.
-        case preserveLegacy
         case migrated(Plan)
     }
 
@@ -303,8 +270,12 @@ enum SavedDashboardMigration {
             // left is retiring whatever legacy records still exist.
             return .alreadyMigrated(retireLegacy: !legacy.isEmpty)
         }
-        guard !legacy.isEmpty else { return .cleanInstall }
-        guard let rawURL = legacy.derivedDashboardURL else { return .preserveLegacy }
+        guard !legacy.isEmpty, let rawURL = legacy.derivedDashboardURL else {
+            // Nothing to migrate (clean install, or unusable fragments with
+            // no address): commit the empty registry so this branch never
+            // re-runs, and let the caller retire whatever fragments exist.
+            return legacy.isEmpty ? .cleanInstall : .alreadyMigrated(retireLegacy: true)
+        }
         let normalized = normalizedLegacyURL
             ?? (try? ConnectionURLPolicy.normalizedBaseURL(rawURL))
             ?? rawURL.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -322,8 +293,8 @@ enum SavedDashboardMigration {
             label: label,
             writesConnection: legacy.connection != nil,
             writesCredentials: legacy.credentials != nil,
-            writesCookies: legacy.cookieMirror != nil && legacy.independentDashboardURL == normalized,
-            writesCloudflare: legacy.cloudflareCanBind(to: normalized),
+            writesCookies: legacy.cookieMirror != nil,
+            writesCloudflare: legacy.cloudflare != nil,
             relabelsServerIdentity: identityMatchesURL,
             createsRegistry: true,
             retiresLegacy: true
@@ -340,31 +311,18 @@ enum SavedDashboardMigrator {
     /// connection. Idempotent, retryable, and crash-safe by construction:
     /// see `SavedDashboardMigration.outcome`.
     static func loadRegistry(defaults: UserDefaults = .standard) -> SavedDashboardRegistry {
-        let storedRegistryData = KeychainHelper.loadDashboardRegistryData()
         // An empty registry beside an old password is an upgrade that ran on
         // a locked phone with only that password saved, which it couldn't
         // read: migrate again now that it can.
-        if let storedRegistryData {
-            // A corrupt or newer registry is not the same as an absent one.
-            // Do not replace it with a newly inferred one or retire records
-            // that may be the only usable copy of a dashboard session.
-            if let existing = SavedDashboardRegistryStore.load() {
-                if !(existing.dashboards.isEmpty && KeychainHelper.loadCredentials() != nil) {
-                    // A valid current-schema registry already owns its UUIDs,
-                    // selected dashboard and scoped records. Recover a global
-                    // leftover only when its own address identifies an entry
-                    // and its scoped copy can be read back before cleanup.
-                    recoverLegacyLeftovers(
-                        LegacyDashboardReader.read(defaults: defaults),
-                        into: existing
-                    )
-                    return existing
-                }
-                // An empty registry beside a readable legacy password is a
-                // retry after an earlier locked launch.
-            } else {
-                return SavedDashboardRegistry()
+        if let existing = SavedDashboardRegistryStore.load(),
+           !(existing.dashboards.isEmpty && KeychainHelper.loadCredentials() != nil) {
+            // The password record is adoptLeftoverCredentials' to retire:
+            // still unreadable, it waits for a load that can read it.
+            adoptLeftoverCredentials(into: existing)
+            if !LegacyDashboardReader.read(defaults: defaults).isEmpty {
+                LegacyDashboardReader.retireLegacy(keepingCredentials: true)
             }
+            return existing
         }
         let legacy = LegacyDashboardReader.read(defaults: defaults)
         let outcome = SavedDashboardMigration.outcome(
@@ -374,18 +332,22 @@ enum SavedDashboardMigrator {
             normalizedLegacyURL: nil
         )
         switch outcome {
-        case .alreadyMigrated:
-            // This outcome belongs to a caller with an existing registry. If
-            // reached without one, leave all records available for a retry.
-            return SavedDashboardRegistry()
+        case .alreadyMigrated(let retireLegacy):
+            // Unreachable with a nil registry except for the fragment branch:
+            // commit the empty registry so the decision is terminal, and
+            // retire the unusable fragments.
+            if retireLegacy {
+                LegacyDashboardReader.retireLegacy(keepingCredentials: legacy.credentials == nil)
+            }
+            let registry = SavedDashboardRegistry()
+            SavedDashboardRegistryStore.save(registry)
+            return registry
         case .cleanInstall:
             let registry = SavedDashboardRegistry()
-            _ = SavedDashboardRegistryStore.save(registry)
+            SavedDashboardRegistryStore.save(registry)
             return registry
-        case .preserveLegacy:
-            return SavedDashboardRegistry()
         case .migrated(let plan):
-            return execute(plan: plan, legacy: legacy, defaults: defaults) ?? SavedDashboardRegistry()
+            return execute(plan: plan, legacy: legacy, defaults: defaults)
         }
     }
 
@@ -396,7 +358,22 @@ enum SavedDashboardMigrator {
         plan: SavedDashboardMigration.Plan,
         legacy: LegacyDashboardState,
         defaults: UserDefaults
-    ) -> SavedDashboardRegistry? {
+    ) -> SavedDashboardRegistry {
+        if let connection = legacy.connection, plan.writesConnection {
+            KeychainHelper.saveConnection(connection, dashboardID: plan.dashboardID)
+        }
+        if let credentials = legacy.credentials, plan.writesCredentials {
+            KeychainHelper.saveCredentials(credentials, dashboardID: plan.dashboardID)
+        }
+        if let cookies = legacy.cookieMirror, plan.writesCookies {
+            KeychainHelper.saveDashboardCookies(cookies, dashboardID: plan.dashboardID)
+        }
+        if let cloudflare = legacy.cloudflare, plan.writesCloudflare {
+            KeychainHelper.saveCloudflareKeychainRecord(cloudflare, dashboardID: plan.dashboardID)
+        }
+        if plan.relabelsServerIdentity {
+            defaults.set(plan.dashboardID.uuidString, forKey: AppState.chatResumeServerIdentityKey)
+        }
         let dashboard = SavedDashboard(
             id: plan.dashboardID,
             label: plan.label,
@@ -406,156 +383,30 @@ enum SavedDashboardMigrator {
             activeDashboardID: plan.dashboardID,
             dashboards: [dashboard]
         )
-
-        guard legacy.derivedDashboardURL == plan.normalizedURL else { return nil }
-
-        if let connection = legacy.connection, plan.writesConnection {
-            guard Self.normalized(connection.baseUrl) == plan.normalizedURL else { return nil }
-            KeychainHelper.saveConnection(connection, dashboardID: plan.dashboardID)
-            guard KeychainHelper.loadConnection(dashboardID: plan.dashboardID) == connection else { return nil }
-        }
-        if let credentials = legacy.credentials, plan.writesCredentials {
-            guard Self.normalized(credentials.baseURL) == plan.normalizedURL else { return nil }
-            KeychainHelper.saveCredentials(credentials, dashboardID: plan.dashboardID)
-            guard KeychainHelper.loadCredentials(dashboardID: plan.dashboardID) == credentials else { return nil }
-        }
-        if let cookies = legacy.cookieMirror, plan.writesCookies {
-            // Cookie mirrors carry no address themselves. Only migrate them
-            // alongside a ticket or password record that identifies this URL.
-            guard legacy.independentDashboardURL == plan.normalizedURL else { return nil }
-            KeychainHelper.saveDashboardCookies(cookies, dashboardID: plan.dashboardID)
-            guard KeychainHelper.loadDashboardCookies(dashboardID: plan.dashboardID) == cookies else { return nil }
-        }
-        if let cloudflare = legacy.cloudflare, plan.writesCloudflare {
-            // A pre-origin record can be bound only when a credential or
-            // connection independently identifies this sole legacy target.
-            guard legacy.cloudflareCanBind(to: plan.normalizedURL) else { return nil }
-            let migratedCloudflare = cloudflare.origin.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                ? CloudflareAccessKeychainRecord(
-                    clientID: cloudflare.clientID,
-                    clientSecret: cloudflare.clientSecret,
-                    origin: plan.normalizedURL
-                ) : cloudflare
-            KeychainHelper.saveCloudflareKeychainRecord(migratedCloudflare, dashboardID: plan.dashboardID)
-            guard KeychainHelper.loadCloudflareKeychainRecord(dashboardID: plan.dashboardID) == migratedCloudflare else {
-                return nil
-            }
-        }
-        // The registry is the commit marker. Never retire the old records,
-        // or relabel their runtime identity, until every scoped write and
-        // the registry itself can be read back.
-        guard SavedDashboardRegistryStore.save(registry) else { return nil }
-        if plan.relabelsServerIdentity {
-            defaults.set(plan.dashboardID.uuidString, forKey: AppState.chatResumeServerIdentityKey)
-        }
+        SavedDashboardRegistryStore.save(registry)
         if plan.retiresLegacy {
-            recoverLegacyLeftovers(legacy, into: registry)
+            // A password not read here may only be unreadable: earlier
+            // builds saved it readable only while unlocked, and a call can
+            // launch Conduit on a locked phone. It stays until a later load
+            // reads it (adoptLeftoverCredentials).
+            LegacyDashboardReader.retireLegacy(keepingCredentials: legacy.credentials == nil)
         }
         return registry
     }
 
-    private static func normalized(_ value: String) -> String {
-        (try? ConnectionURLPolicy.normalizedBaseURL(value)) ?? value.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    /// Completes a migration interrupted after a registry commit, or removes
-    /// duplicate global records after a new commit. Every record is assigned
-    /// by its own address, never by whichever dashboard happens to be active.
-    private static func recoverLegacyLeftovers(
-        _ legacy: LegacyDashboardState,
-        into registry: SavedDashboardRegistry
-    ) {
-        // A disagreeing ticket/password pair has no safe owner. Keep all
-        // leftovers until the user reconnects and supplies an unambiguous URL.
-        guard let ownerURL = legacy.derivedDashboardURL,
-              let id = registry.dashboardID(atNormalizedURL: normalized(ownerURL)),
-              let dashboard = registry.dashboard(with: id) else { return }
-
-        let connectionIsScoped = legacy.connection.map { connection in
-            normalized(connection.baseUrl) == ownerURL && ensureScopedCopy(
-                connection,
-                load: { KeychainHelper.loadConnection(dashboardID: $0) },
-                save: { KeychainHelper.saveConnection($0, dashboardID: id) },
-                dashboardID: id,
-                accepts: { normalized($0.baseUrl) == ownerURL }
-            )
-        } ?? true
-
-        // A known dashboard's own password wins over a stale global copy.
-        let credentialsAreScoped = legacy.credentials.map { credentials in
-            normalized(credentials.baseURL) == ownerURL && ensureScopedCopy(
-                credentials,
-                load: { KeychainHelper.loadCredentials(dashboardID: $0) },
-                save: { KeychainHelper.saveCredentials($0, dashboardID: id) },
-                dashboardID: id,
-                accepts: { normalized($0.baseURL) == ownerURL }
-            )
-        } ?? true
-
-        // Addressless dependents must become durable before their old address
-        // evidence is retired. Failed writes remain retryable next launch.
-        let cookiesAreScoped = legacy.cookieMirror.map { cookies in
-            legacy.independentDashboardURL == ownerURL && ensureScopedCopy(
-                cookies,
-                load: { KeychainHelper.loadDashboardCookies(dashboardID: $0) },
-                save: { KeychainHelper.saveDashboardCookies($0, dashboardID: id) },
-                dashboardID: id,
-                accepts: { $0 == cookies }
-            )
-        } ?? true
-        if cookiesAreScoped, legacy.cookieMirror != nil {
-            KeychainHelper.clearLegacyDashboardCookies()
+    /// A legacy password left by a migration that ran on a locked phone
+    /// joins the dashboard saved for its address, unless that dashboard
+    /// has a password of its own by now. Once read, the legacy record goes.
+    static func adoptLeftoverCredentials(into registry: SavedDashboardRegistry) {
+        guard let credentials = KeychainHelper.loadCredentials() else { return }
+        let normalized = (try? ConnectionURLPolicy.normalizedBaseURL(credentials.baseURL))
+            ?? credentials.baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let dashboardID = registry.dashboardID(atNormalizedURL: normalized),
+           KeychainHelper.loadCredentials(dashboardID: dashboardID) == nil {
+            KeychainHelper.saveCredentials(credentials, dashboardID: dashboardID)
         }
-
-        var originlessCloudflareIsScoped = legacy.cloudflare.map {
-            !$0.origin.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        } ?? true
-        if let cloudflare = legacy.cloudflare, legacy.cloudflareCanBind(to: ownerURL) {
-            let isOriginless = cloudflare.origin.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            let scoped = isOriginless
-                ? CloudflareAccessKeychainRecord(
-                    clientID: cloudflare.clientID,
-                    clientSecret: cloudflare.clientSecret,
-                    origin: dashboard.normalizedURL
-                )
-                : cloudflare
-            let cloudflareIsScoped = ensureScopedCopy(
-                scoped,
-                load: { KeychainHelper.loadCloudflareKeychainRecord(dashboardID: $0) },
-                save: { KeychainHelper.saveCloudflareKeychainRecord($0, dashboardID: id) },
-                dashboardID: id,
-                accepts: { $0 == scoped }
-            )
-            if cloudflareIsScoped { KeychainHelper.clearCloudflareAccess() }
-            if isOriginless { originlessCloudflareIsScoped = cloudflareIsScoped }
-        }
-
-        let addresslessDependentsAreScoped = cookiesAreScoped && originlessCloudflareIsScoped
-        if addresslessDependentsAreScoped {
-            if connectionIsScoped, legacy.connection != nil { KeychainHelper.clearLegacyConnectionTicket() }
-            if credentialsAreScoped, legacy.credentials != nil { KeychainHelper.clearCredentials() }
-        }
+        KeychainHelper.clearCredentials()
     }
-
-    private static func ensureScopedCopy<Value>(
-        _ value: Value,
-        load: (UUID) -> Value?,
-        save: (Value) -> Void,
-        dashboardID: UUID,
-        accepts: (Value) -> Bool
-    ) -> Bool {
-        if let existing = load(dashboardID) { return accepts(existing) }
-        save(value)
-        guard let stored = load(dashboardID) else { return false }
-        return accepts(stored)
-    }
-
-    /// Unlock retry uses exactly the same address, ownership and readback
-    /// checks as launch-time recovery.
-    static func recoverLegacyLeftovers(into registry: SavedDashboardRegistry, defaults: UserDefaults) {
-        recoverLegacyLeftovers(LegacyDashboardReader.read(defaults: defaults), into: registry)
-    }
-
 }
 
 /// Reads and retires the legacy global auth records. Kept separate from the
