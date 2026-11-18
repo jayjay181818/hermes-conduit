@@ -641,13 +641,18 @@ extension SidebarLayoutTests {
         // The column and its transcript step through the same sizes, and
         // body text's sizes are iOS's.
         XCTAssertEqual(ChatTypography.standardDynamicTypeSizes, ChatTypography.standardCategories.map { DynamicTypeSize($0) })
-        XCTAssertEqual(
-            ChatTypography.standardBodySizes,
-            ChatTypography.standardCategories.map { UIFont.preferredFont(forTextStyle: .body, compatibleWith: UITraitCollection(preferredContentSizeCategory: $0)).pointSize }
-        )
+        let drawnSizes = ChatTypography.standardCategories.map {
+            UIFont.preferredFont(forTextStyle: .body, compatibleWith: UITraitCollection(preferredContentSizeCategory: $0)).pointSize
+        }
+        XCTAssertEqual(ChatTypography.drawnBodySizes, drawnSizes)
+        #if targetEnvironment(macCatalyst)
+        XCTAssertEqual(ChatTypography.standardBodySizes, [14, 15, 16, 17, 19, 21, 23])
+        #else
+        XCTAssertEqual(ChatTypography.standardBodySizes, drawnSizes)
+        #endif
         // Steps stop at the largest standard size; accessibility sizes stay.
-        XCTAssertEqual(ChatTypography.widthScale(steps: 3, from: .xxLarge), 23.0 / 21, accuracy: 0.0001)
-        XCTAssertEqual(ChatTypography.widthScale(steps: 2, from: .xxxLarge), 1)
+        XCTAssertEqual(ChatTypography.widthScale(steps: 3, from: .xxLarge), 23.0 / drawnSizes[5], accuracy: 0.0001)
+        XCTAssertEqual(ChatTypography.widthScale(steps: 2, from: .xxxLarge), 23.0 / drawnSizes[6])
         XCTAssertEqual(ChatTypography.widthScale(steps: 2, from: .accessibility2), 1)
         XCTAssertEqual(ReadableWidth.chatTextGrowth, [19.0 / 17, 21.0 / 17, 23.0 / 17])
         XCTAssertEqual(ChatTextAppearance(size: .default).widened(steps: 2, in: ColumnText(base: .accessibility2)), ChatTextAppearance(size: .default))
@@ -658,7 +663,7 @@ extension SidebarLayoutTests {
         // every size alike (a Mac), the growth iOS would give from the
         // column's base, the transcript's widthScale, never a shrink.
         let mac = [CGFloat](repeating: 17, count: 7)
-        XCTAssertEqual(ChatTypography.missingGrowth(at: .extraExtraExtraLarge, from: .large), 1)
+        XCTAssertEqual(ChatTypography.missingGrowth(at: .extraExtraExtraLarge, from: .large), max(1, 23.0 / drawnSizes[6]))
         XCTAssertEqual(ChatTypography.missingGrowth(at: .extraExtraExtraLarge, from: nil, drawn: mac), 1)
         XCTAssertEqual(ChatTypography.missingGrowth(at: .small, from: .small, drawn: mac), 1)
         XCTAssertEqual(ChatTypography.missingGrowth(at: .accessibilityLarge, from: .large, drawn: mac), 1)
@@ -673,7 +678,7 @@ extension SidebarLayoutTests {
         }
         XCTAssertEqual(
             UIFont.preferredFont(forTextStyle: .subheadline, in: .extraExtraExtraLarge, from: ColumnText(base: .large)).pointSize,
-            UIFont.preferredFont(forTextStyle: .subheadline, compatibleWith: UITraitCollection(preferredContentSizeCategory: .extraExtraExtraLarge)).pointSize,
+            UIFont.preferredFont(forTextStyle: .subheadline, compatibleWith: UITraitCollection(preferredContentSizeCategory: .extraExtraExtraLarge)).pointSize * max(1, 23.0 / drawnSizes[6]),
             accuracy: 0.001
         )
         // Caches tell the steps apart; no steps keeps today's keys.

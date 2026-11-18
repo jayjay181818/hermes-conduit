@@ -327,7 +327,7 @@ final class MacAttention {
             // Watched as it landed, in Conduit: not news afterwards either.
             guard !(isFrontmost && appState.isSceneActive) else { return }
             // A follow-up Hermes took on its own stays quiet, as its push does.
-            if let followUp = appState.predictiveFollowUpTurn?.sessionID,
+            if let followUp = appState.shownChat.predictiveFollowUpTurn?.sessionID,
                keys(for: chatIDs(sessionID), row: catalogRow(for: chatIDs(sessionID), in: appState)).contains(followUp) {
                 Self.log.debug("Reply skipped: predictive follow-up")
                 return

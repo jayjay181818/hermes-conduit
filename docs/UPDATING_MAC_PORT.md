@@ -35,6 +35,10 @@ A PR is ready only when its reported checks match the final source state. Label 
 
 The fork adds its own Catalyst and Linux source checks. The upstream maintainer's provider-backed review chain is restricted to the upstream repository, so opening a fork PR does not start additional model reviewers or require their secrets.
 
-## Current verified update
+## Updating an installed Mac build
+
+The first upgrade from build 162 uses the Mac installer. Once installed, build 278 checks for newer stable Mac releases in the fork through **Conduit → Check for Updates**. The release target, credential continuity checks, and signing procedure are in [Mac releases](MAC_RELEASES.md).
+
+## Previous verified release, build 162
 
 Fork PR #1 integrates upstream `20abe51`. Debug and optimized Release builds and signatures passed. Across 11 focused Catalyst suites, 462 tests passed and 2 mobile-only tests were intentionally skipped; the corrected permission suite passed its focused rerun. Debug and Release binary import checks passed. GUI evidence covers an isolated fresh launch and the File menu (New Chat, no New Window); further Computer Use capture was unavailable, so authenticated flows and full desktop interaction are not claimed as verified.

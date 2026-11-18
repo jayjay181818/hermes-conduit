@@ -197,7 +197,7 @@ final class LiveTurnActivities {
     /// 14 has none for iPhone and iPad apps, so nothing may touch it there
     /// (issue 1877: Conduit didn't launch on Sonoma).
     static let shared: LiveTurnActivities? = isAvailable ? LiveTurnActivities() : nil
-    nonisolated static var isAvailable: Bool { !ProcessInfo.processInfo.isiOSAppOnMac }
+    nonisolated static var isAvailable: Bool { !ProcessInfo.processInfo.runsOnMac }
     /// An activity nobody updated for this long reads as out of date.
     static let staleAfter: TimeInterval = 15 * 60
     /// A finished turn stays on the Lock Screen this long.

@@ -25,6 +25,9 @@ extension AppState {
         // Voice background jobs are not the active conversation, so they
         // observe every event before the active-session filter below.
         voiceBackgroundJobSupervisor.observe(event)
+        #if targetEnvironment(macCatalyst)
+        MacAttention.shared.streamEvent(event, sessionID: sessionID(for: event))
+        #endif
         // A Local Live call's reply streams back to the speech server.
         if isLocalLiveActive { localLiveTurns.observe(event) }
         notePresentedCardEvent(event)

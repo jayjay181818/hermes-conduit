@@ -850,6 +850,9 @@ extension AppState {
             liveSessionStatusProfile = profile
         }
         // Lock Screen progress of a turn that ended unseen (#605).
+        #if targetEnvironment(macCatalyst)
+        MacAttention.shared.registrySnapshot(rows, profile: profile)
+        #endif
         if liveTurnActivitiesRegistrySnapshot(Self.liveTurnSessionIDs(rows), profile, activeDashboardID?.uuidString) {
             scheduleLiveTurnRegistryRecheck()
         }

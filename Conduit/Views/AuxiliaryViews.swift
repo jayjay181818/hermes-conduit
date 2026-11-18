@@ -4427,9 +4427,9 @@ private struct NotificationsSettingsDetail: View {
             #if targetEnvironment(macCatalyst)
             // Conduit for Mac posts its own notifications (MacAttention):
             // no relay to pair or check, only when they come and what they say.
-            ConduitSettingsSection(title: AppLocalization.string("Notify me when"), symbol: "slider.horizontal.3", tint: .conduitAccent) {
+            ConduitSettingsSection(title: AppLocalization.string("Notify me when", table: .settings), symbol: "slider.horizontal.3", tint: .conduitAccent) {
                 if notifications.authorizationStatus == .denied {
-                    Label(AppLocalization.string("Notifications denied"), systemImage: "bell.slash")
+                    Label(notifications.statusText, systemImage: "bell.slash")
                         .scaledFont(.footnote)
                         .foregroundStyle(.red)
                 }

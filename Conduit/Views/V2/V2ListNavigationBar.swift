@@ -56,7 +56,7 @@ extension View {
 /// Mac opens chats beside the list and pushes one only in a narrow window,
 /// so it keeps the hidden bar it had before #2580.
 enum V2ListNavigationBarPolicy {
-    static func keepsBarShown(onMac: Bool = ProcessInfo.processInfo.isiOSAppOnMac) -> Bool {
+    static func keepsBarShown(onMac: Bool = ProcessInfo.processInfo.runsOnMac) -> Bool {
         !onMac
     }
 }

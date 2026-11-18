@@ -334,7 +334,7 @@ extension AppState {
                 profiles = orderedProfiles(profiles)
             }
         } else {
-            SavedDashboardMigrator.adoptLeftoverCredentials(into: savedDashboardRegistry)
+            SavedDashboardMigrator.recoverLegacyLeftovers(into: savedDashboardRegistry, defaults: defaults)
         }
         // Nothing saved to sign in with (an off-screen switch to a dashboard
         // with no reusable auth): the sign-in card keeps its explanation.

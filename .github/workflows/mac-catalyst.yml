@@ -98,6 +98,10 @@ jobs:
             -only-testing:ConduitTests/NotificationCopyTests \
             -only-testing:ConduitTests/ComposerPasteTextViewTests \
             -only-testing:ConduitTests/ComposerReturnKeyTests \
+            -only-testing:ConduitTests/ChatVoiceButtonTests \
+            -only-testing:ConduitTests/SidebarLayoutTests \
+            -only-testing:ConduitTests/CustomHeadersTests \
+            -only-testing:ConduitTests/SavedDashboardRegistryTests \
             -only-testing:ConduitTests/WidgetLaunchLinkTests \
             -only-testing:ConduitTests/AppStateReasoningStreamTests \
             >"$log" 2>&1; then

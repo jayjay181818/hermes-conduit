@@ -45,14 +45,14 @@ enum ComposerLayout {
     /// type, as in a desktop client: on a Mac (issue 1692), as New Chat
     /// already did there. An iPhone or iPad keeps the keyboard down until
     /// the field is tapped, so it doesn't cover what just opened.
-    static func focusesOnOpen(onMac: Bool = ProcessInfo.processInfo.isiOSAppOnMac) -> Bool {
+    static func focusesOnOpen(onMac: Bool = ProcessInfo.processInfo.runsOnMac) -> Bool {
         onMac
     }
 
     /// Whether ⌘V in an open conversation's transcript pastes into its
     /// composer (issue 1692): on a Mac, where the transcript keeps the
     /// keys once a click there put the composer's focus away.
-    static func transcriptTakesPaste(onMac: Bool = ProcessInfo.processInfo.isiOSAppOnMac) -> Bool {
+    static func transcriptTakesPaste(onMac: Bool = ProcessInfo.processInfo.runsOnMac) -> Bool {
         onMac
     }
 

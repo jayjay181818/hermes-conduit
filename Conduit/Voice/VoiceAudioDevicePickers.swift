@@ -16,6 +16,30 @@ import os
 import SwiftUI
 import UIKit
 
+#if targetEnvironment(macCatalyst)
+private let soundSettingsURL = URL(string: "x-apple.systempreferences:com.apple.Sound-Settings.extension")!
+
+struct VoiceCallAudioDeviceButtons: View {
+    var body: some View {
+        Link(destination: soundSettingsURL) {
+            Image(systemName: "speaker.wave.2")
+                .accessibilityLabel(Text(verbatim: AppLocalization.string("Microphone and output", table: .voice)))
+        }
+        .help(AppLocalization.string("Microphone and output", table: .voice))
+    }
+}
+
+struct VoiceAudioDeviceSettingsSection: View {
+    var body: some View {
+        ConduitSettingsSection(title: AppLocalization.string("Microphone and output", table: .voice), symbol: "headphones", tint: .conduitAccent) {
+            Link(destination: soundSettingsURL) {
+                Text(verbatim: AppLocalization.string("Microphone and output", table: .voice))
+                Image(systemName: "arrow.up.forward.app")
+            }
+        }
+    }
+}
+#else
 private let devicePickerLogger = Logger(subsystem: "com.milim.relay", category: "VoiceAudio")
 
 /// The names of the microphone and the output the voice uses now, as iOS
@@ -282,3 +306,4 @@ struct VoiceAudioDeviceSettingsSection: View {
             .foregroundStyle(.secondary)
     }
 }
+#endif

@@ -300,15 +300,34 @@ final class SavedDashboardRegistryTests: XCTestCase {
 
     func testLazyRetirementHonorsInjectedDefaults() throws {
         // Registry already present + legacy records still around (a migration
-        // that died before retirement): loading with the SAME injected
-        // defaults retires the legacy records.
-        KeychainHelper.saveConnection(HermesConnection(baseUrl: legacyURL, ticket: "leftover"))
-        let existing = SavedDashboardRegistry(activeDashboardID: nil, dashboards: [])
+        // that died before retirement): a duplicate for a committed active
+        // address is retired after its scoped copy is verified.
+        let id = track(UUID())
+        let connection = HermesConnection(baseUrl: legacyURL, ticket: "leftover")
+        KeychainHelper.saveConnection(connection)
+        KeychainHelper.saveConnection(connection, dashboardID: id)
+        let existing = SavedDashboardRegistry(
+            activeDashboardID: id,
+            dashboards: [SavedDashboard(id: id, label: "Mac", normalizedURL: legacyURL)]
+        )
         SavedDashboardRegistryStore.save(existing)
 
         let registry = SavedDashboardMigrator.loadRegistry(defaults: defaults)
         XCTAssertEqual(registry, existing)
         XCTAssertNil(KeychainHelper.loadConnection(), "lazy retirement removes the legacy leftovers")
+    }
+
+    func testLazyRetirementPreservesAddressedOrphanWithoutRegistryOwner() throws {
+        let connection = HermesConnection(baseUrl: legacyURL, ticket: "orphan-ticket")
+        KeychainHelper.saveConnection(connection)
+        let existing = SavedDashboardRegistry()
+        SavedDashboardRegistryStore.save(existing)
+
+        let registry = SavedDashboardMigrator.loadRegistry(defaults: defaults)
+
+        XCTAssertEqual(registry, existing)
+        XCTAssertEqual(KeychainHelper.loadConnection(), connection)
+        XCTAssertTrue(registry.dashboards.isEmpty)
     }
 
     func testCleanInstallProducesEmptyRegistryWithoutLegacy() throws {

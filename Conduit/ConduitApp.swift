@@ -389,7 +389,12 @@ struct ConduitApp: App {
         }
         // The menu bar and ⌘-held shortcuts on an iPad and a Mac: ⌘N is
         // New Chat here, not a second window (issue 2219).
-        .commands { ConduitKeyboardCommands() }
+        .commands {
+            ConduitKeyboardCommands()
+            #if targetEnvironment(macCatalyst)
+            CatalystUpdaterCommands()
+            #endif
+        }
 
         // A chat in a window of its own, opened from the pane beside the
         // open chat (all-live stage 2, AppState+ChatWindows.swift). The

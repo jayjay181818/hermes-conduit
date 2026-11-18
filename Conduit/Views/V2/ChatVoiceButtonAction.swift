@@ -71,19 +71,19 @@ enum ChatVoiceButtonAction: String, CaseIterable, Equatable {
     /// On a Mac a live call starts from the chat's header, as a desktop
     /// client's call button does, rather than from a round button over the
     /// corner of the transcript (issue 1534).
-    static func liveCallInHeader(onMac: Bool = ProcessInfo.processInfo.isiOSAppOnMac) -> Bool {
+    static func liveCallInHeader(onMac: Bool = ProcessInfo.processInfo.runsOnMac) -> Bool {
         onMac
     }
 
     /// Whether the round button stands beside the chat's composer: always,
     /// but on a Mac when all it would do is the call the header has.
-    static func roundButtonBeside(_ action: ChatVoiceButtonAction, onMac: Bool = ProcessInfo.processInfo.isiOSAppOnMac) -> Bool {
+    static func roundButtonBeside(_ action: ChatVoiceButtonAction, onMac: Bool = ProcessInfo.processInfo.runsOnMac) -> Bool {
         !(liveCallInHeader(onMac: onMac) && action == .liveCall)
     }
 
     /// Whether the chat's header has the call button: when the round
     /// button does something else, and always on a Mac.
-    static func headerCallButton(_ action: ChatVoiceButtonAction, onMac: Bool = ProcessInfo.processInfo.isiOSAppOnMac) -> Bool {
+    static func headerCallButton(_ action: ChatVoiceButtonAction, onMac: Bool = ProcessInfo.processInfo.runsOnMac) -> Bool {
         action != .liveCall || liveCallInHeader(onMac: onMac)
     }
 }
